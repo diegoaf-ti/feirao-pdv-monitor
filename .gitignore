@@ -1,0 +1,15 @@
+# Dados gerados no computador do caixa; nunca versionar.
+logs/
+outbox/
+programa/
+monitor.xml*
+central.xml*
+central-credencial.bin*
+cursores.xml*
+recuperacoes.xml*
+status.txt
+*.csv
+*.zip
+*.bin
+*.tmp
+.DS_Store

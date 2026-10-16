@@ -1,0 +1,28 @@
+name: Testes do monitor
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-powershell:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sintaxe e testes isolados no Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Get-ChildItem -File | Where-Object { $_.Extension -in @('.ps1', '.psm1') } | ForEach-Object {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errors)
+            if ($errors.Count) { throw ($_.Name + ': ' + ($errors | Out-String)) }
+          }
+          Get-ChildItem -Filter 'Tests*.ps1' -File | Sort-Object Name | ForEach-Object {
+            & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $_.FullName
+            if ($LASTEXITCODE -ne 0) { throw ('Falha em ' + $_.Name) }
+          }
