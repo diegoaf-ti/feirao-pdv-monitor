@@ -2,7 +2,7 @@
 
 Monitor local do pinpad TEF e da impressora para registrar mudanças de porta COM, desconexões observáveis, problemas informados pelo Windows e tentativas de recuperação. Mantém histórico local e pode enviar os registros para a central do Conecta.
 
-**Piloto em validação.** Os testes foram realizados com dados simulados no macOS; a execução no Windows e com os equipamentos reais ainda precisa ser validada. Comece em um caixa acompanhado pelo suporte, mantendo a recuperação desarmada.
+**Piloto em validação.** Os testes com dados simulados passaram no macOS com PowerShell 7.5.4 e no Windows com PowerShell 5.1 pelo [GitHub Actions](https://github.com/diegoaf-ti/feirao-pdv-monitor/actions). A interface, a coleta nativa e os equipamentos reais ainda precisam ser validados no caixa. Comece acompanhado pelo suporte, mantendo a recuperação desarmada.
 
 ## Abrir e deixar funcionando
 
@@ -114,7 +114,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\TestsMonitorHost.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\TestsMonitorRuntime.ps1
 ```
 
-A validação em macOS não comprova funcionamento do Windows PowerShell 2.0/5.1, interface de bandeja, DPAPI, WMI, Event Log, TLS/HTTPS, driver ou recuperação real.
+A aprovação dos testes simulados no macOS e no Windows PowerShell 5.1 não comprova funcionamento do Windows PowerShell 2.0, interface de bandeja, DPAPI, coleta WMI/Event Log, TLS/HTTPS, driver ou recuperação real.
 
 No primeiro caixa, validar abertura no usuário comum, presença/COM comparadas com o Gerenciador de Dispositivos, ocultação sem encerrar, exportação, início após novo login e saída explícita. Fora de uma venda, testar desconectar/reconectar um equipamento por vez, falta de rede/reenvio sem duplicar, mudança para offline na central e revogação. Conferir a presença desconhecida no Windows 7 e os avisos de consulta indisponível. Só depois avaliar recuperação durante manutenção acompanhada.
 
