@@ -6,7 +6,7 @@ if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { throw 'A inst
 $source = Split-Path -Parent $MyInvocation.MyCommand.Path;
 $destination = Join-Path $env:LOCALAPPDATA 'Feirao\PdvMonitor\programa';
 # Lista explícita: não copia credenciais, configurações, logs ou arquivos do PDV.
-$files = @('MonitorPdv.ps1', 'InicializarMonitor.ps1', 'Monitor.cmd', 'IniciarMonitor.vbs', 'InstalarMonitor.ps1', 'DesinstalarMonitor.ps1', 'PdvMonitor.Runtime.psm1', 'PdvMonitor.Coleta.psm1', 'PdvMonitor.Politica.psm1', 'PdvLegado.Core.psm1', 'PdvDispositivos.Core.psm1');
+$files = @('MonitorPdv.ps1', 'InicializarMonitor.ps1', 'Monitor.cmd', 'IniciarMonitor.vbs', 'InstalarMonitor.ps1', 'DesinstalarMonitor.ps1', 'PdvMonitor.Runtime.psm1', 'PdvMonitor.Inventario.psm1', 'PdvMonitor.Coleta.psm1', 'PdvMonitor.Politica.psm1', 'PdvLegado.Core.psm1', 'PdvDispositivos.Core.psm1');
 if (Test-Path -LiteralPath (Join-Path $source 'PdvMonitor.Transporte.psm1')) { $files += 'PdvMonitor.Transporte.psm1'; }
 foreach ($file in $files) {
   if (-not (Test-Path -LiteralPath (Join-Path $source $file))) { throw ('Pacote incompleto: ' + $file); }

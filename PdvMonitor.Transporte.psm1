@@ -1,6 +1,7 @@
 ﻿# Transporte opcional. Sintaxe Windows PowerShell 2.0; sem módulos externos.
 # Token nunca integra eventos, XML de configuração, retornos ou mensagens.
 Set-StrictMode -Version 2.0
+Import-Module (Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'PdvMonitor.Inventario.psm1')
 $script:PdvEventFields = @('EventId', 'Timestamp', 'SessionId', 'Sequence', 'Kind', 'Role', 'InstanceId', 'DeviceName', 'Port', 'Present', 'PresenceKnown', 'Status', 'ProblemCode', 'Reason', 'Detail', 'WindowsChannel', 'RecordId', 'Provider', 'WindowsEventId')
 $script:PdvOutboxMaxBytes = 104857600
 $script:PdvOutboxMaxRecords = 20000
@@ -54,7 +55,7 @@ function Get-PdvTransportPaths {
   $outbox = [IO.Path]::GetFullPath($outbox)
   $directoryPrefix = $directory.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
   if (-not $outbox.StartsWith($directoryPrefix, [StringComparison]::OrdinalIgnoreCase)) { throw 'OutboxMustBeInsideDataDirectory' }
-  return (New-Object PSObject -Property @{Directory=$directory; Outbox=$outbox; Config=(Join-Path $directory 'central.xml'); Credential=(Join-Path $directory 'central-credencial.bin')})
+  return (New-Object PSObject -Property @{Directory=$directory; Outbox=$outbox; Config=(Join-Path $directory 'central.xml'); Credential=(Join-Path $directory 'central-credencial.bin'); Hardware=(Join-Path $directory 'hardware-pendente.xml')})
 }
 
 function Get-PdvOutboxFiles {
@@ -88,8 +89,42 @@ function ConvertTo-PdvEventJson {
 }
 
 function New-PdvEnvelopeJson {
-  param($Central, [string[]]$EventJson, [string]$BatchId)
-  return '{"schemaVersion":1,"agentId":' + (ConvertTo-PdvJsonString ([string](Get-PdvTransportValue $Central 'AgentId'))) + ',"storeId":' + (ConvertTo-PdvJsonString ([string](Get-PdvTransportValue $Central 'StoreId'))) + ',"terminal":' + (ConvertTo-PdvJsonString ([string](Get-PdvTransportValue $Central 'Terminal'))) + ',"batchId":' + (ConvertTo-PdvJsonString $BatchId) + ',"events":[' + [string]::Join(',', $EventJson) + ']}'
+  param($Central, [string[]]$EventJson, [string]$BatchId, [string]$HardwareJson='')
+  $version='1'; $hardwarePart=''
+  if ($HardwareJson) { $version='2'; $hardwarePart=',"hardware":'+$HardwareJson }
+  return '{"schemaVersion":'+$version+',"agentId":' + (ConvertTo-PdvJsonString ([string](Get-PdvTransportValue $Central 'AgentId'))) + ',"storeId":' + (ConvertTo-PdvJsonString ([string](Get-PdvTransportValue $Central 'StoreId'))) + ',"terminal":' + (ConvertTo-PdvJsonString ([string](Get-PdvTransportValue $Central 'Terminal'))) + ',"batchId":' + (ConvertTo-PdvJsonString $BatchId) + ',"events":[' + [string]::Join(',', $EventJson) + ']'+$hardwarePart+'}'
+}
+
+function Read-PdvHardwarePending {
+  param([string]$Path)
+  $values=Read-PdvTransportXml $Path 'PdvMonitorHardware' @('AgentId','StoreId','Terminal','Fingerprint','HardwareJson')
+  if ($values.Fingerprint -notmatch '^[a-f0-9]{64}$' -or [Text.Encoding]::UTF8.GetByteCount($values.HardwareJson) -gt 32768 -or -not $values.HardwareJson.StartsWith('{') -or -not $values.HardwareJson.EndsWith('}')) { throw 'HardwarePendingInvalid' }
+  return $values
+}
+
+function Set-PdvMonitorHardwarePending {
+  [CmdletBinding()]
+  param([Parameter(Mandatory=$true)]$Session, [Parameter(Mandatory=$true)][Collections.IDictionary]$Hardware)
+  $central=Get-PdvCentralConfig $Session
+  if (-not (Get-PdvTransportValue $central 'Enabled' $false)) { return (New-PdvTransportResult $false 'CentralDisabled') }
+  try {
+    if (-not (Test-PdvCentralIdentity ([string](Get-PdvTransportValue $central 'Endpoint')) ([string](Get-PdvTransportValue $central 'StoreId')) ([string](Get-PdvTransportValue $central 'Terminal')) ([string](Get-PdvTransportValue $central 'AgentId')))) { throw 'InvalidConfiguration' }
+    $json=ConvertTo-PdvHardwareJson $Hardware
+    if ([Text.Encoding]::UTF8.GetByteCount($json) -gt 32768) { throw 'HardwareTooLarge' }
+    $paths=Get-PdvTransportPaths $Session
+    $values=@{AgentId=[string](Get-PdvTransportValue $central 'AgentId');StoreId=[string](Get-PdvTransportValue $central 'StoreId');Terminal=[string](Get-PdvTransportValue $central 'Terminal');Fingerprint=(Get-PdvHardwareFingerprint $Hardware);HardwareJson=$json}
+    if ([IO.File]::Exists($paths.Hardware)) {
+      $previous=Read-PdvHardwarePending $paths.Hardware
+      foreach ($field in @('AgentId','StoreId','Terminal')) { if ($previous[$field] -cne $values[$field]) { throw 'HardwareIdentityMismatch' } }
+    }
+    # Inventário representa o estado mais recente. A substituição do único item
+    # pendente é atômica e não altera a fila histórica de eventos.
+    Write-PdvTransportAtomicBytes $paths.Hardware (New-PdvTransportXmlBytes 'PdvMonitorHardware' $values)
+    return (New-PdvTransportResult $true 'HardwareQueued' $true)
+  } catch {
+    Set-PdvTransportValue $Session 'UploadStatusText' 'Não foi possível persistir o inventário para envio; inventário local preservado.'
+    return (New-PdvTransportResult $false 'HardwareQueueFailed')
+  }
 }
 
 function Test-PdvOutboxRecord {
@@ -236,6 +271,13 @@ function Set-PdvMonitorCentralConfig {
         return (New-PdvTransportResult $false 'PendingIdentityChange')
       }
     }
+    if ([IO.File]::Exists($paths.Hardware)) {
+      $pendingHardware=Read-PdvHardwarePending $paths.Hardware
+      if ($pendingHardware.AgentId -ne $newCentral.AgentId -or $pendingHardware.StoreId -cne $StoreId -or $pendingHardware.Terminal -cne $Terminal) {
+        Set-PdvTransportValue $Session 'UploadStatusText' 'Há inventário pendente de outra identificação. Envie a fila antes de trocar agente, loja ou terminal.'
+        return (New-PdvTransportResult $false 'PendingIdentityChange')
+      }
+    }
     $protected = Protect-PdvMonitorToken $Token $newCentral
     $configValues = @{Enabled='true'; Endpoint=$Endpoint; StoreId=$StoreId; Terminal=$Terminal; AgentId=$newCentral.AgentId}
     $configBytes = New-PdvTransportXmlBytes 'PdvMonitorCentral' $configValues
@@ -357,7 +399,16 @@ function Invoke-PdvMonitorUpload {
     $paths = Get-PdvTransportPaths $Session
     if (-not (Test-PdvCentralIdentity ([string](Get-PdvTransportValue $central 'Endpoint')) ([string](Get-PdvTransportValue $central 'StoreId')) ([string](Get-PdvTransportValue $central 'Terminal')) ([string](Get-PdvTransportValue $central 'AgentId')))) { throw 'InvalidConfiguration' }
     $files = @(Get-PdvOutboxFiles $paths.Outbox | Sort-Object LastWriteTimeUtc, Name)
-    if ($files.Count -eq 0) {
+    $hardwarePending=$null; $hardwareJson=''; $hardwareFingerprint=''
+    if ([IO.File]::Exists($paths.Hardware)) {
+      $hardwarePending=Read-PdvHardwarePending $paths.Hardware
+      if ($hardwarePending.AgentId -ne [string](Get-PdvTransportValue $central 'AgentId') -or $hardwarePending.StoreId -cne [string](Get-PdvTransportValue $central 'StoreId') -or $hardwarePending.Terminal -cne [string](Get-PdvTransportValue $central 'Terminal')) {
+        Set-PdvUploadBackoff $Session $now $true
+        return (New-PdvTransportResult $false 'OutboxIdentityMismatch')
+      }
+      $hardwareJson=$hardwarePending.HardwareJson; $hardwareFingerprint=$hardwarePending.Fingerprint
+    }
+    if ($files.Count -eq 0 -and -not $hardwareJson) {
       Set-PdvTransportValue $Session 'UploadStatusText' 'Fila central vazia; nenhum envio necessário nesta leitura.'
       return (New-PdvTransportResult $true 'OutboxEmpty')
     }
@@ -373,7 +424,7 @@ function Invoke-PdvMonitorUpload {
     $batchId = [Guid]::NewGuid().ToString('D')
     $jsonEvents = New-Object 'Collections.Generic.List[string]'
     $selected = New-Object 'Collections.Generic.List[string]'
-    $body = $null
+    $body = [Text.Encoding]::UTF8.GetBytes((New-PdvEnvelopeJson $central @() $batchId $hardwareJson))
     foreach ($file in $files) {
       if ($selected.Count -ge 50) { break }
       $record = Read-PdvTransportXml $file.FullName 'PdvMonitorOutbox' (@('AgentId', 'StoreId', 'Terminal') + $script:PdvEventFields)
@@ -385,7 +436,7 @@ function Invoke-PdvMonitorUpload {
       if (-not (Test-PdvOutboxRecord $record)) { throw 'InvalidQueuedRecord' }
       $candidateJson = ConvertTo-PdvEventJson $record
       $candidates = @($jsonEvents.ToArray()) + @($candidateJson)
-      $candidateBody = [Text.Encoding]::UTF8.GetBytes((New-PdvEnvelopeJson $central $candidates $batchId))
+      $candidateBody = [Text.Encoding]::UTF8.GetBytes((New-PdvEnvelopeJson $central $candidates $batchId $hardwareJson))
       if ($candidateBody.Length -gt $script:PdvBatchMaxBytes) {
         if ($selected.Count -eq 0) { throw 'QueuedRecordTooLarge' }
         break
@@ -403,10 +454,19 @@ function Invoke-PdvMonitorUpload {
       return (New-PdvTransportResult $false ('Http' + [string]$statusCode))
     }
     $deleteFailed = $false
+    if ($hardwarePending -and [IO.File]::Exists($paths.Hardware)) {
+      # O ACK pertence ao conteúdo exato enviado. Não remover um inventário
+      # mais recente caso tenha sido gravado enquanto a chamada estava em voo.
+      try {
+        $currentHardware=Read-PdvHardwarePending $paths.Hardware
+        if ($currentHardware.Fingerprint -ceq $hardwareFingerprint -and $currentHardware.HardwareJson -ceq $hardwareJson) { [IO.File]::Delete($paths.Hardware) }
+      } catch { $deleteFailed=$true }
+    }
     foreach ($path in $selected) { try { [IO.File]::Delete($path) } catch { $deleteFailed = $true } }
     Set-PdvTransportValue $Session 'UploadFailureCount' 0
     Set-PdvTransportValue $Session 'NextUploadAt' $now.AddSeconds(5)
     $text = 'Central confirmou ' + [string]$selected.Count + ' eventos.'
+    if ($hardwarePending) { $text += ' Inventário da máquina confirmado.' }
     if ($deleteFailed) { $text += ' Limpeza local pendente; reenvio mantém os mesmos identificadores para evitar duplicação.' }
     Set-PdvTransportValue $Session 'UploadStatusText' $text
     return (New-PdvTransportResult $true 'Acknowledged' $false $selected.Count)
@@ -417,4 +477,4 @@ function Invoke-PdvMonitorUpload {
   } finally { $token = $null; $authorization = $null }
 }
 
-Export-ModuleMember -Function Initialize-PdvMonitorCentral, Set-PdvMonitorCentralConfig, Add-PdvMonitorOutboxRecord, Invoke-PdvMonitorUpload
+Export-ModuleMember -Function Initialize-PdvMonitorCentral, Set-PdvMonitorCentralConfig, Add-PdvMonitorOutboxRecord, Invoke-PdvMonitorUpload, Set-PdvMonitorHardwarePending

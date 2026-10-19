@@ -95,9 +95,10 @@ function Update-PdvMonitorView {
   if ($script:session.LastTickAt) { $statusLabel.Text += ' | Coleta: ' + [string]$script:session.LastTickAt; }
   $warnings = @($script:session.Snapshot.Warnings | Where-Object { $_ });
   if ($script:wmiWarning) { $warnings += $script:wmiWarning; }
+  if (@($script:session.Config.Profiles).Count -eq 0) { $warnings += 'Para receber alertas de COM: selecione o pinpad e a impressora corretos, confirme a COM esperada e use Salvar vínculo. O inventário da máquina funciona sem vínculos.'; }
   $warningLabel.Text = $warnings -join ' | ';
   if (-not $warningLabel.Text) { $warningLabel.Text = 'Presença no Windows não comprova comunicação com o Nérus. O monitor não abre a porta COM nem lê dados de pagamentos.'; }
-  $dataLabel.Text = 'Logs e configuração: ' + $script:dataDirectory + [Environment]::NewLine + 'Envio central: ' + [string]$script:session.UploadStatusText;
+  $dataLabel.Text = 'Logs e configuração: ' + $script:dataDirectory + [Environment]::NewLine + 'Envio central: ' + [string]$script:session.UploadStatusText + ' | ' + [string]$script:session.HardwareStatus;
 }
 
 function Set-PdvMonitorControls {
@@ -257,7 +258,7 @@ try {
   }
   $form.Controls.Add($layout);
   $intro = New-Object System.Windows.Forms.Label; $intro.Dock = 'Fill';
-  $intro.Text = "Coleta contínua a cada 15 segundos e histórico local. Fechar esta janela mantém o monitor ao lado do relógio.`r`nA recuperação de dispositivos exige perfil autorizado, manutenção temporária e processos do caixa fechados.";
+  $intro.Text = "COM e falhas graves: três leituras a cada 15 segundos. Inventário da máquina: início e a cada 6 horas. Fechar mantém o monitor na bandeja.`r`nA recuperação de dispositivos exige perfil autorizado, manutenção temporária e processos do caixa fechados.";
   $layout.Controls.Add($intro, 0, 0);
   $toolbar = New-Object System.Windows.Forms.FlowLayoutPanel; $toolbar.Dock = 'Fill';
   $refreshButton = New-Object System.Windows.Forms.Button; $refreshButton.Text = 'Coletar agora'; $refreshButton.AutoSize = $true;

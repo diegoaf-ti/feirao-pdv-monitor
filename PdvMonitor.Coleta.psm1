@@ -87,14 +87,20 @@ function Get-PdvMonitorSnapshot {
 }
 
 function Get-PdvMonitorSystemEventXPath {
-  # SCM é limitado a serviços relacionados à impressão/TEF. O payload é usado
-  # somente pelo filtro nativo e nunca é materializado ou gravado pelo monitor.
-  $providers = @('Microsoft-Windows-Kernel-PnP', 'Microsoft-Windows-UserPnp', 'Microsoft-Windows-DriverFrameworks-UserMode', 'Microsoft-Windows-USB-USBHUB3', 'Microsoft-Windows-USB-UCX', 'Microsoft-Windows-USB-USBPORT', 'Microsoft-Windows-USB-USBHUB', 'Microsoft-Windows-PrintService', 'Print', 'usbser', 'Serial');
-  $providerTerms = @($providers | ForEach-Object { "Provider[@Name='" + $_ + "']" });
-  $hardware = 'System[' + ($providerTerms -join ' or ') + ']';
-  $service = "(System[Provider[@Name='Service Control Manager']] and EventData[Data='Spooler' or Data='Print Spooler' or Data='Spooler de Impressão' or Data='SiTef' or Data='CliSiTef' or Data='Cliente SiTef'])";
-  $logLifecycle = "System[(Provider[@Name='Microsoft-Windows-Eventlog'] and EventID=104) or (Provider[@Name='EventLog'] and (EventID=6005 or EventID=6006))]";
-  return @($hardware, $service, $logLifecycle);
+  # Somente níveis crítico/erro de provedores relacionados a hardware, disco,
+  # energia, USB, serial e impressão. Informações/warnings de rotina não viram
+  # incidentes. Cada seleção fica abaixo do limite de expressões nativo.
+  $groups = @(
+    @('Microsoft-Windows-Kernel-PnP','Microsoft-Windows-UserPnp','Microsoft-Windows-DriverFrameworks-UserMode','Microsoft-Windows-USB-USBHUB3','Microsoft-Windows-USB-UCX','Microsoft-Windows-USB-USBPORT','Microsoft-Windows-USB-USBHUB','usbser','Serial'),
+    @('disk','Disk','Ntfs','Microsoft-Windows-Ntfs','storahci','stornvme','storport','Microsoft-Windows-WHEA-Logger','Microsoft-Windows-Kernel-Power','Microsoft-Windows-PrintService','Print')
+  );
+  $terms=@();
+  foreach ($group in $groups) {
+    $providers=@($group | ForEach-Object { "Provider[@Name='"+$_+"']" });
+    $terms += 'System[(Level=1 or Level=2) and ('+($providers -join ' or ')+')]';
+  }
+  $terms += "(System[(Level=1 or Level=2) and Provider[@Name='Service Control Manager']] and EventData[Data='Spooler' or Data='Print Spooler' or Data='Spooler de Impressão' or Data='SiTef' or Data='CliSiTef' or Data='Cliente SiTef'])";
+  return $terms;
 }
 
 function Read-PdvMonitorEventQuery {
@@ -192,12 +198,12 @@ function Get-PdvMonitorWindowsEvents {
       $status.CoverageStart = $coverageStart;
       $conditions = 'EventRecordID > ' + $afterId + ' and EventRecordID <= ' + $newestId;
       if ($status.Baseline) { $conditions += " and TimeCreated[@SystemTime >= '" + $StartAfter.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ') + "']"; }
-      $range = '*[System[' + $conditions + ']]';
+      $range = '*[System[' + $conditions + ' and (Level=1 or Level=2)]]';
       $xpath = $range; $queryXml = '';
       if ($channel -eq 'System') {
         $terms = @(Get-PdvMonitorSystemEventXPath);
         # Seleções estruturadas: cada XPath fica abaixo do limite de 20
-        # expressões do Windows Event Log. Os três provedores são disjuntos.
+        # expressões do Windows Event Log. As seleções são deduplicadas pelo Windows.
         $selects = @($terms | ForEach-Object {
           '<Select Path="System">' + [Security.SecurityElement]::Escape(('*[System[' + $conditions + '] and ' + $_ + ']')) + '</Select>';
         });

@@ -13,3 +13,8 @@ status.txt
 *.bin
 *.tmp
 .DS_Store
+
+# Inventário local contém identificadores patrimoniais.
+inventario-hardware.json*
+inventario-estado.xml*
+hardware-pendente.xml*

@@ -39,7 +39,7 @@ $module = Get-Module PdvMonitor.Coleta;
 
   function New-TestEvent {
     param([long]$RecordId, [DateTime]$Time, [string]$Provider = 'Microsoft-Windows-Kernel-PnP', [string]$Service = '');
-    $event = New-Object PSObject -Property @{ RecordId = $RecordId; TimeCreated = $Time; ProviderName = $Provider; Id = 219; Level = 3; Service = $Service };
+    $event = New-Object PSObject -Property @{ RecordId = $RecordId; TimeCreated = $Time; ProviderName = $Provider; Id = 219; Level = 2; Service = $Service };
     $event | Add-Member -MemberType ScriptProperty -Name Message -Value { throw 'Teste detectou leitura indevida de mensagem sensível.'; };
     $event | Add-Member -MemberType ScriptProperty -Name Properties -Value { throw 'Teste detectou leitura indevida de payload sensível.'; };
     return $event;
@@ -59,7 +59,7 @@ $module = Get-Module PdvMonitor.Coleta;
       if ($null -ne $FilterXml) { $selectors = @($FilterXml.QueryList.Query.Select | ForEach-Object { $_.InnerText }); }
       $items = @($items | Where-Object {
         $timeText = $_.TimeCreated.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ');
-        $eventXml = [xml]('<Event><System><Provider Name="' + $_.ProviderName + '"/><EventID>' + $_.Id + '</EventID><EventRecordID>' + $_.RecordId + '</EventRecordID><TimeCreated SystemTime="' + $timeText + '"/></System><EventData><Data>' + $_.Service + '</Data></EventData></Event>');
+        $eventXml = [xml]('<Event><System><Provider Name="' + $_.ProviderName + '"/><EventID>' + $_.Id + '</EventID><Level>' + $_.Level + '</Level><EventRecordID>' + $_.RecordId + '</EventRecordID><TimeCreated SystemTime="' + $timeText + '"/></System><EventData><Data>' + $_.Service + '</Data></EventData></Event>');
         $selected = $false;
         foreach ($selector in $selectors) {
           # Standard XPath 1.0 só compara números com >= em strings. O Windows

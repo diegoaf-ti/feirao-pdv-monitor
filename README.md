@@ -4,6 +4,8 @@ Monitor local do pinpad TEF e da impressora para registrar mudanças de porta CO
 
 **Piloto em validação.** Os testes com dados simulados passaram no macOS com PowerShell 7.5.4 e no Windows com PowerShell 5.1 pelo [GitHub Actions](https://github.com/diegoaf-ti/feirao-pdv-monitor/actions). A interface, a coleta nativa e os equipamentos reais ainda precisam ser validados no caixa. Comece acompanhado pelo suporte, mantendo a recuperação desarmada.
 
+Para atualizar o piloto, consulte o [guia de publicação e validação](GUIA-PILOTO-V2.md). A [proposta de correção no Nerus](PLANO-CORRECAO-NERUS.md) detalha os requisitos da futura integração.
+
 ## Abrir e deixar funcionando
 
 1. Extraia toda a pasta do pacote no computador do caixa.
@@ -20,19 +22,28 @@ A instalação é opcional: `Monitor.cmd` também funciona de forma portátil. N
 
 Para remover o início automático, execute `DesinstalarMonitor.ps1` pelo PowerShell no mesmo usuário. Isso remove somente o atalho criado pelo monitor e preserva programa, perfis, chave protegida e logs. Encerre a instância já aberta pelo ícone da bandeja.
 
-## O que fica registrado
+## Alertas para o suporte e inventário da empresa
+
+O histórico prioriza problemas que exigem atenção. A enumeração de portas continua local a cada 15 segundos, mas dispositivos normais, filas e reservas COM não são enviados repetidamente. Sinais genéricos WMI não geram uma ocorrência por mudança.
+
+**Os alertas de COM exigem vínculo salvo.** Na primeira instalação, selecione a instância exata do pinpad e da impressora, confirme a porta que o Nerus espera para aquele caixa e use **Salvar vínculo**. Sem esse passo o monitor coleta o patrimônio e as falhas graves do Windows, mas não sabe qual dispositivo deveria estar em qual COM. Nome/modelo ou VID/PID sozinho não identificam uma unidade com segurança.
 
 | Fonte | Frequência e informação |
 | --- | --- |
-| Inventário Windows | Consulta a cada 15 segundos, além da duração da própria coleta. Registra presença confirmada ou desconhecida, COM, status e código de problema. |
-| Mudança genérica WMI | Quando disponível, registra avisos de chegada/remoção recebidos pelo Windows, inclusive mudanças que podem ocorrer entre duas consultas. O aviso não identifica qual dispositivo mudou. |
-| Eventos Windows | Consulta a cada 60 segundos aos canais relevantes já habilitados, com até 100 eventos por canal por rodada, do mais antigo pendente para o mais recente. |
-| Inventário periódico | Dispositivos, filas e reservas COM são registrados novamente a cada dez minutos. |
-| Monitor e manutenção | Início/encerramento, sinal periódico de atividade, falhas de coleta e decisões/tentativas/resultados de recuperação. |
+| COM e dispositivos vinculados | Consulta local a cada 15 segundos, além da duração da coleta. Divergência da COM, ocupação por outra instância presente, desconexão e falha Windows são confirmadas em três leituras completas consecutivas. |
+| Persistência e resolução | Um mesmo problema gera um alerta até a condição mudar. Três leituras normais geram resolução. Presença ou código desconhecido não se tornam prova de desconexão ou recuperação. |
+| Patrimônio da máquina | Coleta no início e a cada seis horas: identificação WMI, nome do computador, fabricante/modelo/série, Windows, CPU, RAM/módulos, discos, volume do sistema e adaptadores físicos. Documento próprio de até 32 KiB. |
+| Atualização do patrimônio | Envio inicial, mudança do hardware ou renovação após 24 horas. Horário de captura, boot, espaço livre e ordem dos dispositivos não criam uma mudança de patrimônio. Falha de consulta preserva o último inventário válido. |
+| Falhas graves Windows | Canais relevantes já habilitados, somente níveis crítico/erro de disco, WHEA, energia, USB, serial e impressão. Consulta a cada 60 segundos, até 100 eventos por canal, com repetidos agrupados por canal/provedor/código por dez minutos. |
+| Monitor e manutenção | Início/encerramento, sinal de atividade a cada minuto, mudanças na cobertura de coleta e tentativas/resultados de recuperação. Decisões desarmadas não são publicadas como incidentes. |
 
-Os eventos do Windows incluem apenas horário, canal, provedor, número de registro, código e nível. Mensagens completas, conteúdo de documentos e propriedades livres não são lidos. O monitor não habilita canais que estejam desligados. Na primeira leitura de um canal, a cobertura começa nos últimos dois minutos e essa referência fica registrada. Limpeza/rotação dos canais, falhas de acesso e limite de coleta geram informação de cobertura; não há promessa de capturar todo evento passado.
+O patrimônio fica separado da lista de ocorrências na central. `MachineInventory` e `HardwareChanged` são resumos informativos. Não há nova remessa periódica de uma linha por driver ou reserva COM. Reservas não provam que a COM está ocupada; um dispositivo histórico ausente não é anunciado como conflito concreto.
 
-As consultas não abrem portas seriais, não realizam pagamentos ou impressões de teste e não leem arquivos de transações/configuração do SiTef. Uma observação de mudança indica o que o Windows conseguiu informar, sem provar a causa da falha.
+Eventos Windows preservam somente horário, canal, provedor, número de registro, código e nível. Mensagens completas, documentos e propriedades livres não são lidos. O monitor não habilita canais desligados. A cobertura inicial começa nos últimos dois minutos; limpeza/rotação, falhas de acesso e limite de coleta ficam explícitos. O agrupamento é por metadados e não determina a causa de uma falha. Não há promessa de capturar todo evento passado.
+
+O inventário usa uma lista explícita de campos. Não coleta usuário, product key, IPs, programas instalados, arquivos, dados de pagamento ou mensagens WMI livres. Arrays têm limites de 16 itens e a cobertura reduzida é informada; o JSON nunca é cortado para caber no transporte.
+
+As consultas não abrem portas seriais, não realizam pagamentos ou impressões de teste e não leem arquivos de transações/configuração do SiTef. Uma observação indica o que o Windows informou, sem provar a comunicação com o Nerus ou a causa da falha.
 
 ### Particularidades do Windows 7
 
@@ -51,6 +62,9 @@ Os dados ficam em `%LOCALAPPDATA%\Feirao\PdvMonitor`:
 - `cursores.xml`: posições de leitura dos canais Windows.
 - `recuperacoes.xml`: histórico recente das tentativas de reinício.
 - `status.txt`: último estado informado pelo monitor.
+- `inventario-hardware.json`: último patrimônio estruturado válido; incluído na exportação.
+- `inventario-estado.xml`: hash estático e referência da última inclusão para envio.
+- `hardware-pendente.xml`: único documento patrimonial aguardando confirmação; fica fora da exportação, assim como a fila histórica e a credencial.
 
 Os CSVs são separados por dia/sessão e giram em torno de 5 MB por arquivo. A limpeza mantém até 30 dias e busca limitar o conjunto a 100 MB, removendo os arquivos antigos; o arquivo em uso é preservado. Exporte o atendimento antes de alcançar essa retenção se precisar guardar o histórico por mais tempo.
 
@@ -68,7 +82,7 @@ A chave é protegida pelo Windows para o usuário atual com DPAPI e fica fora do
 
 O envio usa HTTPS com validação normal de certificado. No Windows 7, a disponibilidade real de TLS 1.2 depende da configuração e das atualizações instaladas; o teste no caixa deve confirmar a conexão. Não há opção de ignorar certificado.
 
-Se ficar sem internet, a coleta local continua e os eventos pendentes ficam em uma fila em disco. Cada envio contém até 50 registros e respeita o limite de 256 KB. Somente HTTP **204** confirma o lote inteiro e permite removê-lo da fila. Repetições preservam os identificadores, e o servidor descarta duplicatas idênticas sem sobrescrever o primeiro conteúdo. Erros de rede usam novas tentativas com espera progressiva.
+Se ficar sem internet, a coleta local continua e os eventos pendentes ficam em uma fila em disco. Cada envio contém até 50 registros e respeita o limite de 256 KB. O documento patrimonial usa o protocolo v2 e pode ser enviado sozinho ou junto aos eventos. Somente HTTP **204** confirma atomicamente os eventos e o inventário anexo, permitindo remover os itens confirmados da fila. O arquivo patrimonial só é removido se ainda corresponder ao conteúdo exato enviado. Repetições preservam os identificadores, e o servidor descarta duplicatas idênticas sem sobrescrever o primeiro conteúdo. Erros de rede usam novas tentativas com espera progressiva.
 
 A fila tem limites de **100 MB e 20 mil registros**. Ao atingir a capacidade, o monitor preserva os pendentes e sinaliza que novos eventos não entraram na fila central; os CSVs locais continuam sujeitos à sua própria retenção. Não há descarte silencioso da fila antiga. Falhas de credencial ou de envio também ficam visíveis no estado do monitor. Resolva a causa e exporte os logs se necessário.
 
@@ -76,7 +90,7 @@ Na central, **Online** significa contato recebido nos últimos cinco minutos, co
 
 A API, sua migração de banco e o painel precisam ser publicados separadamente antes de ativar esse envio. O monitor pode funcionar apenas com logs locais enquanto essa preparação não estiver concluída.
 
-As alterações correspondentes estão na branch `codex/monitor-pdv` do [Conecta](https://github.com/jeremiascb/conecta-feirao/tree/codex/monitor-pdv) e da [API](https://github.com/jeremiascb/conecta-feirao-api/tree/codex/monitor-pdv). No repositório da API, `PDV_MONITOR.md` descreve a publicação e `database/ddl/create_pdv_monitor_tables.sql` contém a migração do banco principal do Conecta. Essa migração deve ser revisada e aplicada no ambiente escolhido; o monitor Windows não a executa.
+**Ordem da atualização:** aplique primeiro a migração de inventário no banco do ambiente escolhido, depois publique a API que aceita `schemaVersion:2` e o painel. Depois atualize os monitores Windows. A API continua aceitando agentes v1. Um agente novo contra API antiga preserva a fila, porém o envio v2 será recusado até a atualização. As instruções e os arquivos SQL ficam em `PDV_MONITOR.md` no repositório da API; o Windows não executa migrações. O piloto deste projeto usa o ambiente `nxstore.shop` e a base `conecta_feirao_hm`; isso não autoriza alterar outra base.
 
 ## Recuperação: desarmada por padrão
 
@@ -112,10 +126,14 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\TestsMonitorPolitica.p
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\TestsMonitorTransporte.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\TestsMonitorHost.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\TestsMonitorRuntime.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\TestsMonitorInventario.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\TestsPnpProperties.ps1
 ```
 
 A aprovação dos testes simulados no macOS e no Windows PowerShell 5.1 não comprova funcionamento do Windows PowerShell 2.0, interface de bandeja, DPAPI, coleta WMI/Event Log, TLS/HTTPS, driver ou recuperação real.
 
-No primeiro caixa, validar abertura no usuário comum, presença/COM comparadas com o Gerenciador de Dispositivos, ocultação sem encerrar, exportação, início após novo login e saída explícita. Fora de uma venda, testar desconectar/reconectar um equipamento por vez, falta de rede/reenvio sem duplicar, mudança para offline na central e revogação. Conferir a presença desconhecida no Windows 7 e os avisos de consulta indisponível. Só depois avaliar recuperação durante manutenção acompanhada.
+Para atualizar uma instalação existente, encerre o monitor pelo ícone da bandeja, extraia todos os arquivos da nova versão e abra `Monitor.cmd` com o mesmo usuário e pasta de dados. Confirme a configuração central e os vínculos existentes; a chave permanece protegida para esse usuário. Se usa início automático, use novamente o botão de instalação para atualizar os arquivos copiados. Não execute uma versão antiga em paralelo.
+
+No primeiro caixa, validar abertura no usuário comum, presença/COM comparadas com o Gerenciador de Dispositivos, ocultação sem encerrar, exportação, início após novo login e saída explícita. Fora de uma venda, testar desconectar/reconectar um equipamento por vez, falta de rede/reenvio sem duplicar, mudança para offline na central e revogação. Conferir a presença desconhecida no Windows 7 e os avisos de consulta indisponível. Confirme que o patrimônio aparece na central, que não surgem novos snapshots periódicos e que a COM esperada de cada perfil está correta. Fora de venda, simule divergência apenas no perfil do monitor, observe o alerta após três leituras, restaure a referência e confira a resolução. Não renumere a COM do Windows para esse teste. Só depois avaliar recuperação durante manutenção acompanhada.
 
 Registre Windows, modelo do pinpad e da impressora, versões do driver, Nerus e CliSiTef. A documentação de [Get-WinEvent](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.diagnostics/get-winevent?view=powershell-5.1) explica as consultas aos canais Windows. A possibilidade de `AUTO_USB` deve ser validada separadamente com o fornecedor da [CliSiTef](https://dev.softwareexpress.com.br/docs/clisitef/configuracao_da_porta/), conforme equipamento e biblioteca instalados.
