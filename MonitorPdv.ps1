@@ -9,6 +9,7 @@ Add-Type -AssemblyName System.Windows.Forms;
 Add-Type -AssemblyName System.Drawing;
 [System.Windows.Forms.Application]::EnableVisualStyles();
 Import-Module $script:runtimePath -Force;
+Import-Module (Join-Path $script:programDirectory 'PdvMonitor.Atualizacao.psm1');
 
 function Show-PdvMonitorMessage {
   param([string]$Message, [string]$Title = 'Monitor do PDV');
@@ -98,7 +99,7 @@ function Update-PdvMonitorView {
   if (@($script:session.Config.Profiles).Count -eq 0) { $warnings += 'Para receber alertas de COM: selecione o pinpad e a impressora corretos, confirme a COM esperada e use Salvar vínculo. O inventário da máquina funciona sem vínculos.'; }
   $warningLabel.Text = $warnings -join ' | ';
   if (-not $warningLabel.Text) { $warningLabel.Text = 'Presença no Windows não comprova comunicação com o Nérus. O monitor não abre a porta COM nem lê dados de pagamentos.'; }
-  $dataLabel.Text = 'Logs e configuração: ' + $script:dataDirectory + [Environment]::NewLine + 'Envio central: ' + [string]$script:session.UploadStatusText + ' | ' + [string]$script:session.HardwareStatus;
+  $dataLabel.Text = 'Logs e configuração: ' + $script:dataDirectory + [Environment]::NewLine + 'Envio central: ' + [string]$script:session.UploadStatusText + ' | ' + [string]$script:session.HardwareStatus + ' | Versão ' + $script:session.MonitorVersion + ' | ' + $script:session.UpdateStatus;
 }
 
 function Set-PdvMonitorControls {
@@ -205,6 +206,12 @@ function Complete-PdvMonitorTickWorker {
   if ($failure) { $statusLabel.Text = 'Falha na coleta; nova tentativa em 15 segundos: ' + $failure; }
   $script:nextTickAt = (Get-Date).AddSeconds(15);
   Set-PdvMonitorControls (-not $script:closing);
+  if (-not $script:closing -and -not $failure -and $script:session.UpdateStaged -and $script:session.AutoUpdateEnabled) {
+    $idle=(-not $script:session.MaintenanceArmed -and ($null -eq $script:session.NerusAutomation -or $null -eq $script:session.NerusAutomation.Pending));
+    $apply=Start-PdvMonitorUpdateApply -Session $script:session -ProgramDirectory $script:programDirectory -Enabled $script:session.AutoUpdateEnabled -OperationsIdle $idle;
+    $script:session.UpdateStatus=$apply.Reason;
+    if ($apply.Started) { $script:closing=$true; }
+  }
   if ($script:closing) { $form.Close(); }
 }
 
@@ -237,13 +244,13 @@ $tray = $null; $timer = $null; $form = $null;
 $script:wmiSource = 'Feirao.PdvMonitor.DeviceChange.' + [guid]::NewGuid().ToString('N');
 $script:wmiSubscribed = $false; $script:wmiWarning = '';
 try {
-  $script:session = Start-PdvMonitorSession -DataDirectory $script:dataDirectory;
+  $script:session = Start-PdvMonitorSession -DataDirectory $script:dataDirectory -ProgramDirectory $script:programDirectory;
   try {
     Register-WmiEvent -Class Win32_DeviceChangeEvent -SourceIdentifier $script:wmiSource -ErrorAction Stop | Out-Null;
     $script:wmiSubscribed = $true;
   } catch { $script:wmiWarning = 'Notificações imediatas do Windows indisponíveis; a coleta periódica continua. ' + $_.Exception.Message; }
   $form = New-Object System.Windows.Forms.Form;
-  $form.Text = 'Feirão | Monitor contínuo do PDV';
+  $form.Text = 'Feirão | Monitor do PDV ' + $script:session.MonitorVersion;
   $form.Size = New-Object System.Drawing.Size(1120, 790);
   $form.MinimumSize = New-Object System.Drawing.Size(940, 730);
   $form.StartPosition = 'CenterScreen'; $form.Font = New-Object System.Drawing.Font('Segoe UI', 9);

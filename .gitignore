@@ -18,3 +18,13 @@ status.txt
 inventario-hardware.json*
 inventario-estado.xml*
 hardware-pendente.xml*
+
+# Estado da automação e assinatura privada nunca integra o programa.
+nerus-automacao.xml*
+atualizacoes/
+*-signing.xml
+*.pem
+*.key
+falha-inicializacao-monitor.txt
+
+__pycache__/

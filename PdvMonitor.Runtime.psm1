@@ -6,6 +6,9 @@ Import-Module (Join-Path $script:runtimeDirectory 'PdvMonitor.Coleta.psm1') -For
 Import-Module (Join-Path $script:runtimeDirectory 'PdvMonitor.Politica.psm1') -Force;
 Import-Module (Join-Path $script:runtimeDirectory 'PdvMonitor.Transporte.psm1') -Force;
 Import-Module (Join-Path $script:runtimeDirectory 'PdvMonitor.Inventario.psm1');
+Import-Module (Join-Path $script:runtimeDirectory 'PdvMonitor.Nerus.psm1');
+Import-Module (Join-Path $script:runtimeDirectory 'PdvMonitor.Atualizacao.psm1');
+Import-Module (Join-Path $script:runtimeDirectory 'PdvMonitor.Version.psm1');
 
 function Get-PdvRuntimeNow { return [DateTimeOffset]::Now; }
 
@@ -215,7 +218,7 @@ function New-PdvMonitorRecoveryState {
 
 function Start-PdvMonitorSession {
   [CmdletBinding()]
-  param([string]$DataDirectory = (Join-Path $env:LOCALAPPDATA 'Feirao\PdvMonitor'));
+  param([string]$DataDirectory = (Join-Path $env:LOCALAPPDATA 'Feirao\PdvMonitor'), [string]$ProgramDirectory = '');
   $data = [IO.Path]::GetFullPath($DataDirectory);
   [void][IO.Directory]::CreateDirectory($data);
   $logDirectory = Join-Path $data 'logs'; [void][IO.Directory]::CreateDirectory($logDirectory);
@@ -252,8 +255,14 @@ function Start-PdvMonitorSession {
     PreviousUploadFailureReason = ''; LastLoggedOutboxGapCount = 0L;
     ComAlertStates = @{}; WindowsAlertStates = @{}; LastHardwareAt = $null; HardwareStatus = '';
     HardwareFingerprint = ''; HardwareLastQueuedAt = $null; HardwareQueueFailed = $false;
+    HardwareMachineId = ''; ProgramDirectory = $ProgramDirectory; NerusAutomation = $null;
+    AutoUpdateEnabled = $false; NextUpdateCheckAt = [DateTimeOffset]::MinValue;
+    UpdateStatus = ''; LastUpdateReason = ''; UpdateStaged = $false; MonitorVersion = (Get-PdvMonitorVersion);
   };
   Initialize-PdvMonitorCentral -Session $session | Out-Null;
+  if ($ProgramDirectory -and [IO.File]::Exists((Join-Path $ProgramDirectory 'atualizacoes-chave-publica.xml'))) {
+    [void](Initialize-PdvMonitorUpdateTrust -DataDirectory $data -PublicKeyPath (Join-Path $ProgramDirectory 'atualizacoes-chave-publica.xml'));
+  }
   $historyPath = Join-Path $data 'recuperacoes.xml';
   if ([IO.File]::Exists($historyPath)) {
     try {
@@ -301,7 +310,7 @@ function Start-PdvMonitorSession {
       if ($lastQueued) { $session.HardwareLastQueuedAt=[DateTimeOffset]::Parse($lastQueued,[Globalization.CultureInfo]::InvariantCulture); }
     } catch { Write-PdvMonitorRecord $session 'CollectionWarning' 'Estado anterior do inventário indisponível; a coleta será refeita sem alterar equipamentos.'; }
   }
-  Write-PdvMonitorRecord $session 'SessionStarted' ('Monitor iniciado; computador=' + $env:COMPUTERNAME + '; PowerShell=' + $PSVersionTable.PSVersion + '; recuperação desarmada.');
+  Write-PdvMonitorRecord $session 'SessionStarted' ('Monitor iniciado; versão=' + $session.MonitorVersion + '; computador=' + $env:COMPUTERNAME + '; PowerShell=' + $PSVersionTable.PSVersion + '; recuperação desarmada.');
   Remove-PdvMonitorOldLogs $session;
   return $session;
 }
@@ -414,7 +423,7 @@ function Update-PdvMonitorHardware {
     $result=Get-PdvMonitorHardwareInventory;
     if (-not $result.Success -or $null -eq $result.Hardware) { throw 'InventoryUnavailable'; }
     if ($Session.HardwareFingerprint -and -not [bool](Get-PdvRuntimeValue $result 'CoverageHealthy' $true)) { throw 'InventoryCoverageIncomplete'; }
-    $hardware=$result.Hardware; $fingerprint=Get-PdvHardwareFingerprint $hardware;
+    $hardware=$result.Hardware; $Session.HardwareMachineId=[string]$hardware.machineId; $fingerprint=Get-PdvHardwareFingerprint $hardware;
     $json=ConvertTo-PdvHardwareJson $hardware;
     $previousFingerprint=$Session.HardwareFingerprint;
     $changed=($fingerprint -cne $previousFingerprint);
@@ -539,6 +548,26 @@ function Invoke-PdvMonitorWindowsAlerts {
   }
 }
 
+function Publish-PdvMonitorUpdateResult {
+  param($Session);
+  $path=Join-Path (Join-Path $Session.DataDirectory 'atualizacoes') 'estado.xml';
+  if (-not [IO.File]::Exists($path)) { return; }
+  try {
+    $xml=Read-PdvRuntimeXml $path; $root=$xml.DocumentElement;
+    if ($root.Name -cne 'Update' -or $root.NamespaceURI -or $root.Attributes.Count -ne 4 -or $root.SelectNodes('*').Count) { return; }
+    $status=$root.GetAttribute('status'); $version=$root.GetAttribute('version'); $reason=$root.GetAttribute('reason'); $at=$root.GetAttribute('at');
+    if (@('installed','rolledBack','failed') -cnotcontains $status -or $version -notmatch '^[0-9]{1,4}[.][0-9]{1,4}[.][0-9]{1,4}$' -or $reason -notmatch '^Update[A-Za-z]{1,80}$' -or $at.Length -gt 48) { return; }
+    [void][DateTimeOffset]::Parse($at,[Globalization.CultureInfo]::InvariantCulture);
+    $signature=$status+'|'+$version+'|'+$reason+'|'+$at;
+    $marker=Join-Path (Join-Path $Session.DataDirectory 'atualizacoes') 'ultimo-resultado-enviado.txt';
+    if ([IO.File]::Exists($marker) -and (New-Object IO.FileInfo($marker)).Length -le 512 -and [IO.File]::ReadAllText($marker) -ceq $signature) { return; }
+  } catch { return; }
+  $kind='UpdateFailed'; if ($status -ceq 'installed') { $kind='UpdateApplied'; } elseif ($status -ceq 'rolledBack') { $kind='UpdateRollback'; }
+  $previousGap=$Session.OutboxGapCount;
+  Write-PdvMonitorRecord $Session $kind ('Resultado da atualização do próprio monitor: '+$status+'; versão candidata='+$version+'; motivo='+$reason+'; informado em='+$at+'. PDV e TEF não foram encerrados.') -Reason $reason;
+  if ($Session.OutboxGapCount -eq $previousGap) { Write-PdvRuntimeAtomic $marker $signature; }
+}
+
 function Invoke-PdvMonitorTick {
   [CmdletBinding()]
   param($Session);
@@ -559,7 +588,16 @@ function Invoke-PdvMonitorTick {
     # um sinal genérico não identifica dispositivo e não precisa chegar ao suporte.
     $signalCount = 0;
     while ($Session.Signals.Count -gt 0 -and $signalCount -lt 1000) { [void]$Session.Signals.Dequeue(); $signalCount++; }
-    $snapshot = Get-PdvMonitorSnapshot; $Session.Snapshot = $snapshot;
+    $snapshot = Get-PdvMonitorSnapshot; $snapshotAt=Get-PdvRuntimeNow; $Session.Snapshot = $snapshot;
+    if ($Session.ProgramDirectory) {
+      Invoke-PdvMonitorNerusAutomation -Session $Session -Snapshot $snapshot -ObservedAt $snapshotAt;
+      if ($null -ne $Session.NerusAutomation) {
+        while ($Session.NerusAutomation.Events.Count) {
+          $notice=$Session.NerusAutomation.Events.Dequeue();
+          Write-PdvMonitorRecord $Session $notice.Kind $notice.Detail -Role 'Impressora Nerus' -Reason $notice.Reason;
+        }
+      }
+    }
     $warningText = @($snapshot.Warnings) -join ' | ';
     if ($warningText -ne $Session.PreviousWarnings) {
       if ($warningText) { Write-PdvMonitorRecord $Session 'CollectionWarning' $warningText; }
@@ -645,8 +683,23 @@ function Invoke-PdvMonitorTick {
       }
     }
     if ($null -eq $Session.LastHeartbeatAt -or ($now - $Session.LastHeartbeatAt).TotalSeconds -ge 60) {
-      Write-PdvMonitorRecord $Session 'Heartbeat' ('Monitor ativo; modo=' + $snapshot.InventoryMode + '; inventário completo=' + $snapshot.InventoryComplete + '; presença completa=' + $snapshot.PresenceComplete + '; dispositivos=' + @($snapshot.Devices).Count + '; recuperação armada=' + $Session.MaintenanceArmed + '; eventos sem fila central=' + $Session.OutboxGapCount);
+      Write-PdvMonitorRecord $Session 'Heartbeat' ('Monitor ativo; modo=' + $snapshot.InventoryMode + '; inventário completo=' + $snapshot.InventoryComplete + '; presença completa=' + $snapshot.PresenceComplete + '; dispositivos=' + @($snapshot.Devices).Count + '; recuperação armada=' + $Session.MaintenanceArmed + '; versão=' + $Session.MonitorVersion + '; eventos sem fila central=' + $Session.OutboxGapCount);
       $Session.LastHeartbeatAt = $now; Remove-PdvMonitorOldLogs $Session;
+    }
+    if ($Session.ProgramDirectory) {
+      Publish-PdvMonitorUpdateResult $Session;
+      if ($Session.AutoUpdateEnabled -and $now -ge $Session.NextUpdateCheckAt -and ($null -eq $Session.NerusAutomation -or $null -eq $Session.NerusAutomation.Pending) -and -not $Session.MaintenanceArmed) {
+        $Session.NextUpdateCheckAt=$now.AddHours(6);
+        $update=Invoke-PdvMonitorUpdateCheck -Session $Session -ProgramDirectory $Session.ProgramDirectory -CurrentVersion $Session.MonitorVersion -Enabled $true;
+        $Session.UpdateStatus=[string]$update.Reason; $Session.UpdateStaged=[bool]$update.Staged;
+        if (-not $update.Success) { $Session.NextUpdateCheckAt=$now.AddMinutes(15); }
+        if ($Session.LastUpdateReason -cne [string]$update.Reason) {
+          if ($update.Staged) { Write-PdvMonitorRecord $Session 'UpdateStaged' ('Versão '+$update.Version+' aprovada e verificada. Aguardando o monitor ficar livre para reiniciar somente sua própria coleta.') -Reason $update.Reason; }
+          elseif (-not $update.Success) { Write-PdvMonitorRecord $Session 'UpdateFailed' ('Atualização não aplicada; motivo='+$update.Reason+'. Versão atual continua em uso.') -Reason $update.Reason; }
+          $Session.LastUpdateReason=[string]$update.Reason;
+        }
+      }
+      [void](Write-PdvMonitorUpdateHealth -Session $Session -ProgramDirectory $Session.ProgramDirectory -TickHealthy ($Session.LoggingHealthy -and $complete));
     }
     $Session.LastTickAt = Get-PdvRuntimeNow;
     $Session.StatusText = 'Coletando | última consulta ' + (Get-Date -Format 'HH:mm:ss') + ' | ' + $snapshot.InventoryMode;
@@ -699,7 +752,7 @@ function Export-PdvMonitorLogs {
     $path = Join-Path $Session.DataDirectory $name;
     if ([IO.File]::Exists($path)) { [IO.File]::Copy($path, (Join-Path $destination $name)); }
   }
-  [IO.File]::WriteAllText((Join-Path $destination 'LEIA-ME.txt'), 'Diagnóstico local do monitor. Contém identificadores de hardware, loja/caixa e metadados de eventos. Não contém a chave de envio, dados de pagamento nem mensagens completas dos eventos do Windows. Datas incluem o fuso do computador; o relógio local pode estar incorreto. Logs locais têm retenção de 30 dias e limite total de 100 MB. O monitor não lê a configuração do Nerus nem executa pagamentos de teste.', [Text.Encoding]::UTF8);
+  [IO.File]::WriteAllText((Join-Path $destination 'LEIA-ME.txt'), 'Diagnóstico local do monitor. Contém identificadores de hardware, loja/caixa e metadados de eventos. Não contém a chave de envio, dados de pagamento nem mensagens completas dos eventos do Windows. Datas incluem o fuso do computador; o relógio local pode estar incorreto. Logs locais têm retenção de 30 dias e limite total de 100 MB. A integração autorizada consulta e ajusta somente o fiscalDevice da impressora pela API; não executa pagamentos de teste.', [Text.Encoding]::UTF8);
   return $destination;
 }
 

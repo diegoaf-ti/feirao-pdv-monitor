@@ -1,4 +1,6 @@
-# Proposta de correção da porta da impressora no Nerus
+> Este documento registra o desenho anterior. Consulte a implementação e os procedimentos atuais em [GUIA-PILOTO-V3.md](GUIA-PILOTO-V3.md). As frases abaixo sobre integração ainda não implementada pertencem à proposta histórica.
+
+# Histórico da proposta de correção Nerus (evoluído na versão 0.3.0)
 
 Esta proposta descreve a próxima integração. O monitor atual identifica alterações
 de COM, falhas e desconexões e as apresenta ao suporte; ele ainda não escreve a

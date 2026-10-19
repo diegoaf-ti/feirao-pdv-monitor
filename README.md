@@ -1,10 +1,10 @@
-# Monitor contínuo do PDV — Windows 7/10/11
+# Monitor contínuo do PDV 0.3.0 — Windows 7/10/11
 
 Monitor local do pinpad TEF e da impressora para registrar mudanças de porta COM, desconexões observáveis, problemas informados pelo Windows e tentativas de recuperação. Mantém histórico local e pode enviar os registros para a central do Conecta.
 
 **Piloto em validação.** Os testes com dados simulados passaram no macOS com PowerShell 7.5.4 e no Windows com PowerShell 5.1 pelo [GitHub Actions](https://github.com/diegoaf-ti/feirao-pdv-monitor/actions). A interface, a coleta nativa e os equipamentos reais ainda precisam ser validados no caixa. Comece acompanhado pelo suporte, mantendo a recuperação desarmada.
 
-Para atualizar o piloto, consulte o [guia de publicação e validação](GUIA-PILOTO-V2.md). A [proposta de correção no Nerus](PLANO-CORRECAO-NERUS.md) detalha os requisitos da futura integração.
+Para correção automática e atualização assinada, consulte o [guia do piloto 0.3.0](GUIA-PILOTO-V3.md) e a [documentação do atualizador](ATUALIZACAO-AUTOMATICA.md). O [guia v2](GUIA-PILOTO-V2.md) preserva as instruções anteriores.
 
 ## Abrir e deixar funcionando
 
@@ -21,6 +21,12 @@ O início automático ocorre **depois do login desse usuário no Windows**. Não
 A instalação é opcional: `Monitor.cmd` também funciona de forma portátil. Não há instalador `.exe`. Os iniciadores aplicam `ExecutionPolicy Bypass` somente ao processo aberto; não alteram a política permanente do computador. Se uma política da organização impedir a execução, o suporte deve providenciar a liberação.
 
 Para remover o início automático, execute `DesinstalarMonitor.ps1` pelo PowerShell no mesmo usuário. Isso remove somente o atalho criado pelo monitor e preserva programa, perfis, chave protegida e logs. Encerre a instância já aberta pelo ícone da bandeja.
+
+## Correção automática e atualização do monitor
+
+A central pode autorizar por instalação o ajuste de fiscalDevice para uma correspondência COM homologada. A tentativa exige PDV/TEF fechados, nenhuma impressão pendente, três leituras estáveis e nova conferência; a API usa ticket, comparação do valor anterior e auditoria transacional. A configuração aguarda reabertura e validação da impressão. O programa não fecha o caixa nem altera a COM do Windows.
+
+Atualizações aprovadas podem ser recebidas automaticamente após uma instalação inicial desta versão. O monitor valida a assinatura, aplica seu próprio programa e restaura o anterior se a nova versão falhar. As duas opções começam desativadas e são independentes. A integração v3 do Conecta/API precisa ser publicada antes de habilitá-las; por solicitação do usuário, essa publicação está pendente.
 
 ## Alertas para o suporte e inventário da empresa
 
@@ -94,7 +100,7 @@ A API, sua migração de banco e o painel precisam ser publicados separadamente 
 
 ## Recuperação: desarmada por padrão
 
-O uso normal é observar e registrar. A recuperação só pode solicitar ao Windows o reinício de uma **instância exata previamente vinculada**, durante uma manutenção autorizada pelo operador. Não fixa COM, não muda parâmetros/SQL do Nerus, não encerra processos, não reinicia o PC e não descarrega DLLs.
+A recuperação local de dispositivo é separada da integração Nerus descrita acima: ela só pode solicitar ao Windows o reinício de uma **instância exata previamente vinculada**, durante uma manutenção autorizada pelo operador. Não fixa COM, não muda parâmetros/SQL do Nerus, não encerra processos, não reinicia o PC e não descarrega DLLs.
 
 Para avaliar essa função no caixa piloto, o suporte deve identificar os equipamentos, encerrar o PDV/TEF, verificar que não há transação ou impressão pendente, habilitar a recuperação apenas no perfil desejado e informar os nomes exatos dos processos do PDV/TEF. Depois pode usar **Armar recuperação por 15 minutos...**. A janela expira automaticamente e não permanece armada ao reabrir o monitor.
 
