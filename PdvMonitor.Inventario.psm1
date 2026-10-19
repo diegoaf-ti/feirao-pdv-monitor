@@ -79,15 +79,27 @@ function ConvertTo-PdvHardwareJson {
   throw 'HardwareShapeUnsupported';
 }
 
+function Get-PdvHardwareCanonicalArray {
+  param([object[]]$Items);
+  # O hash compara conteúdo, nunca a ordem incidental retornada pelo WMI.
+  # Sort-Object por nomes de propriedades não lê chaves de hashtable no PS5.1
+  # e chaves primárias podem empatar. Comparar o JSON canônico inteiro com
+  # Ordinal preserva duplicatas, distingue maiúsculas e independe da cultura.
+  $canonical=New-Object 'Collections.Generic.List[string]';
+  foreach ($item in @($Items)) { $canonical.Add((ConvertTo-PdvHardwareJson $item)); }
+  $canonical.Sort([StringComparer]::Ordinal);
+  return ,$canonical.ToArray();
+}
+
 function Get-PdvHardwareFingerprint {
   param([Collections.IDictionary]$Hardware);
   # Campos voláteis não alteram a identidade do patrimônio nem causam incidentes.
   $copy=@{}; foreach ($key in $Hardware.Keys) { if (@('collectedAt','warnings') -notcontains $key) { $copy[$key]=$Hardware[$key]; } }
   $copy.os=@{}; foreach ($key in $Hardware.os.Keys) { if ($key -ne 'lastBootAt') { $copy.os[$key]=$Hardware.os[$key]; } }
   $copy.systemVolume=@{}; foreach ($key in $Hardware.systemVolume.Keys) { if ($key -ne 'freeBytes') { $copy.systemVolume[$key]=$Hardware.systemVolume[$key]; } }
-  $copy.disks=@($Hardware.disks | Sort-Object id,serialNumber,model);
-  $copy.networkAdapters=@($Hardware.networkAdapters | Sort-Object macAddress,name);
-  $copy.memory=@{totalBytes=$Hardware.memory.totalBytes; modules=@($Hardware.memory.modules | Sort-Object serialNumber,partNumber,capacityBytes,speedMHz)};
+  $copy.disks=Get-PdvHardwareCanonicalArray @($Hardware.disks);
+  $copy.networkAdapters=Get-PdvHardwareCanonicalArray @($Hardware.networkAdapters);
+  $copy.memory=@{totalBytes=$Hardware.memory.totalBytes; modules=(Get-PdvHardwareCanonicalArray @($Hardware.memory.modules))};
   $sha=[Security.Cryptography.SHA256]::Create();
   try { return [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes((ConvertTo-PdvHardwareJson $copy)))).Replace('-','').ToLowerInvariant(); }
   finally { $sha.Dispose(); }
@@ -140,10 +152,10 @@ function Get-PdvMonitorHardwareInventory {
     serialNumber=(ConvertTo-PdvHardwareText (Get-PdvHardwareValue $bios 'SerialNumber') 128);
     os=@{caption=(ConvertTo-PdvHardwareText (Get-PdvHardwareValue $os 'Caption') 160);version=(ConvertTo-PdvHardwareText (Get-PdvHardwareValue $os 'Version') 80);build=(ConvertTo-PdvHardwareText (Get-PdvHardwareValue $os 'BuildNumber') 40);architecture=(ConvertTo-PdvHardwareText (Get-PdvHardwareValue $os 'OSArchitecture') 40);lastBootAt=(ConvertTo-PdvHardwareTime (Get-PdvHardwareValue $os 'LastBootUpTime'));};
     cpu=@{name=(ConvertTo-PdvHardwareText (Get-PdvHardwareValue $cpu 'Name') 200);cores=(ConvertTo-PdvHardwareNumber $cores 1024);logicalProcessors=(ConvertTo-PdvHardwareNumber $logical 1024);};
-    memory=@{totalBytes=(ConvertTo-PdvHardwareNumber (Get-PdvHardwareValue $computer 'TotalPhysicalMemory'));modules=@($modules | Sort-Object serialNumber,partNumber,capacityBytes,speedMHz);};
-    disks=@($disks | Sort-Object id,serialNumber,model);
+    memory=@{totalBytes=(ConvertTo-PdvHardwareNumber (Get-PdvHardwareValue $computer 'TotalPhysicalMemory'));modules=@($modules | Sort-Object -CaseSensitive -Property { [string]($_['serialNumber']) },{ [string]($_['partNumber']) },{ [string]($_['capacityBytes']) },{ [string]($_['speedMHz']) },{ ConvertTo-PdvHardwareJson $_ });};
+    disks=@($disks | Sort-Object -CaseSensitive -Property { [string]($_['id']) },{ [string]($_['serialNumber']) },{ [string]($_['model']) },{ ConvertTo-PdvHardwareJson $_ });
     systemVolume=@{name=$systemDrive;totalBytes=(ConvertTo-PdvHardwareNumber (Get-PdvHardwareValue $volumeInfo 'Size'));freeBytes=(ConvertTo-PdvHardwareNumber (Get-PdvHardwareValue $volumeInfo 'FreeSpace'));};
-    networkAdapters=@($adapters | Sort-Object macAddress,name); warnings=@($warnings.ToArray() | Select-Object -First 16);
+    networkAdapters=@($adapters | Sort-Object -CaseSensitive -Property { [string]($_['macAddress']) },{ [string]($_['name']) },{ ConvertTo-PdvHardwareJson $_ }); warnings=@($warnings.ToArray() | Select-Object -First 16);
   };
   if ($hardware.systemVolume.totalBytes -and $hardware.systemVolume.freeBytes -and [UInt64]$hardware.systemVolume.freeBytes -gt [UInt64]$hardware.systemVolume.totalBytes) {
     $hardware.systemVolume.freeBytes=''; $hardware.warnings=@($hardware.warnings)+@('Espaço livre inconsistente no volume do sistema; valor omitido.');

@@ -31,6 +31,21 @@ Assert-Inventory ((Get-PdvHardwareFingerprint $hardware) -cne $hash) 'Alteraçã
 $hardware.disks=@(@{id='2';model='SSD2';serialNumber='SN2';sizeBytes='2';interfaceType='USB';status='OK'},@{id='1';model='SSD1';serialNumber='SN1';sizeBytes='1';interfaceType='USB';status='OK'});
 $hash=Get-PdvHardwareFingerprint $hardware; $hardware.disks=@($hardware.disks[1],$hardware.disks[0]);
 Assert-Inventory ((Get-PdvHardwareFingerprint $hardware) -ceq $hash) 'Ordenação dos discos não gera mudança de hardware';
+# Empates nas antigas chaves, diferença de maiúsculas e duplicatas preservadas.
+$hardware.disks=@(@{id='1';model='SSD';serialNumber='SN';sizeBytes='100';interfaceType='USB';status='OK'},@{id='1';model='SSD';serialNumber='SN';sizeBytes='200';interfaceType='USB';status='OK'},@{id='1';model='ssd';serialNumber='sn';sizeBytes='300';interfaceType='USB';status='OK'});
+$hardware.memory.modules=@(@{capacityBytes='1';manufacturer='RAM';partNumber='PN';serialNumber='SN';speedMHz='100'},@{capacityBytes='1';manufacturer='ram';partNumber='PN';serialNumber='SN';speedMHz='100'});
+$hardware.networkAdapters=@(@{name='Rede';macAddress='AA:BB';adapterType='Ethernet'},@{name='Rede';macAddress='AA:BB';adapterType='Outro'},@{name='rede';macAddress='aa:bb';adapterType='Ethernet'});
+$hash=Get-PdvHardwareFingerprint $hardware;
+$hardware.disks=@($hardware.disks[2],$hardware.disks[0],$hardware.disks[1]);
+$hardware.memory.modules=@($hardware.memory.modules[1],$hardware.memory.modules[0]);
+$hardware.networkAdapters=@($hardware.networkAdapters[2],$hardware.networkAdapters[1],$hardware.networkAdapters[0]);
+Assert-Inventory ((Get-PdvHardwareFingerprint $hardware) -ceq $hash) 'Empates e maiúsculas em discos/RAM/rede não tornam o hash dependente da ordem';
+$hardware.disks+=@($hardware.disks[0]);
+Assert-Inventory ((Get-PdvHardwareFingerprint $hardware) -cne $hash) 'Duplicatas reais continuam fazendo parte do inventário';
+$hardware.disks=@($hardware.disks[0],$hardware.disks[1],$hardware.disks[2]);
+$hardware.networkAdapters[0].name='REDE';
+Assert-Inventory ((Get-PdvHardwareFingerprint $hardware) -cne $hash) 'Alteração real de maiúsculas não é descartada pelo comparador';
+
 & $module { $script:Data.Win32_ComputerSystem[0].Name=('á'*63)+[char]0xd83d+[char]0xde80+[char]0; $script:Data.Win32_NetworkAdapter[0].MACAddress='INVÁLIDO/IP'; };
 $result=Get-PdvMonitorHardwareInventory;
 Assert-Inventory ($result.Hardware.hostname.Length -eq 63 -and $result.Hardware.networkAdapters[0].macAddress -ceq '') 'Sanitização de controles/MAC e truncamento sem cortar surrogate';
