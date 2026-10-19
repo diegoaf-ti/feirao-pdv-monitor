@@ -79,13 +79,30 @@ function New-AutomationSession([string]$Name) {
   $data=Join-Path $testRoot $Name;
   return (Start-PdvMonitorSession -DataDirectory $data -ProgramDirectory (Join-Path $data 'programa'));
 }
-function Get-AutomationRecords([string]$Kind) { return (& $runtime { param($k); return ,@($script:Records | Where-Object {$_.Kind -ceq $k}); } $Kind); }
+function Get-AutomationRecords([string]$Kind) {
+  # Preserva explicitamente o array na saída da função: em 5.1/StrictMode um
+  # único PSObject não fornece Count, e zero resultados normalmente vira null.
+  $matches=@(& $runtime {
+    param($k);
+    foreach ($record in $script:Records) { if ($record.Kind -ceq $k) { $record; } }
+  } $Kind);
+  return ,$matches;
+}
 function Write-TestJournal($Session,[string]$Status='installed',[string]$Reason='UpdateHealthConfirmed') {
   $updates=Join-Path $Session.DataDirectory 'atualizacoes'; [void][IO.Directory]::CreateDirectory($updates);
   $xml=New-Object Xml.XmlDocument; $r=$xml.CreateElement('Update'); [void]$xml.AppendChild($r); $r.SetAttribute('status',$Status); $r.SetAttribute('version','0.3.1'); $r.SetAttribute('reason',$Reason); $r.SetAttribute('at','2026-10-19T12:00:00-03:00');
   [IO.File]::WriteAllText((Join-Path $updates 'estado.xml'),$xml.OuterXml);
 }
 try {
+  Reset-TestMetrics;
+  $none=Get-AutomationRecords 'ArrayContract';
+  Assert-Automation ($none -is [object[]] -and $none.Count -eq 0) 'Helper de registros retorna array vazio em vez de null';
+  & $runtime { [void]$script:Records.Add((New-Object PSObject -Property @{Kind='ArrayContract';})); };
+  $one=Get-AutomationRecords 'ArrayContract';
+  Assert-Automation ($one -is [object[]] -and $one.Count -eq 1 -and $one[0].Kind -ceq 'ArrayContract') 'Helper mantém array quando existe um único registro';
+  & $runtime { [void]$script:Records.Add((New-Object PSObject -Property @{Kind='ArrayContract';})); };
+  $many=Get-AutomationRecords 'ArrayContract';
+  Assert-Automation ($many -is [object[]] -and $many.Count -eq 2) 'Helper mantém array para múltiplos registros';
   Reset-TestMetrics; $s=New-AutomationSession 'policy-six-hours';
   Assert-Automation (-not $s.AutoUpdateEnabled) 'Início não presume opt-in local';
   Invoke-PdvMonitorTick $s;
