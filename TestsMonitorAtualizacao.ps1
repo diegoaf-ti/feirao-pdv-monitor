@@ -10,7 +10,7 @@ $script:Checks=0;
 function Assert-Update($Condition,[string]$Message) { if (-not $Condition) { throw $Message; }; $script:Checks++; }
 function Assert-Rejected([scriptblock]$Action,[string]$Message) { $rejected=$false; try { & $Action; } catch { $rejected=$true; }; Assert-Update $rejected $Message; }
 try {
-  $rsa=& $module { $rsa=New-PdvUpdateRsa; $rsa.KeySize=2048; return ,$rsa; };
+  $rsa=& $module { $rsa=New-PdvUpdateRsa 2048; return ,$rsa; };
   $public=Join-Path $temporary 'public.xml'; [IO.File]::WriteAllText($public,$rsa.ToXmlString($false));
   $names=& $module { return ,$script:PdvUpdateProgramFiles; };
   Add-Type -AssemblyName System.IO.Compression;
@@ -60,7 +60,7 @@ try {
   $trustData=Join-Path $temporary 'pinning';
   Assert-Update ((Initialize-PdvMonitorUpdateTrust $trustData $public) -ceq 'Pinned') 'Bootstrap fixa chave uma vez';
   Assert-Update ((Initialize-PdvMonitorUpdateTrust $trustData $public) -ceq 'AlreadyPinned') 'Reinstalação com mesma chave preserva pin';
-  $other=& $module { $k=New-PdvUpdateRsa; $k.KeySize=2048; return ,$k; }; $otherPath=Join-Path $temporary 'other.xml'; [IO.File]::WriteAllText($otherPath,$other.ToXmlString($false)); $other.Clear();
+  $other=& $module { $k=New-PdvUpdateRsa 2048; return ,$k; }; $otherPath=Join-Path $temporary 'other.xml'; [IO.File]::WriteAllText($otherPath,$other.ToXmlString($false)); $other.Clear();
   Assert-Rejected { Initialize-PdvMonitorUpdateTrust $trustData $otherPath; } 'Bootstrap não substitui chave fixada';
   $validOutput=Join-Path $temporary 'expanded';
   & $module { param($z,$o,$p); Expand-PdvApprovedUpdate $z $o '2.0.0' $p; } $zipPath $validOutput $public;

@@ -49,8 +49,14 @@ function Test-PdvUpdateVersion {
   return ($Version -cmatch '^(0|[1-9][0-9]{0,3})[.](0|[1-9][0-9]{0,3})[.](0|[1-9][0-9]{0,3})$');
 }
 function New-PdvUpdateRsa {
-  if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) { $parameters=New-Object Security.Cryptography.CspParameters(24); $rsa=New-Object Security.Cryptography.RSACryptoServiceProvider($parameters); }
-  else { $rsa=New-Object Security.Cryptography.RSACryptoServiceProvider; }
+  param([int]$KeySize=2048);
+  if ($KeySize -lt 2048 -or $KeySize -gt 4096 -or ($KeySize % 256) -ne 0) { throw 'UpdateRsaKeySizeInvalid'; }
+  # No .NET Framework, o adaptador PowerShell expõe KeySize do CSP como somente
+  # leitura. Definir o tamanho pelo construtor funciona em 5.1 e em .NET moderno.
+  if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+    $parameters=New-Object Security.Cryptography.CspParameters(24);
+    $rsa=New-Object -TypeName Security.Cryptography.RSACryptoServiceProvider -ArgumentList @($KeySize,$parameters);
+  } else { $rsa=New-Object -TypeName Security.Cryptography.RSACryptoServiceProvider -ArgumentList @($KeySize); }
   $rsa.PersistKeyInCsp=$false; return ,$rsa;
 }
 function Read-PdvUpdatePublicKey {
