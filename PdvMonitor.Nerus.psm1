@@ -152,21 +152,64 @@ function ConvertFrom-PdvNerusPolicy {
   }
   return $policy;
 }
+function Get-PdvNerusSampleDiagnosis {
+  # Diagnóstico puro: mantém as mesmas guardas da amostra e nunca deduz uma
+  # identidade pelo modelo, nome, porta ou histórico de dispositivos ausentes.
+  # Os motivos são textos fixos, sem payload, hostname ou identificador livre.
+  param($Session,$Snapshot,$Policy,[DateTimeOffset]$ObservedAt);
+  $result=@{Eligible=$false;Reason='';Detail='';Sample=$null};
+  if (-not $Snapshot.InventoryComplete -or -not $Snapshot.PresenceComplete) {
+    $result.Reason='NerusInventoryIncomplete'; $result.Detail='Correção aguardando inventário completo e presença confirmada. Uma consulta parcial não autoriza escolher outro dispositivo.'; return $result;
+  }
+  $profiles=@($Session.Config.Profiles | Where-Object {$_.InstanceId -ieq $Policy.InstanceId});
+  if ($profiles.Count -eq 0) {
+    $result.Reason='NerusPrinterProfileMissing'; $result.Detail='A impressora autorizada na central não tem vínculo local. O suporte precisa vincular a identidade exata; modelo e porta não criam vínculo automático.'; return $result;
+  }
+  if ($profiles.Count -ne 1) {
+    $result.Reason='NerusPrinterProfileAmbiguous'; $result.Detail='Há mais de um perfil local para a identidade autorizada. Corrigir os vínculos antes de permitir a tentativa.'; return $result;
+  }
+  if ([string]$profiles[0].Role -notmatch 'impressora') {
+    $result.Reason='NerusPrinterRoleInvalid'; $result.Detail='O vínculo local da identidade autorizada não está identificado como impressora. Nenhuma configuração do pinpad será alterada.'; return $result;
+  }
+  $devices=@($Snapshot.Devices | Where-Object {$_.InstanceId -ieq $Policy.InstanceId});
+  if ($devices.Count -eq 0) {
+    $result.Reason='NerusDeviceNotFound'; $result.Detail='A identidade exata autorizada não foi encontrada. Outro equipamento com mesmo modelo ou outra porta não será escolhido automaticamente.'; return $result;
+  }
+  if ($devices.Count -ne 1) {
+    $result.Reason='NerusDeviceIdentityAmbiguous'; $result.Detail='A consulta retornou mais de um dispositivo para a identidade autorizada. Aguardar uma leitura sem ambiguidade.'; return $result;
+  }
+  $device=$devices[0];
+  if ($device.Present -isnot [bool] -or $device.PresenceKnown -isnot [bool] -or -not $device.PresenceKnown) {
+    $result.Reason='NerusDevicePresenceUnknown'; $result.Detail='A presença física da impressora autorizada não foi confirmada. Estado OK ou porta cadastrada isoladamente não provam conexão.'; return $result;
+  }
+  if (-not $device.Present) {
+    $result.Reason='NerusDeviceAbsent'; $result.Detail='A identidade autorizada está ausente. Instâncias antigas mantidas pelo Windows não serão usadas, nem substituídas por outra impressora automaticamente.'; return $result;
+  }
+  if ([string]$device.ProblemCode -cne '0' -or [string]$device.Status -ine 'OK') {
+    $result.Reason='NerusDeviceUnhealthy'; $result.Detail='O Windows não confirmou a impressora autorizada como saudável. A correção do parâmetro aguarda código zero e estado OK.'; return $result;
+  }
+  $port=([string]$device.Port).ToUpperInvariant();
+  if (-not $Policy.PortMappings.ContainsKey($port)) {
+    $result.Reason='NerusPortMappingMissing'; $result.Detail='A porta atual da impressora não tem correspondência fiscalDevice homologada na política. Nenhum valor será calculado a partir do número COM.'; return $result;
+  }
+  foreach ($other in @($Snapshot.Devices)) {
+    if ($other.InstanceId -ine $Policy.InstanceId -and [string]$other.Port -ieq $port -and ($other.PresenceKnown -isnot [bool] -or -not $other.PresenceKnown -or $other.Present)) {
+      $result.Reason='NerusPortConflict'; $result.Detail='Outra identidade presente ou com presença desconhecida usa a porta atual. A tentativa aguarda exclusão do conflito; instâncias comprovadamente ausentes não contam como ocupação.'; return $result;
+    }
+  }
+  foreach ($other in @($Session.Config.Profiles)) {
+    if ($other.InstanceId -ine $Policy.InstanceId -and [string]$other.ExpectedPort -ieq $port) {
+      $result.Reason='NerusProfilePortConflict'; $result.Detail='Outro perfil local reserva a porta atual para uma identidade diferente. Conferir os vínculos antes de ajustar o parâmetro.'; return $result;
+    }
+  }
+  $result.Eligible=$true;
+  $result.Sample=@{observedAt=$ObservedAt.ToString('o');instanceId=$Policy.InstanceId;actualPort=$port;present=$true;presenceKnown=$true;healthy=$true;inventoryComplete=$true;problemCode='0'};
+  return $result;
+}
 function Get-PdvNerusSample {
   param($Session,$Snapshot,$Policy,[DateTimeOffset]$ObservedAt);
-  if (-not $Snapshot.InventoryComplete -or -not $Snapshot.PresenceComplete) { return $null; }
-  $profiles=@($Session.Config.Profiles | Where-Object {$_.InstanceId -ieq $Policy.InstanceId});
-  if ($profiles.Count -ne 1 -or [string]$profiles[0].Role -notmatch 'impressora') { return $null; }
-  $devices=@($Snapshot.Devices | Where-Object {$_.InstanceId -ieq $Policy.InstanceId});
-  if ($devices.Count -ne 1) { return $null; }; $device=$devices[0];
-  if ($device.Present -isnot [bool] -or -not $device.Present -or $device.PresenceKnown -isnot [bool] -or -not $device.PresenceKnown -or [string]$device.ProblemCode -cne '0' -or [string]$device.Status -ine 'OK') { return $null; }
-  $port=([string]$device.Port).ToUpperInvariant();
-  if (-not $Policy.PortMappings.ContainsKey($port)) { return $null; }
-  foreach ($other in @($Snapshot.Devices)) {
-    if ($other.InstanceId -ine $Policy.InstanceId -and [string]$other.Port -ieq $port -and ($other.PresenceKnown -isnot [bool] -or -not $other.PresenceKnown -or $other.Present)) { return $null; }
-  }
-  foreach ($other in @($Session.Config.Profiles)) { if ($other.InstanceId -ine $Policy.InstanceId -and [string]$other.ExpectedPort -ieq $port) { return $null; } }
-  return @{observedAt=$ObservedAt.ToString('o');instanceId=$Policy.InstanceId;actualPort=$port;present=$true;presenceKnown=$true;healthy=$true;inventoryComplete=$true;problemCode='0'};
+  $diagnosis=Get-PdvNerusSampleDiagnosis $Session $Snapshot $Policy $ObservedAt;
+  return $diagnosis.Sample;
 }
 function Get-PdvNerusEvidence {
   param($Session,$State);
@@ -264,8 +307,12 @@ function Invoke-PdvMonitorNerusAutomation {
       Add-PdvNerusNotice $state 'OutsideAutomaticWindow' 'NerusRecoveryBlocked' 'Correção Nerus aguardando política habilitada e horário autorizado. Coleta normal continua.';
       return;
     }
-    $sample=Get-PdvNerusSample $Session $Snapshot $state.Policy $ObservedAt;
-    Add-PdvNerusSample $state $sample;
+    $diagnosis=Get-PdvNerusSampleDiagnosis $Session $Snapshot $state.Policy $ObservedAt;
+    Add-PdvNerusSample $state $diagnosis.Sample;
+    if (-not $diagnosis.Eligible) {
+      Add-PdvNerusNotice $state $diagnosis.Reason 'NerusRecoveryBlocked' $diagnosis.Detail;
+      return;
+    }
     if ($state.Samples.Count -ne 3 -or $now -lt $state.NextAttemptAt -or -not $Session.LoggingHealthy -or $Session.MaintenanceArmed) { return; }
     $evidence=Get-PdvNerusEvidence $Session $state;
     if ($null -eq $evidence) {

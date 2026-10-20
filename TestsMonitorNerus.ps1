@@ -29,6 +29,27 @@ function New-TestDevice([string]$Id=$instance,[string]$Port='COM4',[bool]$Presen
 function New-TestSnapshot {
   return (New-Object PSObject -Property @{InventoryComplete=$true;PresenceComplete=$true;Devices=@((New-TestDevice))});
 }
+function New-TestComHistorySnapshot([bool]$ChangedIdentity=$false) {
+  # Sequência inspirada no atendimento, com identidades e nomes fictícios.
+  # Os oito registros antigos não representam oito equipamentos conectados.
+  $devices=@();
+  for ($i=0;$i -lt 8;$i++) {
+    $oldId='USB\VID_0B1B&PID_0003\GHOST-DEMO-'+$i;
+    if ($ChangedIdentity -and $i -eq 0) { $oldId=$instance; }
+    $old=New-TestDevice $oldId 'COM8' $false $true; $old.ProblemCode='45'; $old.Status='Unknown';
+    $devices+=@($old);
+  }
+  $activeId=$instance; $port='COM8';
+  if ($ChangedIdentity) { $activeId='USB\VID_0B1B&PID_0003\OTHER-LOCATION-DEMO'; $port='COM9'; }
+  $devices+=@((New-TestDevice $activeId $port));
+  return (New-Object PSObject -Property @{InventoryComplete=$true;PresenceComplete=$true;Devices=$devices});
+}
+function Set-TestComHistoryPolicy {
+  # 42 é valor sintético explícito: não representa COM menos um.
+  $text=(New-TestPolicyXml).Replace('<Port>COM4</Port><FiscalDevice>3</FiscalDevice>','<Port>COM8</Port><FiscalDevice>42</FiscalDevice>');
+  $fresh=New-TestComHistorySnapshot; $prepared=New-TestReply 'prepared' $ticket 'COM8' '42'; $configured=New-TestReply 'configured_pending_restart' $ticket 'COM8' '42';
+  & $module {param($p,$s,$pr,$co);$script:TestPolicy=$p;$script:TestFreshSnapshot=$s;$script:TestPrepared=$pr;$script:TestConfigured=$co;} $text $fresh $prepared $configured;
+}
 function New-TestPolicyXml([bool]$Enabled=$true,[bool]$Updates=$false,[bool]$Window=$true) {
   $yes=([string]$Enabled).ToLowerInvariant(); $up=([string]$Updates).ToLowerInvariant(); $open=([string]$Window).ToLowerInvariant();
   return '<PdvMonitorPolicy schemaVersion="1"><ServerTime>2026-10-19T22:00:00-03:00</ServerTime><WindowOpen>'+ $open +'</WindowOpen><Enabled>'+$yes+'</Enabled><AutoUpdateEnabled>'+$up+'</AutoUpdateEnabled><Revision>'+$revision+'</Revision><InstanceId>'+[Security.SecurityElement]::Escape($instance)+'</InstanceId><HardwareId>machine-demo-001</HardwareId><PortMappings><Mapping><Port>COM4</Port><FiscalDevice>3</FiscalDevice></Mapping><Mapping><Port>COM5</Port><FiscalDevice>9</FiscalDevice></Mapping></PortMappings><BlockingProcessNames><Name>nerus</Name><Name>clisitef</Name></BlockingProcessNames><MaintenanceWindow><UtcOffsetMinutes>-180</UtcOffsetMinutes><Days><Day>1</Day></Days><Start>22:00</Start><End>23:00</End></MaintenanceWindow></PdvMonitorPolicy>';
@@ -185,6 +206,71 @@ try {
       Invoke-NerusTicks $s $sn;
       $expected=0;if ($case -ceq 'ghost') {$expected=1;}
       Assert-Nerus (@(Get-NerusCalls '/agent/nerus/prepare').Count -eq $expected) ('Conflito/perfil/fantasma avaliado incorretamente: '+$case);
+    }
+  };
+  Test-NerusCase 'diagnostico puro preserva amostra e explica cada bloqueio sem payload livre' {
+    foreach ($case in @('inventory','presence','profilemissing','profileduplicate','role','identitymissing','identityduplicate','unknown','presentunknown','absent','fault','status','unmapped','activeconflict','unknownconflict','profileconflict')) {
+      Reset-NerusMocks;$s=New-TestNerusSession;$sn=New-TestSnapshot;$expected='';
+      switch ($case) {
+        'inventory' {$sn.InventoryComplete=$false;$expected='NerusInventoryIncomplete';}
+        'presence' {$sn.PresenceComplete=$false;$expected='NerusInventoryIncomplete';}
+        'profilemissing' {$s.Config.Profiles=@();$expected='NerusPrinterProfileMissing';}
+        'profileduplicate' {$s.Config.Profiles+=@($s.Config.Profiles[0]);$expected='NerusPrinterProfileAmbiguous';}
+        'role' {$s.Config.Profiles[0].Role='PinpadTEF';$expected='NerusPrinterRoleInvalid';}
+        'identitymissing' {$sn.Devices=@((New-TestDevice 'USB\OTHER-DEMO' 'COM4'));$expected='NerusDeviceNotFound';}
+        'identityduplicate' {$sn.Devices+=@((New-TestDevice));$expected='NerusDeviceIdentityAmbiguous';}
+        'unknown' {$sn.Devices[0].PresenceKnown=$false;$expected='NerusDevicePresenceUnknown';}
+        'presentunknown' {$sn.Devices[0].Present='True';$expected='NerusDevicePresenceUnknown';}
+        'absent' {$sn.Devices[0].Present=$false;$expected='NerusDeviceAbsent';}
+        'fault' {$sn.Devices[0].ProblemCode='28';$expected='NerusDeviceUnhealthy';}
+        'status' {$sn.Devices[0].Status='ERROR';$expected='NerusDeviceUnhealthy';}
+        'unmapped' {$sn.Devices[0].Port='COM8';$expected='NerusPortMappingMissing';}
+        'activeconflict' {$sn.Devices+=@((New-TestDevice 'USB\OTHER-DEMO' 'COM4'));$expected='NerusPortConflict';}
+        'unknownconflict' {$sn.Devices+=@((New-TestDevice 'USB\OTHER-DEMO' 'COM4' $false $false));$expected='NerusPortConflict';}
+        'profileconflict' {$s.Config.Profiles+=New-Object PSObject -Property @{Role='PinpadTEF';InstanceId='USB\OTHER-DEMO';ExpectedPort='COM4'};$expected='NerusProfilePortConflict';}
+      }
+      $sn.Devices[0].Name='PAYLOAD-LIVRE-NAO-ENVIAR';
+      $policy=& $module {param($text);ConvertFrom-PdvNerusPolicy $text;} (New-TestPolicyXml);
+      $diagnosis=& $module {param($session,$snapshot,$p);Get-PdvNerusSampleDiagnosis $session $snapshot $p $script:TestNow;} $s $sn $policy;
+      $sample=& $module {param($session,$snapshot,$p);Get-PdvNerusSample $session $snapshot $p $script:TestNow;} $s $sn $policy;
+      Assert-Nerus (-not $diagnosis.Eligible -and $null -eq $diagnosis.Sample -and $null -eq $sample -and $diagnosis.Reason -ceq $expected) ('Diagnostico/amostra nao preservou bloqueio: '+$case);
+      Assert-Nerus (@(Get-NerusCalls).Count -eq 0) 'Helper puro iniciou HTTP';
+      Invoke-NerusTicks $s $sn 6;
+      $notices=@(Get-NerusEvents $s | Where-Object {$_.Kind -ceq 'NerusRecoveryBlocked' -and $_.Reason -ceq $expected});
+      Assert-Nerus ($notices.Count -eq 1 -and $notices[0].Detail -and $notices[0].Detail -notmatch 'PAYLOAD-LIVRE-NAO-ENVIAR') ('Bloqueio nao foi explicado/deduplicado com texto seguro: '+$case);
+      Assert-Nerus (@(Get-NerusCalls | Where-Object {$_.Method -ceq 'POST'}).Count -eq 0 -and $s.NerusAutomation.Samples.Count -eq 0) ('Diagnostico bloqueado iniciou POST ou reteve estabilidade: '+$case);
+    }
+  };
+  Test-NerusCase 'COM8 presente com oito fantasmas usa somente identidade e mapa explicitos' {
+    Reset-NerusMocks;Set-TestComHistoryPolicy;$s=New-TestNerusSession;$sn=New-TestComHistorySnapshot;
+    $s.Config.Profiles[0].ExpectedPort='COM8';
+    $s.Config.Central | Add-Member -MemberType NoteProperty -Name Terminal -Value 'CXDEMO01';
+    $s | Add-Member -MemberType NoteProperty -Name Hostname -Value 'WINDOWS-DEMO-OUTRO-NOME';
+    $policy=& $module {$p=ConvertFrom-PdvNerusPolicy $script:TestPolicy;return $p;};
+    $diagnosis=& $module {param($session,$snapshot,$p);Get-PdvNerusSampleDiagnosis $session $snapshot $p $script:TestNow;} $s $sn $policy;
+    $sample=& $module {param($session,$snapshot,$p);Get-PdvNerusSample $session $snapshot $p $script:TestNow;} $s $sn $policy;
+    Assert-Nerus ($sn.Devices.Count -eq 9 -and $diagnosis.Eligible -and $sample.actualPort -ceq 'COM8' -and $sample.instanceId -ceq $instance) 'Fantasmas bloquearam a identidade presente ou amostra mudou de contrato';
+    Invoke-NerusTicks $s $sn;
+    $prepare=@(Get-NerusCalls '/agent/nerus/prepare');$commit=@(Get-NerusCalls '/agent/nerus/commit');
+    Assert-Nerus ($prepare.Count -eq 1 -and $commit.Count -eq 1) 'Identidade presente e mapa explicito nao chegaram ao handshake simulado';
+    $body=ConvertFrom-Json $prepare[0].Body;
+    Assert-Nerus ($body.evidence.hardwareId -ceq 'machine-demo-001' -and $body.evidence.samples[2].actualPort -ceq 'COM8' -and $s.Hostname -cne $s.Config.Central.Terminal) 'Nome Windows diferente do caixa impediu identidade fisica valida';
+    Assert-Nerus ($s.NerusAutomation.Policy.PortMappings['COM8'] -ceq '42' -and @(Get-NerusEvents $s | Where-Object {$_.Kind -ceq 'NerusRecoveryConfigured'}).Count -eq 1) 'Valor sintetico explicito foi substituido por formula de porta';
+  };
+  Test-NerusCase 'historico COM8 para outra identidade COM9 exige vinculo e mapa sem aliases' {
+    foreach ($case in @('missingprofile','oldidentity','oldidentitymissing','unmapped')) {
+      Reset-NerusMocks;Set-TestComHistoryPolicy;$s=New-TestNerusSession;$sn=New-TestComHistorySnapshot;$expected='';
+      switch ($case) {
+        'missingprofile' {$s.Config.Profiles=@();$expected='NerusPrinterProfileMissing';}
+        'oldidentity' {$sn=New-TestComHistorySnapshot $true;$expected='NerusDeviceAbsent';}
+        'oldidentitymissing' {$sn=New-TestComHistorySnapshot $true;$sn.Devices=@($sn.Devices | Where-Object {$_.InstanceId -cne $instance});$expected='NerusDeviceNotFound';}
+        'unmapped' {& $module {$script:TestPolicy=$script:TestPolicy.Replace('<Port>COM8</Port><FiscalDevice>42</FiscalDevice>','<Port>COM4</Port><FiscalDevice>3</FiscalDevice>');};$expected='NerusPortMappingMissing';}
+      }
+      Invoke-NerusTicks $s $sn 6;
+      $notices=@(Get-NerusEvents $s | Where-Object {$_.Kind -ceq 'NerusRecoveryBlocked' -and $_.Reason -ceq $expected});
+      Assert-Nerus ($notices.Count -eq 1 -and $s.NerusAutomation.Samples.Count -eq 0) ('Sequencia COM8/COM9 nao gerou bloqueio auditavel: '+$case);
+      Assert-Nerus (@(Get-NerusCalls | Where-Object {$_.Method -ceq 'POST'}).Count -eq 0) ('Sequencia COM8/COM9 iniciou alteracao sem vinculo/mapa: '+$case);
+      Assert-Nerus ($s.NerusAutomation.Policy.InstanceId -ceq $instance -and ($s.Config.Profiles.Count -eq 0 -or $s.Config.Profiles[0].InstanceId -ceq $instance)) 'Modelo/porta criou alias ou trocou identidade automaticamente';
     }
   };
   Test-NerusCase 'PDV aberto impressao pendente consultas falhas e manutencao impedem tentativa' {

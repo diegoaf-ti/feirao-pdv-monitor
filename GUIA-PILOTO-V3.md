@@ -1,4 +1,4 @@
-# Piloto 0.3.0 — correção Nerus e atualização automática
+# Piloto 0.3.1 — correção Nerus e atualização automática
 
 O monitor implementa a tentativa de ajuste de fiscalDevice pela API e a atualização assinada do próprio programa. O Conecta e a API precisam receber a integração v3 antes de habilitar essas opções. A publicação dessas duas aplicações está aguardando a decisão da equipe; esta entrega não atualiza nxstore.shop nem executa migrações.
 
@@ -8,7 +8,7 @@ O monitor implementa a tentativa de ajuste de fiscalDevice pela API e a atualiza
 2. Confirmar DB_NAME_CONECTA=conecta_feirao_hm e DB_NAME_SQLPARAM=teste_sqlparam para o piloto. O código recusa schema ausente ou inválido; não assume sqlparam de produção.
 3. Aplicar as tabelas originais, a migração de hardware v2 e database/ddl/create_pdv_monitor_automation.sql da integração v3, nessa ordem, conforme já existam no ambiente. As migrações são manuais.
 4. Publicar API v3 e painel, mantendo HTTPS. Para distribuir versões, montar um diretório de pacotes aprovados e configurar PDV_MONITOR_UPDATE_DIR com seu caminho absoluto no servidor/container. A API precisa apenas ler esse diretório; em Docker, usar volume somente leitura.
-5. Copiar para esse diretório o ZIP imutável 0.3.0.zip e o manifesto assinado latest.xml. Publicar primeiro o ZIP, depois substituir o manifesto de forma atômica.
+5. Copiar para esse diretório o ZIP imutável 0.3.1.zip e o manifesto assinado latest.xml. Publicar primeiro o ZIP, depois substituir o manifesto de forma atômica.
 
 Uma API antiga continua recebendo telemetria v1/v2. Rotas de automação ausentes não habilitam ações por dedução: o monitor mantém a coleta normal.
 
@@ -17,7 +17,7 @@ Uma API antiga continua recebendo telemetria v1/v2. Rotas de automação ausente
 A versão antiga não possui o mecanismo de atualização. É necessária uma instalação inicial:
 
 1. Encerrar o monitor anterior pela bandeja, preservando %LOCALAPPDATA%\Feirao\PdvMonitor.
-2. Extrair 0.3.0.zip completo e abrir Monitor.cmd com o usuário que opera o caixa.
+2. Extrair 0.3.1.zip completo e abrir Monitor.cmd com o usuário que opera o caixa.
 3. Usar **Iniciar automaticamente neste usuário...**. O instalador copia os 20 arquivos, fixa a chave pública e cria um iniciador estável fora da pasta substituída nas atualizações.
 4. Confirmar os vínculos locais da impressora e do pinpad. O InstanceId usado na central deve corresponder ao vínculo local **Impressora**; não escolher apenas pelo nome/modelo.
 5. Preservar instalação e chave de envio existentes. Não revogar nem recadastrar apenas por atualizar.
@@ -39,6 +39,8 @@ A API confere política, horário, máquina, dispositivo, evidências e limites.
 
 Timeout não autoriza criar outra alteração: o mesmo ticket é consultado/repetido até conhecer o resultado. Há intervalo de quinze minutos e limite de duas tentativas por hora. Falha ao salvar estado local bloqueia novas ações.
 
+Os registros de bloqueio da versão 0.3.1 informam quando falta vínculo local, identidade presente, coleta confiável ou mapa da porta. Sem correspondência homologada, o monitor não calcula fiscalDevice pela numeração da COM. Se a identidade USB mudar, a instância anterior ausente não é substituída automaticamente por outra do mesmo modelo; o suporte deve confirmar o vínculo correto. O nome do computador Windows não precisa coincidir com o nome do caixa Nerus: a central usa a instalação cadastrada e a identidade física da máquina.
+
 **Configuração gravada; aguarda reabertura** indica apenas ajuste do parâmetro. Abrir o Nerus e confirmar impressão. O monitor não encerra PDV, recarrega DLL, renumera COM ou executa pagamento/impressão de teste. Lista de processos e janela reduzem o risco, mas não substituem um contrato de manutenção do ERP: evitar iniciar o PDV durante a breve conferência do piloto.
 
 ## Habilitar atualização automática
@@ -55,12 +57,12 @@ A versão nova deve confirmar coleta saudável em até noventa segundos. Falha r
 
 Alterar código no GitHub não instala automaticamente um commit nos caixas:
 
-1. Atualizar o número em PdvMonitor.Version.psm1 e monitor-version.txt, por exemplo 0.3.1.
+1. Atualizar o número em PdvMonitor.Version.psm1 e monitor-version.txt, por exemplo 0.3.2.
 2. Rodar testes e revisar alterações.
 3. Gerar o pacote offline com a chave privada fora do repositório:
 
 ~~~text
-python3 tools/criar-pacote-atualizacao.py --source PASTA_FONTE --output PASTA_NOVA --version 0.3.1 --private-key CAMINHO_CHAVE_PRIVADA
+python3 tools/criar-pacote-atualizacao.py --source PASTA_FONTE --output PASTA_NOVA --version 0.3.2 --private-key CAMINHO_CHAVE_PRIVADA
 ~~~
 
 4. Conferir manifesto/ZIP; copiar o ZIP ao diretório oficial da API e trocar latest.xml atomicamente.
