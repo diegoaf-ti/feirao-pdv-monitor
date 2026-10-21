@@ -24,7 +24,7 @@ Para remover o início automático, execute `DesinstalarMonitor.ps1` pelo PowerS
 
 ## Correção automática e atualização do monitor
 
-A central pode autorizar por instalação o ajuste de fiscalDevice para uma correspondência COM homologada. A tentativa exige PDV/TEF fechados, nenhuma impressão pendente, três leituras estáveis e nova conferência; a API usa ticket, comparação do valor anterior e auditoria transacional. A configuração aguarda reabertura e validação da impressão. O programa não fecha o caixa nem altera a COM do Windows.
+A central pode autorizar por instalação o ajuste de fiscalDevice para uma correspondência COM homologada. A tentativa exige PDV/TEF fechados, nenhuma impressão pendente, três leituras estáveis e nova conferência; a API usa ticket, comparação do valor anterior e auditoria transacional. No fluxo autônomo, a configuração aguarda reabertura e validação da impressão; esse fluxo não fecha o caixa. A tentativa assistida descrita a seguir acrescenta o fechamento e a reabertura confirmados localmente. Nenhum dos fluxos altera a COM do Windows.
 
 A versão 0.4.0 acrescenta **Corrigir e reabrir Nerus...** no monitor local. Depois de consultar a divergência pela API, o operador confirma que finalizou ou cancelou venda e pagamento. A tentativa identifica o executável pelo atalho **Nerus** da Área de Trabalho, pede fechamento normal, aguarda a saída, usa a correção transacional existente e reabre uma vez. A aplicação pode recusar o fechamento; não há encerramento forçado ou confirmação automática dos diálogos. Resultado incerto da escrita bloqueia a reabertura automática. A consulta nova da API precisa estar publicada.
 
@@ -138,6 +138,11 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\TestsMonitorHost.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\TestsMonitorRuntime.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\TestsMonitorInventario.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\TestsPnpProperties.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\TestsMonitorNerus.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\TestsMonitorNerusRestart.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\TestsMonitorNerusRestartFlow.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\TestsMonitorAtualizacao.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\TestsMonitorIntegracaoAutomacao.ps1
 ```
 
 A aprovação dos testes simulados no macOS e no Windows PowerShell 5.1 não comprova funcionamento do Windows PowerShell 2.0, interface de bandeja, DPAPI, coleta WMI/Event Log, TLS/HTTPS, driver ou recuperação real.
