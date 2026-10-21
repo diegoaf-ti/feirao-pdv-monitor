@@ -1,10 +1,10 @@
-# Monitor contínuo do PDV 0.3.1 — Windows 7/10/11
+# Monitor contínuo do PDV 0.4.0 — Windows 7/10/11
 
 Monitor local do pinpad TEF e da impressora para registrar mudanças de porta COM, desconexões observáveis, problemas informados pelo Windows e tentativas de recuperação. Mantém histórico local e pode enviar os registros para a central do Conecta.
 
 **Piloto em validação.** Os testes com dados simulados passaram no macOS com PowerShell 7.5.4 e no Windows com PowerShell 5.1 pelo [GitHub Actions](https://github.com/diegoaf-ti/feirao-pdv-monitor/actions). A interface, a coleta nativa e os equipamentos reais ainda precisam ser validados no caixa. Comece acompanhado pelo suporte, mantendo a recuperação desarmada.
 
-Para correção automática e atualização assinada, consulte o [guia do piloto 0.3.1](GUIA-PILOTO-V3.md) e a [documentação do atualizador](ATUALIZACAO-AUTOMATICA.md). O [guia v2](GUIA-PILOTO-V2.md) preserva as instruções anteriores.
+Para correção automática e atualização assinada, consulte o [guia do piloto 0.4.0](GUIA-PILOTO-V3.md) e a [documentação do atualizador](ATUALIZACAO-AUTOMATICA.md). O [guia v2](GUIA-PILOTO-V2.md) preserva as instruções anteriores.
 
 ## Abrir e deixar funcionando
 
@@ -25,6 +25,8 @@ Para remover o início automático, execute `DesinstalarMonitor.ps1` pelo PowerS
 ## Correção automática e atualização do monitor
 
 A central pode autorizar por instalação o ajuste de fiscalDevice para uma correspondência COM homologada. A tentativa exige PDV/TEF fechados, nenhuma impressão pendente, três leituras estáveis e nova conferência; a API usa ticket, comparação do valor anterior e auditoria transacional. A configuração aguarda reabertura e validação da impressão. O programa não fecha o caixa nem altera a COM do Windows.
+
+A versão 0.4.0 acrescenta **Corrigir e reabrir Nerus...** no monitor local. Depois de consultar a divergência pela API, o operador confirma que finalizou ou cancelou venda e pagamento. A tentativa identifica o executável pelo atalho **Nerus** da Área de Trabalho, pede fechamento normal, aguarda a saída, usa a correção transacional existente e reabre uma vez. A aplicação pode recusar o fechamento; não há encerramento forçado ou confirmação automática dos diálogos. Resultado incerto da escrita bloqueia a reabertura automática. A consulta nova da API precisa estar publicada.
 
 A versão 0.3.1 explica nos registros por que uma tentativa não pode avançar: inventário incompleto, impressora sem vínculo, identidade ausente, porta sem correspondência homologada ou conflito. Instâncias ausentes de conexões anteriores não são escolhidas para corrigir o caixa. Esses avisos não confirmam falha de impressão nem autorizam associar equipamentos apenas pelo nome/modelo.
 

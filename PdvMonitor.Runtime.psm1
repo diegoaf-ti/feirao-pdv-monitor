@@ -6,7 +6,7 @@ Import-Module (Join-Path $script:runtimeDirectory 'PdvMonitor.Coleta.psm1') -For
 Import-Module (Join-Path $script:runtimeDirectory 'PdvMonitor.Politica.psm1') -Force;
 Import-Module (Join-Path $script:runtimeDirectory 'PdvMonitor.Transporte.psm1') -Force;
 Import-Module (Join-Path $script:runtimeDirectory 'PdvMonitor.Inventario.psm1');
-Import-Module (Join-Path $script:runtimeDirectory 'PdvMonitor.Nerus.psm1');
+$script:nerusModule = Import-Module (Join-Path $script:runtimeDirectory 'PdvMonitor.Nerus.psm1') -PassThru;
 Import-Module (Join-Path $script:runtimeDirectory 'PdvMonitor.Atualizacao.psm1');
 Import-Module (Join-Path $script:runtimeDirectory 'PdvMonitor.Version.psm1');
 
@@ -256,6 +256,7 @@ function Start-PdvMonitorSession {
     ComAlertStates = @{}; WindowsAlertStates = @{}; LastHardwareAt = $null; HardwareStatus = '';
     HardwareFingerprint = ''; HardwareLastQueuedAt = $null; HardwareQueueFailed = $false;
     HardwareMachineId = ''; ProgramDirectory = $ProgramDirectory; NerusAutomation = $null;
+    NerusRestart = @{ Busy=$false; Stage='Idle'; Proposal=$null; Reason=''; Result=''; };
     AutoUpdateEnabled = $false; NextUpdateCheckAt = [DateTimeOffset]::MinValue;
     UpdateStatus = ''; LastUpdateReason = ''; UpdateStaged = $false; MonitorVersion = (Get-PdvMonitorVersion);
   };
@@ -571,7 +572,8 @@ function Publish-PdvMonitorUpdateResult {
 function Invoke-PdvMonitorTick {
   [CmdletBinding()]
   param($Session);
-  if ($Session.Stopped -or $Session.TickBusy) { return; }
+  $restart = Get-PdvRuntimeValue $Session 'NerusRestart' $null;
+  if ($Session.Stopped -or $Session.TickBusy -or [bool](Get-PdvRuntimeValue $restart 'Busy' $false)) { return; }
   $Session.TickBusy = $true;
   try {
     # Conseguir gravar antes de avaliar qualquer ação também bloqueia recuperação
@@ -756,6 +758,18 @@ function Export-PdvMonitorLogs {
   return $destination;
 }
 
+function Invoke-PdvMonitorNerusRestartProbe {
+  [CmdletBinding()]
+  param($Session);
+  & $script:nerusModule { param($CurrentSession); Invoke-PdvMonitorNerusRestartProbe -Session $CurrentSession; } $Session;
+}
+
+function Invoke-PdvMonitorNerusRestartApply {
+  [CmdletBinding()]
+  param($Session, [string]$ProposalId);
+  & $script:nerusModule { param($CurrentSession, $Id); Invoke-PdvMonitorNerusRestartApply -Session $CurrentSession -ProposalId $Id; } $Session $ProposalId;
+}
+
 function Stop-PdvMonitorSession {
   [CmdletBinding()]
   param($Session);
@@ -765,4 +779,4 @@ function Stop-PdvMonitorSession {
   finally { $Session.Stopped = $true; }
 }
 
-Export-ModuleMember -Function Start-PdvMonitorSession, Invoke-PdvMonitorTick, Stop-PdvMonitorSession, Export-PdvMonitorLogs, Set-PdvMonitorMaintenance, Save-PdvMonitorProfiles, Set-PdvMonitorCentral;
+Export-ModuleMember -Function Start-PdvMonitorSession, Invoke-PdvMonitorTick, Stop-PdvMonitorSession, Export-PdvMonitorLogs, Set-PdvMonitorMaintenance, Save-PdvMonitorProfiles, Set-PdvMonitorCentral, Invoke-PdvMonitorNerusRestartProbe, Invoke-PdvMonitorNerusRestartApply;

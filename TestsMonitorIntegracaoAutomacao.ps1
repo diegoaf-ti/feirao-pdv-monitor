@@ -164,8 +164,9 @@ try {
   $script:ApplyCalls=New-Object Collections.ArrayList;
   function Start-PdvMonitorUpdateApply { param($Session,$ProgramDirectory,$Enabled,$OperationsIdle); [void]$script:ApplyCalls.Add([bool]$OperationsIdle); return [pscustomobject]@{Reason='MockWaiting';Started=$false;}; }
   $statusLabel=[pscustomobject]@{Text=''}; $form=[pscustomobject]@{}; $form | Add-Member -MemberType ScriptMethod -Name Close -Value { throw 'Não deve fechar interface no teste'; };
-  foreach ($case in @('maintenance','pending','idle')) {
+  foreach ($case in @('maintenance','pending','repair','idle')) {
     $script:closing=$false; $script:programDirectory='MOCK'; $script:session=[pscustomobject]@{UpdateStaged=$true;AutoUpdateEnabled=$true;MaintenanceArmed=($case -eq 'maintenance');NerusAutomation=@{Pending=$(if($case -eq 'pending'){@{Phase='prepare'}}else{$null})};UpdateStatus='';};
+    if ($case -eq 'repair') { $script:session | Add-Member -MemberType NoteProperty -Name NerusRestart -Value @{Busy=$true}; }
     $script:worker=[pscustomobject]@{Streams=[pscustomobject]@{Error=@()}}; $script:worker | Add-Member -MemberType ScriptMethod -Name EndInvoke -Value { param($r); }; $script:worker | Add-Member -MemberType ScriptMethod -Name Dispose -Value {};
     $script:workerResult=[pscustomobject]@{IsCompleted=$true}; Complete-PdvMonitorTickWorker;
     Assert-Automation ($script:ApplyCalls[$script:ApplyCalls.Count-1] -eq ($case -eq 'idle')) ('Host exige ociosidade: '+$case);
