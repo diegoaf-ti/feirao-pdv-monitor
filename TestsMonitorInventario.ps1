@@ -51,7 +51,7 @@ $result=Get-PdvMonitorHardwareInventory;
 Assert-Inventory ($result.Hardware.hostname.Length -eq 63 -and $result.Hardware.networkAdapters[0].macAddress -ceq '') 'Sanitização de controles/MAC e truncamento sem cortar surrogate';
 & $module { $script:Data.Win32_DiskDrive=@(1..30 | ForEach-Object { [pscustomobject]@{DeviceID=[string]$_;Model=('ç'*160);SerialNumber=('é'*128);Size=100;InterfaceType='SATA';Status='OK'} }); };
 $result=Get-PdvMonitorHardwareInventory; $json=ConvertTo-PdvHardwareJson $result.Hardware;
-Assert-Inventory ($result.Hardware.disks.Count -le 16 -and [Text.Encoding]::UTF8.GetByteCount($json) -le 32768 -and @($result.Hardware.warnings).Count -gt 0 -and (ConvertFrom-Json $json).schemaVersion -eq 1) 'Listas e bytes limitados mantendo JSON íntegro e cobertura explícita';
+Assert-Inventory ($result.Hardware.disks.Count -le 16 -and [Text.Encoding]::UTF8.GetByteCount($json) -le 32768 -and @($result.Hardware.warnings).Count -gt 0 -and (ConvertFrom-Json $json).schemaVersion -eq 2) 'Listas e bytes limitados mantendo JSON íntegro e cobertura explícita';
 & $module { $script:Data.Win32_OperatingSystem=@(); };
 $result=Get-PdvMonitorHardwareInventory;
 Assert-Inventory (-not $result.Success -and $null -eq $result.Hardware) 'Falha essencial não entrega inventário vazio para substituir um válido';

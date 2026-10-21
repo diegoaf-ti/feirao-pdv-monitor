@@ -99,7 +99,7 @@ function Update-PdvMonitorView {
   if (@($script:session.Config.Profiles).Count -eq 0) { $warnings += 'Para receber alertas de COM: selecione o pinpad e a impressora corretos, confirme a COM esperada e use Salvar vínculo. O inventário da máquina funciona sem vínculos.'; }
   $warningLabel.Text = $warnings -join ' | ';
   if (-not $warningLabel.Text) { $warningLabel.Text = 'Presença no Windows não comprova comunicação com o Nérus. O monitor não abre a porta COM nem lê dados de pagamentos.'; }
-  $dataLabel.Text = 'Logs e configuração: ' + $script:dataDirectory + [Environment]::NewLine + 'Envio central: ' + [string]$script:session.UploadStatusText + ' | ' + [string]$script:session.HardwareStatus + ' | Versão ' + $script:session.MonitorVersion + ' | ' + $script:session.UpdateStatus;
+  $dataLabel.Text = 'Logs e configuração: ' + $script:dataDirectory + [Environment]::NewLine + 'Envio central: ' + [string]$script:session.UploadStatusText + ' | ' + [string]$script:session.HardwareStatus + ' | ' + [string]$script:session.SoftwareStatus + ' | Versão ' + $script:session.MonitorVersion;
 }
 
 function Test-PdvMonitorNerusServiceBusy {

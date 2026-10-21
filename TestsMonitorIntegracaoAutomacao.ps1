@@ -30,6 +30,8 @@ function Assert-Automation([bool]$Condition,[string]$Message) { if (-not $Condit
   }
   function script:Get-PdvMonitorHardwareInventory { return (New-Object PSObject -Property @{Success=$false;Hardware=$null;}); }
   function script:Get-PdvMonitorNerusServiceDiscovery { param($Session); return @{Candidates=@();Processes=@();Complete=$true;Reason=''}; }
+  function script:Update-PdvMonitorSoftware { param($Session,$Now); $Session.LastSoftwareAt=$Now; }
+  function script:Publish-PdvMonitorSoftwareUpload { param($Session); }
   function script:Get-PdvMonitorWindowsEvents { param($Cursors,$MaxEventsPerChannel); return (New-Object PSObject -Property @{Events=@();Cursors=@{};ChannelStatus=@();Warnings=@();}); }
   function script:Invoke-PdvMonitorUpload { param($Session); return (New-Object PSObject -Property @{Success=$true;Reason='OutboxEmpty';Sent=0;}); }
   function script:Add-PdvMonitorOutboxRecord {

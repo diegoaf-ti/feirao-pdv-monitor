@@ -1,8 +1,10 @@
-# Monitor contínuo do PDV 0.5.0 — Windows 7/10/11
+# Monitor contínuo do PDV 0.6.0 — Windows 7/10/11
 
 Monitor local do pinpad TEF, da impressora e do componente Nerus para registrar mudanças de porta COM, desconexões observáveis, falhas dos dispositivos vinculados e tentativas de recuperação. Mantém histórico local e pode enviar os registros para a central do Conecta.
 
 **Piloto em validação.** Os testes com dados simulados passaram no macOS com PowerShell 7.5.4 e no Windows com PowerShell 5.1 pelo [GitHub Actions](https://github.com/diegoaf-ti/feirao-pdv-monitor/actions). A interface, a coleta nativa e os equipamentos reais ainda precisam ser validados no caixa. Comece acompanhado pelo suporte, mantendo a recuperação desarmada.
+
+A versão 0.6.0 acrescenta inventário de aplicativos, detecções disponíveis do Microsoft Defender e identificação de placa-mãe/slots de RAM para o histórico central de componentes. Consulte o [guia do inventário empresarial](GUIA-INVENTARIO-EMPRESA.md). A integração da API/banco/painel continua pendente de publicação, por orientação do usuário.
 
 Para o Caixa Web, consulte primeiro o [guia do Nerus Service](GUIA-NERUS-SERVICE.md). Para correção de fiscalDevice e atualização assinada, consulte o [guia do piloto 0.4.0](GUIA-PILOTO-V3.md) e a [documentação do atualizador](ATUALIZACAO-AUTOMATICA.md). O [guia v2](GUIA-PILOTO-V2.md) preserva as instruções anteriores.
 
@@ -46,8 +48,9 @@ O histórico prioriza problemas que exigem atenção. A enumeração de portas c
 | --- | --- |
 | COM e dispositivos vinculados | Consulta local a cada 15 segundos, além da duração da coleta. Divergência da COM, ocupação por outra instância presente, desconexão e falha Windows são confirmadas em três leituras completas consecutivas. |
 | Persistência e resolução | Um mesmo problema gera um alerta até a condição mudar. Três leituras normais geram resolução. Presença ou código desconhecido não se tornam prova de desconexão ou recuperação. |
-| Patrimônio da máquina | Coleta no início e a cada seis horas: identificação WMI, nome do computador, fabricante/modelo/série, Windows, CPU, RAM/módulos, discos, volume do sistema e adaptadores físicos. Documento próprio de até 32 KiB. |
+| Patrimônio da máquina | Coleta no início e a cada seis horas: identificação WMI, nome do computador, fabricante/modelo/série, UUID SMBIOS, placa-mãe, Windows, CPU, RAM/módulos e slots, discos, volume do sistema e adaptadores físicos. Documento próprio de até 32 KiB. |
 | Atualização do patrimônio | Envio inicial, mudança do hardware ou renovação após 24 horas. Horário de captura, boot, espaço livre e ordem dos dispositivos não criam uma mudança de patrimônio. Falha de consulta preserva o último inventário válido. |
+| Softwares e proteção | Consulta local a cada 15 minutos: metadados dos aplicativos registrados em HKLM e no usuário atual; quando disponível, metadados de detecções do Microsoft Defender. Envio inicial, mudança ou renovação após 24 horas, por uma fila independente. |
 | Monitor e manutenção | Início/encerramento, sinal de atividade a cada minuto, mudanças na cobertura de coleta e tentativas/resultados de recuperação. Decisões desarmadas não são publicadas como incidentes. |
 | Nerus Service | Descoberta local a cada 60 segundos. Registra referência inicial e mudanças relevantes de estado/identidade; as informações não são reenviadas a cada consulta. Sem leitura de argumentos, arquivos de pagamento ou conteúdo das DLLs. |
 
@@ -55,7 +58,7 @@ O patrimônio fica separado da lista de ocorrências na central. `MachineInvento
 
 O monitor contínuo concentra a coleta em COM, dispositivos vinculados, componente Nerus, patrimônio e funcionamento do próprio monitor. A versão 0.5.0 deixa de consultar o Event Log e de gerar avisos genéricos de canais/cobertura ou falhas gerais do Windows. Os registros históricos já coletados continuam sujeitos à retenção existente.
 
-O inventário usa uma lista explícita de campos. Não coleta usuário, product key, IPs, programas instalados, arquivos, dados de pagamento ou mensagens WMI livres. Arrays têm limites de 16 itens e a cobertura reduzida é informada; o JSON nunca é cortado para caber no transporte.
+O inventário usa uma lista explícita de campos. Não coleta usuário, product key, IPs, arquivos, dados de pagamento ou mensagens WMI livres. O inventário separado de softwares registra nome, versão, fabricante, escopo e data informada pelo instalador, com cobertura explícita. Não registra comandos de desinstalação, caminhos livres, teclas digitadas ou conteúdo dos arquivos. Arrays de hardware têm limites de 16 itens e a cobertura reduzida é informada; o JSON nunca é cortado para caber no transporte.
 
 O diagnóstico do Nerus Service usa metadados limitados do serviço e do executável, como nome, estado, tipo, PID, caminho e versão. O caminho pode conter o nome de uma pasta de usuário. Não inclui linha de comando, argumentos, credenciais, UUID de ativação ou o conteúdo livre das configurações do fornecedor. `ServiceDiagnostic` utiliza o contrato atual de eventos, sem migração adicional. Na central já publicada, esse registro aparece na visualização completa como registro de rotina; a classificação específica no painel continua pendente de publicação. Estado `Running` ou nova execução do serviço não comprova comunicação ou impressão.
 
@@ -81,7 +84,12 @@ Os dados ficam em `%LOCALAPPDATA%\Feirao\PdvMonitor`:
 - `recuperacoes.xml`: histórico recente das tentativas de reinício.
 - `status.txt`: último estado informado pelo monitor.
 - `inventario-hardware.json`: último patrimônio estruturado válido; incluído na exportação.
+- `inventario-hardware-parcial.json`: última consulta parcial, sem substituir a coleta completa; incluído na exportação.
 - `inventario-estado.xml`: hash estático e referência da última inclusão para envio.
+- `inventario-software.json`: última consulta de aplicativos e proteção; incluída na exportação.
+- `inventario-software-completo.json`: última consulta com cobertura completa dos aplicativos no escopo declarado; incluída na exportação.
+- `software-estado.xml`: resumo persistido para evitar alertas/remessas repetidos após reabertura; fora da exportação.
+- `software-pendente.xml`: documento de softwares aguardando confirmação; fora da exportação.
 - `hardware-pendente.xml`: único documento patrimonial aguardando confirmação; fica fora da exportação, assim como a fila histórica e a credencial.
 - `nerus-servico.xml`: vínculo exato do serviço confirmado pelo suporte, sem argumentos ou credenciais.
 - `nerus-servico-tentativas.xml`: etapas e limites persistidos das tentativas assistidas.
@@ -111,7 +119,7 @@ Na central, **Online** significa contato recebido nos últimos cinco minutos, co
 
 A API, sua migração de banco e o painel precisam ser publicados separadamente antes de ativar esse envio. O monitor pode funcionar apenas com logs locais enquanto essa preparação não estiver concluída.
 
-**Ordem da atualização:** aplique primeiro a migração de inventário no banco do ambiente escolhido, depois publique a API que aceita `schemaVersion:2` e o painel. Depois atualize os monitores Windows. A API continua aceitando agentes v1. Um agente novo contra API antiga preserva a fila, porém o envio v2 será recusado até a atualização. As instruções e os arquivos SQL ficam em `PDV_MONITOR.md` no repositório da API; o Windows não executa migrações. O piloto deste projeto usa o ambiente `nxstore.shop` e a base `conecta_feirao_hm`; isso não autoriza alterar outra base.
+**Ordem da atualização:** aplique primeiro a migração de inventário no banco do ambiente escolhido, depois publique a API que aceita `schemaVersion:2` e o painel. Depois atualize os monitores Windows. A API continua aceitando agentes v1. Se a API responder HTTP 400 ao lote com hardware, o monitor preserva o documento e pode reenviar somente os eventos. Não considera o hardware confirmado por esse segundo envio; aguarda quinze minutos antes de tentar o inventário novamente. Softwares usam um endpoint separado, e um HTTP 404 preserva sua pendência sem bloquear os eventos. Esse tratamento permite a atualização gradual, mas não substitui a publicação da integração empresarial. As instruções e os arquivos SQL ficam em `PDV_MONITOR.md` no repositório da API; o Windows não executa migrações. O piloto deste projeto usa o ambiente `nxstore.shop` e a base `conecta_feirao_hm`; isso não autoriza alterar outra base.
 
 ## Recuperação: desarmada por padrão
 

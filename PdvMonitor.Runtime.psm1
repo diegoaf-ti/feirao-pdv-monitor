@@ -254,8 +254,10 @@ function Start-PdvMonitorSession {
     SignalDropCount = 0L; LastLoggedSignalDropCount = 0L;
     PreviousUploadFailureReason = ''; LastLoggedOutboxGapCount = 0L;
     ComAlertStates = @{}; WindowsAlertStates = @{}; LastHardwareAt = $null; HardwareStatus = '';
-    HardwareFingerprint = ''; HardwareLastQueuedAt = $null; HardwareQueueFailed = $false;
+    HardwareFingerprint = ''; HardwarePartialFingerprint = ''; HardwareLastQueuedAt = $null; HardwareQueueFailed = $false;
     HardwareMachineId = ''; ProgramDirectory = $ProgramDirectory; NerusAutomation = $null;
+    LastSoftwareAt=$null; SoftwareFingerprint=''; SoftwareLastQueuedAt=$null; SoftwareStatus='Aguardando inventário de softwares'; SoftwareQueueFailed=$false;
+    PreviousSoftwareUploadFailure=''; SoftwareThreatSignatures=@{};
     NerusRestart = @{ Busy=$false; Stage='Idle'; Proposal=$null; Reason=''; Result=''; };
     NerusService = $null; LastNerusServiceAt = $null; NerusServiceSignatures = @{};
     AutoUpdateEnabled = $false; NextUpdateCheckAt = [DateTimeOffset]::MinValue;
@@ -313,6 +315,28 @@ function Start-PdvMonitorSession {
       if ($lastQueued) { $session.HardwareLastQueuedAt=[DateTimeOffset]::Parse($lastQueued,[Globalization.CultureInfo]::InvariantCulture); }
     } catch { Write-PdvMonitorRecord $session 'CollectionWarning' 'Estado anterior do inventário indisponível; a coleta será refeita sem alterar equipamentos.'; }
   }
+  $softwareStatePath=Join-Path $data 'software-estado.xml';
+  if([IO.File]::Exists($softwareStatePath)){
+    try{
+      $xml=Read-PdvRuntimeXml $softwareStatePath;
+      $root=$xml.DocumentElement;
+      if($null -eq $root -or $root.Name -cne 'software' -or $root.NamespaceURI -ne '' -or $root.Attributes.Count -ne 2){throw 'SoftwareStateInvalid';}
+      foreach($attribute in $root.Attributes){if(@('fingerprint','lastQueuedAt') -cnotcontains $attribute.Name){throw 'SoftwareStateInvalid';}}
+      $fingerprint=$root.GetAttribute('fingerprint');
+      if($fingerprint -notmatch '^[a-f0-9]{64}$'){throw 'SoftwareStateInvalid';}
+      $signatures=@{};
+      foreach($node in $root.ChildNodes){
+        if($node.Name -cne 'threat' -or $node.NamespaceURI -ne '' -or $node.Attributes.Count -ne 2 -or $node.ChildNodes.Count -ne 0 -or $signatures.Count -ge 64){throw 'SoftwareStateInvalid';}
+        foreach($attribute in $node.Attributes){if(@('id','signature') -cnotcontains $attribute.Name){throw 'SoftwareStateInvalid';}}
+        $id=$node.GetAttribute('id');$signature=$node.GetAttribute('signature');
+        if($id -notmatch '^\d{1,20}$' -or $signature -cnotmatch '^(True|False)\|(True|False)?\|[^\x00-\x1f\x7f]{0,48}$' -or $signatures.ContainsKey($id)){throw 'SoftwareStateInvalid';}
+        $signatures[$id]=$signature;
+      }
+      $lastQueued=$root.GetAttribute('lastQueuedAt');$queuedAt=$null;
+      if($lastQueued){$queuedAt=[DateTimeOffset]::Parse($lastQueued,[Globalization.CultureInfo]::InvariantCulture);if($queuedAt -gt (Get-PdvRuntimeNow).AddMinutes(5)){throw 'SoftwareStateInvalid';}}
+      $session.SoftwareFingerprint=$fingerprint;$session.SoftwareLastQueuedAt=$queuedAt;$session.SoftwareThreatSignatures=$signatures;
+    }catch{Write-PdvMonitorRecord $session 'CollectionWarning' 'Estado anterior dos softwares indisponível; a coleta será refeita preservando os documentos de inventário.' -Reason 'SoftwareStateUnavailable';}
+  }
   Write-PdvMonitorRecord $session 'SessionStarted' ('Monitor iniciado; versão=' + $session.MonitorVersion + '; computador=' + $env:COMPUTERNAME + '; PowerShell=' + $PSVersionTable.PSVersion + '; recuperação desarmada.');
   Remove-PdvMonitorOldLogs $session;
   return $session;
@@ -349,6 +373,7 @@ function Set-PdvMonitorCentral {
   $result = Set-PdvMonitorCentralConfig -Session $Session -Endpoint $Endpoint -StoreId $StoreId -Terminal $Terminal -AgentId $AgentId -Token $Token;
   if (-not $result.Success) { throw ('Não foi possível configurar o envio: ' + $result.Reason + '. ' + $Session.UploadStatusText); }
   $Session.LastSnapshotAt = $null; $Session.LastHardwareAt=$null; $Session.HardwareLastQueuedAt=$null;
+  $Session.LastSoftwareAt=$null; $Session.SoftwareLastQueuedAt=$null;
   Write-PdvMonitorRecord $Session 'CentralConfigured' 'Destino central configurado para esta instalação; chave de envio protegida localmente.';
 }
 
@@ -425,16 +450,49 @@ function Update-PdvMonitorHardware {
   try {
     $result=Get-PdvMonitorHardwareInventory;
     if (-not $result.Success -or $null -eq $result.Hardware) { throw 'InventoryUnavailable'; }
-    if ($Session.HardwareFingerprint -and -not [bool](Get-PdvRuntimeValue $result 'CoverageHealthy' $true)) { throw 'InventoryCoverageIncomplete'; }
     $hardware=$result.Hardware; $Session.HardwareMachineId=[string]$hardware.machineId; $fingerprint=Get-PdvHardwareFingerprint $hardware;
     $json=ConvertTo-PdvHardwareJson $hardware;
+    if(-not [bool](Get-PdvRuntimeValue $result 'CoverageHealthy' $true)){
+      if([int]$hardware.schemaVersion -lt 2){throw 'InventoryCoverageIncomplete';}
+      # A cobertura por classe permite ao servidor preservar os componentes
+      # desconhecidos e registrar mudanças apenas nas partes observadas.
+      Write-PdvRuntimeAtomic (Join-Path $Session.DataDirectory 'inventario-hardware-parcial.json') $json;
+      $partialChanged=([string](Get-PdvRuntimeValue $Session 'HardwarePartialFingerprint' '') -cne $fingerprint);
+      if($partialChanged -or $null -eq $Session.HardwareLastQueuedAt -or ($Now-$Session.HardwareLastQueuedAt).TotalHours -ge 24){
+        $queued=Set-PdvMonitorHardwarePending -Session $Session -Hardware $hardware;
+        if($queued.Success -and $queued.Queued){$Session.HardwareLastQueuedAt=$Now;$Session.HardwareQueueFailed=$false;}
+        elseif([bool](Get-PdvRuntimeValue $Session.Config.Central 'Enabled' $false)){
+          $Session.HardwareLastQueuedAt=$null;
+          if(-not $Session.HardwareQueueFailed){Write-PdvMonitorRecord $Session 'UploadWarning' 'Inventário parcial preservado localmente, mas sua fila de envio não pôde ser gravada. Nova tentativa em quinze minutos; os dados anteriores da central permanecem.' -Reason 'HardwareQueueFailed';}
+          $Session.HardwareQueueFailed=$true;
+        }
+      }
+      if($Session.HardwareStatus -cne 'Inventário com cobertura parcial'){
+        Write-PdvMonitorRecord $Session 'CollectionWarning' 'Inventário com cobertura parcial por componente. A última coleta completa foi preservada; partes não consultadas não significam hardware removido.' -Reason 'MachineInventoryPartial';
+      }
+      if($null -eq $Session.PSObject.Properties['HardwarePartialFingerprint']){$Session|Add-Member NoteProperty HardwarePartialFingerprint '';}
+      $Session.HardwarePartialFingerprint=$fingerprint;$Session.HardwareStatus='Inventário com cobertura parcial';$Session.LastHardwareAt=$Now.AddHours(-6).AddMinutes(15);return;
+    }
     $previousFingerprint=$Session.HardwareFingerprint;
     $changed=($fingerprint -cne $previousFingerprint);
+    $extendedBaseline=$false;$hardwarePath=Join-Path $Session.DataDirectory 'inventario-hardware.json';
+    if($changed -and $previousFingerprint -and [IO.File]::Exists($hardwarePath)){
+      try{
+        $oldText=[IO.File]::ReadAllText($hardwarePath);
+        if($oldText -match '"schemaVersion"\s*:\s*1(?:\s*[,}])' -and [int]$hardware.schemaVersion -eq 2){
+          $legacy=@{};foreach($key in $hardware.Keys){if(@('baseboard','coverage') -notcontains $key){$legacy[$key]=$hardware[$key];}}
+          $legacy.schemaVersion=1;$legacy.cpu=@{};foreach($key in @('name','cores','logicalProcessors')){$legacy.cpu[$key]=$hardware.cpu[$key];}
+          $modules=@();foreach($item in @($hardware.memory.modules)){$oldModule=@{};foreach($key in @('capacityBytes','manufacturer','partNumber','serialNumber','speedMHz')){$oldModule[$key]=$item[$key];};$modules+=@($oldModule);}
+          $legacy.memory=@{totalBytes=$hardware.memory.totalBytes;modules=$modules};
+          $extendedBaseline=((Get-PdvHardwareFingerprint $legacy) -ceq $previousFingerprint);
+        }
+      }catch{}
+    }
     # Snapshot é um documento próprio. O histórico recebe somente um resumo
     # de mudança; nunca JSON cortado ou uma linha por driver normal.
     Write-PdvRuntimeAtomic (Join-Path $Session.DataDirectory 'inventario-hardware.json') $json;
     $queueFailed=$false;
-    if ($changed -or $null -eq $Session.HardwareLastQueuedAt -or ($Now - $Session.HardwareLastQueuedAt).TotalHours -ge 24) {
+    if ($changed -or [string](Get-PdvRuntimeValue $Session 'HardwarePartialFingerprint' '') -or $null -eq $Session.HardwareLastQueuedAt -or ($Now - $Session.HardwareLastQueuedAt).TotalHours -ge 24) {
       $queued=Set-PdvMonitorHardwarePending -Session $Session -Hardware $hardware;
       if ($queued.Success -and $queued.Queued) { $Session.HardwareLastQueuedAt=$Now; $Session.HardwareQueueFailed=$false; }
       elseif ([bool](Get-PdvRuntimeValue $Session.Config.Central 'Enabled' $false)) {
@@ -448,9 +506,11 @@ function Update-PdvMonitorHardware {
     if ($changed) {
       $kind='HardwareChanged'; $reason='MachineHardwareChanged';
       if (-not $previousFingerprint) { $kind='MachineInventory'; $reason='MachineHardwareBaseline'; }
+      if($extendedBaseline){$kind='MachineInventory';$reason='MachineHardwareBaselineExtended';}
       Write-PdvMonitorRecord $Session $kind ('Inventário da máquina atualizado; computador=' + $hardware.hostname + '; fabricante=' + $hardware.manufacturer + '; modelo=' + $hardware.model + '; CPU=' + $hardware.cpu.name + '; memória em bytes=' + $hardware.memory.totalBytes + '; discos=' + @($hardware.disks).Count + '. Consulte o inventário estruturado da instalação.') -Reason $reason;
     }
     $Session.HardwareFingerprint=$fingerprint; Save-PdvMonitorHardwareState $Session;
+    if($null -ne $Session.PSObject.Properties['HardwarePartialFingerprint']){$Session.HardwarePartialFingerprint='';}
     $Session.LastHardwareAt=$Now; $Session.HardwareStatus='Inventário da máquina atualizado';
     if ($queueFailed) { $Session.LastHardwareAt=$Now.AddHours(-6).AddMinutes(15); $Session.HardwareStatus='Inventário local atualizado; envio patrimonial pendente'; }
   } catch {
@@ -458,6 +518,85 @@ function Update-PdvMonitorHardware {
     if ($Session.HardwareStatus -ne 'Inventário temporariamente indisponível') { Write-PdvMonitorRecord $Session 'CollectionWarning' 'Inventário da máquina indisponível nesta consulta. Último inventário válido preservado; nova tentativa em 15 minutos.' -Reason 'MachineInventoryUnavailable'; }
     $Session.HardwareStatus='Inventário temporariamente indisponível'; $Session.LastHardwareAt=$Now.AddHours(-6).AddMinutes(15);
   }
+}
+
+function Save-PdvMonitorSoftwareState {
+  param($Session);
+  $xml=New-Object Xml.XmlDocument;$root=$xml.CreateElement('software');[void]$xml.AppendChild($root);
+  $root.SetAttribute('fingerprint',[string]$Session.SoftwareFingerprint);$lastQueued='';
+  if($null -ne $Session.SoftwareLastQueuedAt){$lastQueued=$Session.SoftwareLastQueuedAt.ToString('o');}
+  $root.SetAttribute('lastQueuedAt',$lastQueued);
+  foreach($id in @($Session.SoftwareThreatSignatures.Keys | Sort-Object | Select-Object -First 64)){
+    $node=$xml.CreateElement('threat');$node.SetAttribute('id',[string]$id);$node.SetAttribute('signature',[string]$Session.SoftwareThreatSignatures[$id]);[void]$root.AppendChild($node);
+  }
+  Write-PdvRuntimeAtomic (Join-Path $Session.DataDirectory 'software-estado.xml') $xml.OuterXml;
+}
+
+function Update-PdvMonitorSoftware {
+  param($Session,[DateTimeOffset]$Now);
+  try{
+    $result=Get-PdvMonitorSoftwareInventory;
+    if(-not $result.Success -or $null -eq $result.Software -or $result.Fingerprint -notmatch '^[a-f0-9]{64}$'){throw 'SoftwareUnavailable';}
+    $software=$result.Software;$json=ConvertTo-PdvHardwareJson $software;
+    if([Text.Encoding]::UTF8.GetByteCount($json) -gt 131072){throw 'SoftwareTooLarge';}
+    Write-PdvRuntimeAtomic (Join-Path $Session.DataDirectory 'inventario-software.json') $json;
+    if($software.complete){Write-PdvRuntimeAtomic (Join-Path $Session.DataDirectory 'inventario-software-completo.json') $json;}
+    $changed=($Session.SoftwareFingerprint -cne $result.Fingerprint);$queueFailed=$false;
+    if($changed -or $null -eq $Session.SoftwareLastQueuedAt -or ($Now-$Session.SoftwareLastQueuedAt).TotalHours -ge 24){
+      $queued=Set-PdvMonitorSoftwarePending -Session $Session -Software $software -Fingerprint $result.Fingerprint;
+      if($queued.Success -and $queued.Queued){$Session.SoftwareLastQueuedAt=$Now;$Session.SoftwareQueueFailed=$false;}
+      elseif([bool](Get-PdvRuntimeValue $Session.Config.Central 'Enabled' $false)){
+        $Session.SoftwareLastQueuedAt=$null;$queueFailed=$true;
+        if(-not $Session.SoftwareQueueFailed){Write-PdvMonitorRecord $Session 'UploadWarning' 'Inventário de softwares preservado localmente, mas a fila de envio não pôde ser gravada. Os eventos de dispositivos continuam independentes.' -Reason 'SoftwareQueueFailed';}
+        $Session.SoftwareQueueFailed=$true;
+      }
+    }
+    if($changed){
+      $kind='SoftwareInventory';if($Session.SoftwareFingerprint){$kind='SoftwareInventoryChanged';}
+      Write-PdvMonitorRecord $Session $kind ('Inventário de softwares observado; aplicativos='+@($software.apps).Count+'; cobertura completa do escopo='+$software.complete+'; proteção consultada='+$software.security.provider+'; estado da consulta='+$software.security.status+'. Os dados detalhados ficam no inventário da instalação.') -Reason 'SoftwareSnapshotObserved';
+    }
+    if($software.security.provider -ceq 'MicrosoftDefender'){
+      $observedThreats=@{};
+      foreach($threat in @($software.security.threats)){
+        if($threat.source -cne 'MicrosoftDefender' -or $threat.id -notmatch '^\d{1,20}$'){continue;}
+        $observedThreats[[string]$threat.id]=$true;
+        $signature=([string]$threat.active)+'|'+[string]$threat.actionSuccess+'|'+[string]$threat.lastSeenAt;
+        $old=$Session.SoftwareThreatSignatures[[string]$threat.id];
+        if($signature -cne $old -and ($threat.active -or $old)){
+          $kind='SecurityThreatStatusChanged';if($threat.active){$kind='SecurityThreatDetected';}
+          Write-PdvMonitorRecord $Session $kind ('Microsoft Defender reportou ameaça; identificador='+$threat.id+'; nome='+(ConvertTo-PdvProtocolText $threat.name 160)+'; gravidade='+$threat.severity+'; ativa='+$threat.active+'; ação confirmada='+[string]$threat.actionSuccess+'. Informação do antivírus, sem coleta de arquivos ou conteúdo.') -Reason 'MicrosoftDefenderDetection';
+        }
+        $Session.SoftwareThreatSignatures[[string]$threat.id]=$signature;
+      }
+      if($Session.SoftwareThreatSignatures.Count -gt 64){
+        foreach($id in @($Session.SoftwareThreatSignatures.Keys | Sort-Object)){
+          if($Session.SoftwareThreatSignatures.Count -le 64){break;}
+          if(-not $observedThreats.ContainsKey($id)){$Session.SoftwareThreatSignatures.Remove($id);}
+        }
+      }
+    }
+    $Session.SoftwareFingerprint=$result.Fingerprint;$Session.LastSoftwareAt=$Now;
+    Save-PdvMonitorSoftwareState $Session;
+    $Session.SoftwareStatus='Softwares atualizados; consulta de proteção: '+$software.security.status;
+    if(-not $software.complete){$Session.SoftwareStatus='Softwares com cobertura parcial; último inventário completo preservado';}
+    if($queueFailed){$Session.SoftwareStatus+='; envio pendente';}
+  }catch{
+    if($Session.SoftwareStatus -cne 'Inventário de softwares indisponível'){Write-PdvMonitorRecord $Session 'CollectionWarning' 'Inventário de softwares indisponível nesta consulta. Os documentos locais anteriores foram preservados; nova tentativa em quinze minutos.' -Reason 'SoftwareInventoryUnavailable';}
+    $Session.SoftwareStatus='Inventário de softwares indisponível';$Session.LastSoftwareAt=$Now;
+  }
+}
+
+function Publish-PdvMonitorSoftwareUpload {
+  param($Session);
+  try{$result=Invoke-PdvMonitorSoftwareUpload $Session;}catch{$result=@{Success=$false;Reason='SoftwareUploadFailed'};}
+  $reason=[string](Get-PdvRuntimeValue $result 'Reason' 'SoftwareUploadFailed');
+  if(@('CentralDisabled','BackoffActive') -contains $reason){return;}
+  if(@('SoftwareAcknowledged','SoftwareOutboxEmpty') -contains $reason){
+    if($Session.PreviousSoftwareUploadFailure){Write-PdvMonitorRecord $Session 'UploadResumed' 'Envio do inventário de softwares voltou ao estado normal.' -Reason 'SoftwareUploadResumed';}
+    $Session.PreviousSoftwareUploadFailure='';return;
+  }
+  if($reason -notmatch '^Software(Http[0-9]{3}|IdentityMismatch|CredentialUnavailable|UploadFailed)$'){$reason='SoftwareUploadFailed';}
+  if($Session.PreviousSoftwareUploadFailure -cne $reason){Write-PdvMonitorRecord $Session 'UploadWarning' ('Inventário de softwares ainda não confirmado pela central; motivo='+$reason+'. A pendência local e o envio de dispositivos foram preservados. A API precisa receber a integração empresarial para aceitar softwares.') -Reason $reason;$Session.PreviousSoftwareUploadFailure=$reason;}
 }
 
 function Update-PdvMonitorAlert {
@@ -597,6 +736,7 @@ function Invoke-PdvMonitorTick {
     if ($Session.ProgramDirectory -and ($null -eq $Session.LastNerusServiceAt -or ($now - $Session.LastNerusServiceAt).TotalSeconds -ge 60)) {
       Update-PdvMonitorNerusServiceDiagnostic -Session $Session -Now $now;
     }
+    if($Session.ProgramDirectory -and ($null -eq $Session.LastSoftwareAt -or ($now-$Session.LastSoftwareAt).TotalMinutes -ge 15)){Update-PdvMonitorSoftware $Session $now;}
     if ($Session.ProgramDirectory) {
       Invoke-PdvMonitorNerusAutomation -Session $Session -Snapshot $snapshot -ObservedAt $snapshotAt;
       if ($null -ne $Session.NerusAutomation) {
@@ -730,6 +870,7 @@ function Invoke-PdvMonitorTick {
       # o contador depois dela impede um ciclo de alertas causado pelo alerta.
       $Session.LastLoggedOutboxGapCount = $Session.OutboxGapCount;
     }
+    if($Session.ProgramDirectory){Publish-PdvMonitorSoftwareUpload $Session;}
   } catch {
     $Session.LoggingHealthy = $false;
     $Session.MaintenanceArmed = $false; $Session.Config.AutoRecoveryEnabled = $false;
@@ -868,7 +1009,7 @@ function Export-PdvMonitorLogs {
   $destination = Join-Path $DestinationDirectory ('PDV-diagnostico-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N').Substring(0, 6));
   [void][IO.Directory]::CreateDirectory($destination);
   foreach ($file in @(Get-ChildItem -LiteralPath $Session.LogDirectory -Filter 'monitor-*.csv' | Where-Object { -not $_.PSIsContainer })) { [IO.File]::Copy($file.FullName, (Join-Path $destination $file.Name)); }
-  foreach ($name in @('monitor.xml', 'central.xml', 'cursores.xml', 'recuperacoes.xml', 'status.txt', 'inventario-hardware.json', 'inventario-estado.xml', 'nerus-servico.xml', 'nerus-servico-tentativas.xml', 'nerus-servico-diagnostico.json')) {
+  foreach ($name in @('monitor.xml', 'central.xml', 'cursores.xml', 'recuperacoes.xml', 'status.txt', 'inventario-hardware.json','inventario-hardware-parcial.json', 'inventario-estado.xml', 'nerus-servico.xml', 'nerus-servico-tentativas.xml', 'nerus-servico-diagnostico.json','inventario-software.json','inventario-software-completo.json')) {
     $path = Join-Path $Session.DataDirectory $name;
     if ([IO.File]::Exists($path)) { [IO.File]::Copy($path, (Join-Path $destination $name)); }
   }
