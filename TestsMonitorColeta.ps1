@@ -4,7 +4,8 @@ $ErrorActionPreference = 'Stop';
 Import-Module (Join-Path $PSScriptRoot 'PdvMonitor.Coleta.psm1') -Force;
 $module = Get-Module PdvMonitor.Coleta;
 & $module {
-  function Assert-Coleta($Condition, [string]$Description) { if (-not $Condition) { throw $Description; } }
+  $script:coletaChecks = 0;
+  function Assert-Coleta($Condition, [string]$Description) { $script:coletaChecks++; if (-not $Condition) { throw $Description; } }
   function New-TestSnapshot {
     New-Object PSObject -Property @{
       CapturedAt = '2026-10-15T12:00:00Z'; Windows = 'Windows 7';
@@ -38,10 +39,12 @@ $module = Get-Module PdvMonitor.Coleta;
   Assert-Coleta ($modern.InventoryMode -eq 'PnP' -and $modern.InventoryComplete -and $modern.Devices[0].Present) 'Coleta moderna preserva presença conhecida/completude';
 
   function New-TestEvent {
-    param([long]$RecordId, [DateTime]$Time, [string]$Provider = 'Microsoft-Windows-Kernel-PnP', [string]$Service = '');
-    $event = New-Object PSObject -Property @{ RecordId = $RecordId; TimeCreated = $Time; ProviderName = $Provider; Id = 219; Level = 3; Service = $Service };
+    param([long]$RecordId, [DateTime]$Time, [string]$Provider = 'Microsoft-Windows-Kernel-PnP', [string]$Service = '', [int]$Id = 219, [int]$Level = 2);
+    $event = New-Object PSObject -Property @{ RecordId = $RecordId; TimeCreated = $Time; ProviderName = $Provider; Id = $Id; Level = $Level; Service = $Service };
     $event | Add-Member -MemberType ScriptProperty -Name Message -Value { throw 'Teste detectou leitura indevida de mensagem sensível.'; };
     $event | Add-Member -MemberType ScriptProperty -Name Properties -Value { throw 'Teste detectou leitura indevida de payload sensível.'; };
+    $event | Add-Member -MemberType ScriptProperty -Name UserData -Value { throw 'Teste detectou leitura indevida de UserData.'; };
+    $event | Add-Member -MemberType ScriptMethod -Name ToXml -Value { throw 'Teste detectou leitura indevida de XML bruto.'; };
     return $event;
   }
   $script:history = @(); $script:failQuery = $false; $script:queryCalls = 0;
@@ -59,7 +62,7 @@ $module = Get-Module PdvMonitor.Coleta;
       if ($null -ne $FilterXml) { $selectors = @($FilterXml.QueryList.Query.Select | ForEach-Object { $_.InnerText }); }
       $items = @($items | Where-Object {
         $timeText = $_.TimeCreated.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ');
-        $eventXml = [xml]('<Event><System><Provider Name="' + $_.ProviderName + '"/><EventID>' + $_.Id + '</EventID><EventRecordID>' + $_.RecordId + '</EventRecordID><TimeCreated SystemTime="' + $timeText + '"/></System><EventData><Data>' + $_.Service + '</Data></EventData></Event>');
+        $eventXml = [xml]('<Event><System><Provider Name="' + [Security.SecurityElement]::Escape($_.ProviderName) + '"/><EventID>' + $_.Id + '</EventID><Level>' + $_.Level + '</Level><EventRecordID>' + $_.RecordId + '</EventRecordID><TimeCreated SystemTime="' + $timeText + '"/></System><EventData><Data>' + [Security.SecurityElement]::Escape($_.Service) + '</Data></EventData></Event>');
         $selected = $false;
         foreach ($selector in $selectors) {
           # Standard XPath 1.0 só compara números com >= em strings. O Windows
@@ -126,5 +129,53 @@ $module = Get-Module PdvMonitor.Coleta;
   $script:history = @();
   $cleared = Get-PdvMonitorWindowsEvents -Cursors $baseline.Cursors;
   Assert-Coleta ($cleared.Cursors['System'].RecordId -eq 0 -and @($cleared.ChannelStatus | Where-Object Channel -eq 'System')[0].Reset) 'Log limpo e vazio reconhecido';
-  Write-Host 'PASS: coleta, fallback Win7/10, presença/completude, baseline, cursor sem perda, filtros, falhas, rotação e limpeza. Mocks; não valida PowerShell 2/5.1, Event Log nativo nem hardware.';
+  # Serviço Nerus: somente nomes exatos fornecidos pelo vínculo, eventos de
+  # falha conhecidos e metadados; nunca texto livre ou payload do SCM.
+  $script:printEnabled = $false;
+  $failureIds = @(7000,7001,7009,7011,7022,7023,7024,7031,7032,7034,7043);
+  $script:history = @(); $record = 0;
+  foreach ($id in $failureIds) { $record++; $script:history += New-TestEvent $record $now 'Service Control Manager' 'NerusService' $id; }
+  $script:history += New-TestEvent 12 $now 'Service Control Manager' 'Nerus Service Fiscal' 7031 1;
+  $script:history += New-TestEvent 13 $now 'Service Control Manager' 'OutroServico' 7031;
+  $script:history += New-TestEvent 14 $now 'Service Control Manager' 'NerusServiceAuxiliar' 7031;
+  $script:history += New-TestEvent 15 $now 'Service Control Manager' 'NerusService' 7036;
+  $script:history += New-TestEvent 16 $now 'Service Control Manager' 'NerusService' 7045;
+  $script:history += New-TestEvent 17 $now 'Service Control Manager' 'NerusService' 7031 4;
+  $script:history += New-TestEvent 18 $now 'Outro.Provedor' 'NerusService' 7031;
+  $script:history += New-TestEvent 19 $now 'Service Control Manager' 'NerusService' 219;
+  $withoutNerus = Get-PdvMonitorWindowsEvents -StartAfter $now.AddMinutes(-2);
+  Assert-Coleta ($withoutNerus.Events.Count -eq 0) 'Sem vínculo não descobre Nerus por substring nem coleta SCM geral';
+  $service = Get-PdvMonitorWindowsEvents -StartAfter $now.AddMinutes(-2) -NerusServiceNames @('NerusService','Nerus Service Fiscal');
+  Assert-Coleta ($service.Events.Count -eq 12 -and ($service.Events.RecordId -join ',') -eq '1,2,3,4,5,6,7,8,9,10,11,12') 'SCM aceita todos os IDs de falha previstos e ambos os nomes vinculados, exclui rotina/outros serviços/provedores';
+  Assert-Coleta ($service.Cursors['System'].RecordId -eq 19) 'Eventos SCM excluídos continuam respeitando o cursor geral do canal';
+  Assert-Coleta (@($service.Events | Where-Object { -not $_.MessageOmitted -or $_.Message -ne 'Conteúdo omitido; somente metadados técnicos do evento.' }).Count -eq 0) 'Falhas do serviço não leem Message, Properties, UserData ou ToXml';
+  Assert-Coleta (@($service.Events[0].PSObject.Properties.Name | Where-Object { $_ -in @('Service','ServiceName','Properties','UserData') }).Count -eq 0) 'Eventos enviados não incorporam payload nem nome livre do serviço';
+  [xml]$serviceXml = $script:queryXml;
+  Assert-Coleta (@($serviceXml.QueryList.Query.Select).Count -eq 7) 'Dois nomes usam quatro seleções adicionais separadas e limitadas';
+  foreach ($select in @($serviceXml.QueryList.Query.Select)) {
+    $predicates = @([regex]::Matches($select.InnerText, 'EventRecordID|@SystemTime|Level=|Provider\[|EventID=|Data='));
+    Assert-Coleta ($predicates.Count -le 20) 'Cada seleção permanece abaixo de vinte expressões, incluindo baseline e intervalo';
+  }
+  $deduplicated = @(Get-PdvMonitorSystemEventXPath -NerusServiceNames @('NerusService','NerusService'));
+  Assert-Coleta ($deduplicated.Count -eq 5) 'Nomes duplicados exatos não multiplicam seleções';
+  $quotedNames = @("Nerus O'Brien",'Nerus "Fiscal"','Nerus & Fiscal',"Nerus' or 1=1 or Data='",'Nerus*');
+  foreach ($name in $quotedNames) {
+    $script:history = @(New-TestEvent 1 $now 'Service Control Manager' $name 7031; New-TestEvent 2 $now 'Service Control Manager' 'OutroServico' 7031; New-TestEvent 3 $now 'Service Control Manager' 'NerusService' 7031);
+    $quoted = Get-PdvMonitorWindowsEvents -StartAfter $now.AddMinutes(-2) -NerusServiceNames @($name);
+    Assert-Coleta ($quoted.Events.Count -eq 1 -and $quoted.Events[0].RecordId -eq 1) 'Nome com aspas, XML, tentativa de injeção ou curinga só corresponde ao literal exato';
+    Assert-Coleta ($quoted.Cursors['System'].RecordId -eq 3) 'Literal seguro não altera semântica de avanço do cursor';
+  }
+  $invalidNames = @(@(''), @(' NerusService'), @('NerusService '), @("Nerus`r`nService"), @("Nerus`0Service"), @('Nerus' + [char]0x85 + 'Service'), @('Nerus "Fiscal' + "'"), @(('N' * 257)), @(1..9 | ForEach-Object { 'Nerus' + $_ }));
+  foreach ($invalid in $invalidNames) {
+    $beforeCalls = $script:queryCalls; $rejected = $false; $errorText = '';
+    try { $null = Get-PdvMonitorWindowsEvents -Cursors $service.Cursors -StartAfter $now.AddMinutes(-2) -NerusServiceNames $invalid; }
+    catch { $rejected = $true; $errorText = [string]$_.Exception.Message; }
+    Assert-Coleta ($rejected -and $errorText -eq 'InvalidNerusServiceNames') 'Nomes inválidos são rejeitados com mensagem fixa sem ecoar entrada';
+    Assert-Coleta ($beforeCalls -eq $script:queryCalls -and $service.Cursors['System'].RecordId -eq 19) 'Validação ocorre antes da consulta e não altera cursor de entrada';
+  }
+  $script:history = @(New-TestEvent 1 $now 'Service Control Manager' 'Nerus1' 7031);
+  $maximum = Get-PdvMonitorWindowsEvents -StartAfter $now.AddMinutes(-2) -NerusServiceNames @(1..8 | ForEach-Object { 'Nerus' + $_ });
+  [xml]$maximumXml = $script:queryXml;
+  Assert-Coleta ($maximum.Events.Count -eq 1 -and @($maximumXml.QueryList.Query.Select).Count -eq 19) 'Lista máxima gera seleções pequenas e mantém correspondência exata';
+  Write-Host ('PASS: ' + $script:coletaChecks + ' verificações de coleta, fallback, cursores e eventos SCM Nerus com nomes exatos. Mocks; não valida PowerShell 2/5.1, Event Log nativo nem hardware.');
 };

@@ -109,12 +109,21 @@ function Get-PdvSnapshot {
         # Uma propriedade não suportada não deve ocultar as demais.
         $propertyErrors = @()
         $deviceProperties = @(Get-PnpDeviceProperty -InstanceId $instanceId -KeyName $propertyNames -ErrorAction SilentlyContinue -ErrorVariable propertyErrors)
-        foreach ($property in $deviceProperties) { $properties[[string]$property.KeyName] = $property.Data }
+        foreach ($property in $deviceProperties) {
+          $key=[string](Get-PdvValue $property 'KeyName' '');
+          $dataProperty=$null; if ($null -ne $property) { $dataProperty=$property.PSObject.Properties['Data'] }
+          if (-not $key -or $null -eq $dataProperty -or $null -eq $dataProperty.Value) { continue }
+          # Provedores antigos devolvem objetos sem Data para chaves não
+          # suportadas. Isso não invalida as propriedades seguintes nem prova
+          # presença. IsPresent só é aceito quando o valor é booleano real.
+          if ($key -eq 'DEVPKEY_Device_IsPresent' -and $dataProperty.Value -isnot [bool]) { continue }
+          $properties[$key]=$dataProperty.Value
+        }
         if ($propertyErrors.Count -gt 0) {
           $warnings.Add('Algumas propriedades de "' + $instanceId + '" não puderam ser lidas; campos vazios indicam informação indisponível.')
         }
       } catch {
-        $warnings.Add('Propriedades indisponíveis para "' + $instanceId + '": ' + $_.Exception.Message)
+        $warnings.Add('Propriedades complementares indisponíveis para "' + $instanceId + '"; campos não confirmados permanecem vazios.')
       }
       $port = $null
       $registryPath = 'Registry::HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Enum\' + $instanceId + '\Device Parameters'

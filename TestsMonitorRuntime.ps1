@@ -15,6 +15,11 @@ $testRoot = Join-Path ([IO.Path]::GetTempPath()) ('pdv-runtime-testes-' + [Guid]
   $script:TestProcessBatches = New-Object Collections.Queue
   $script:TestPrintBatches = New-Object Collections.Queue
   $script:TestDefaultSnapshot = $null
+  $script:TestHardwareResult = New-Object PSObject -Property @{Success=$false;Hardware=$null}
+  $script:TestHardwareCalls=0
+  $script:TestHardwareQueued=0
+  $script:TestHardwareQueueFailure=$false
+  $script:TestWindowsEvents=@()
   $script:TestProcessNames = @()
   $script:TestJobCount = 0
   $script:TestProcessCalls = 0
@@ -43,13 +48,15 @@ $testRoot = Join-Path ([IO.Path]::GetTempPath()) ('pdv-runtime-testes-' + [Guid]
     if ($script:TestUploadResults.Count -gt 0) { return $script:TestUploadResults.Dequeue() }
     return (New-Object PSObject -Property @{Success=$true; Reason='OutboxEmpty'; Sent=0})
   }
+  function script:Get-PdvMonitorHardwareInventory { $script:TestHardwareCalls++; return $script:TestHardwareResult }
+  function script:Set-PdvMonitorHardwarePending { param($Session,$Hardware); $script:TestHardwareQueued++; return (New-Object PSObject -Property @{Success=(-not $script:TestHardwareQueueFailure);Queued=(-not $script:TestHardwareQueueFailure)}) }
   function script:Get-PdvMonitorSnapshot {
     if ($script:TestSnapshots.Count -gt 0) { return $script:TestSnapshots.Dequeue() }
     return $script:TestDefaultSnapshot
   }
   function script:Get-PdvMonitorWindowsEvents {
     param($Cursors, $MaxEventsPerChannel)
-    return (New-Object PSObject -Property @{Events=@(); Cursors=@{System=@{RecordId=42; AnchorRecordId=42; AnchorTime='2026-10-15T12:00:00-03:00'; OldestRecordId=1; LogEpoch='teste'; CoverageStart='2026-10-15T11:58:00-03:00'}}; ChannelStatus=@(); Warnings=@()})
+    throw 'A coleta normal não deve consultar eventos genéricos do Windows';
   }
   function script:Get-Process {
     [CmdletBinding()]param()
@@ -111,6 +118,7 @@ function New-TestSession {
     $script:TestRecords.Clear(); $script:TestSnapshots.Clear(); $script:TestProcessBatches.Clear(); $script:TestPrintBatches.Clear()
     $script:TestProcessNames=@(); $script:TestJobCount=0; $script:TestProcessCalls=0; $script:TestPrintCalls=0; $script:TestRestarts=0; $script:TestUploadCalls=0
     $script:TestProcessFailure=$false; $script:TestPrintFailure=$false; $script:TestRestartFailure=$false; $script:TestHistoryFailure=$false; $script:TestAttemptLogFailure=$false
+    $script:TestHardwareCalls=0; $script:TestHardwareQueued=0; $script:TestHardwareQueueFailure=$false; $script:TestWindowsEvents=@(); $script:TestHardwareResult=New-Object PSObject -Property @{Success=$false;Hardware=$null}
     $script:TestUploadResults.Clear(); $script:TestUploadThrow=$false; $script:TestQueueFailure=$false
     $script:TestHistoryPersistedBeforeAction=$false; $script:TestAttemptLoggedBeforeAction=$false
     $script:TestNow=[DateTimeOffset]::Parse('2026-10-15T12:00:00-03:00')
@@ -150,7 +158,7 @@ try {
   Invoke-PdvMonitorTick $session
   Assert-Runtime (-not $session.TickBusy -and $session.LastTickAt -and $session.LoggingHealthy) 'Rodada termina e atualiza a mesma sessão'
   Assert-Runtime ((Get-TestMetric 'TestProcessCalls') -eq 0 -and (Get-TestMetric 'TestPrintCalls') -eq 0 -and (Get-TestMetric 'TestRestarts') -eq 0) 'Monitoramento desarmado não consulta processos/fila nem reinicia dispositivos'
-  Assert-Runtime ($session.Cursors.System.RecordId -eq 42 -and [IO.File]::Exists((Join-Path $session.DataDirectory 'cursores.xml'))) 'Cursores só avançam após logs locais e persistência'
+  Assert-Runtime ($session.Cursors.Count -eq 0 -and -not [IO.File]::Exists((Join-Path $session.DataDirectory 'cursores.xml'))) 'A coleta normal não cria cursores de eventos genéricos do Windows'
   $session.SignalDropCount=3; Invoke-PdvMonitorTick $session; Invoke-PdvMonitorTick $session
   Assert-Runtime ($session.LastLoggedSignalDropCount -eq 3 -and (@(Get-TestRecords | Where-Object { $_.Kind -eq 'LogGap' -and $_.Detail -like '*sinais descartados*' }).Count -eq 1)) 'Perda de sinais vira LogGap uma vez por aumento do contador'
   $before=$session.Sequence; $session.TickBusy=$true; Invoke-PdvMonitorTick $session; $session.TickBusy=$false
@@ -241,7 +249,7 @@ try {
   Invoke-PdvMonitorTick $session; Invoke-PdvMonitorTick $session
   Assert-Runtime ((@(Get-TestRecords | Where-Object { $_.Kind -eq 'DeviceMissing' }).Count -eq 0)) 'Rodada incompleta não informa remoção de dispositivo antes enumerado'
   Invoke-PdvMonitorTick $session
-  Assert-Runtime ((@(Get-TestRecords | Where-Object { $_.Kind -eq 'DeviceMissing' }).Count -eq 1)) 'Somente duas bases completas permitem registrar remoção'
+  Assert-Runtime ((@(Get-TestRecords | Where-Object { $_.Kind -eq 'DeviceMissing' }).Count -eq 0)) 'Instâncias sem perfil não geram inventário ruidoso nem remoções sem contexto'
 
   # Perfis são normalizados e alterações rejeitadas não substituem referências.
   $session=New-TestSession
@@ -348,5 +356,79 @@ try {
   $gaps=$session.OutboxGapCount; $sequence=$session.Sequence
   Invoke-PdvMonitorTick $session
   Assert-Runtime ($gaps -gt 0 -and $session.OutboxGapCount -eq $gaps -and $session.LastLoggedOutboxGapCount -eq $gaps -and $session.Sequence -eq $sequence -and (@(Get-TestRecords | Where-Object { $_.Kind -eq 'LogGap' -and $_.Reason -eq 'OutboxQueueGap' }).Count -eq 1)) 'Fila cheia gera LogGap durável e não cria ciclo ao falhar seu próprio enfileiramento'
+  # Ruído normal desaparece mesmo com dezenas de drivers e notificações WMI.
+  $session=New-TestSession; $healthy=New-TestSnapshot 0;
+  $many=@(); for ($i=0;$i -lt 40;$i++) { $many += New-Object PSObject -Property @{InstanceId=('USB\NORMAL\'+$i);Name='Normal';Class='Ports';Port=('COM'+($i+20));Present=$true;PresenceKnown=$true;ProblemCode=0;Status='OK'}; }
+  $healthy.Devices=@($healthy.Devices)+$many;
+  & $module { param($Snapshot);$script:TestDefaultSnapshot=$Snapshot } $healthy;
+  for ($i=0;$i -lt 100;$i++) { $session.Signals.Enqueue(@{EventType=3;Time='teste'}); }
+  Invoke-PdvMonitorTick $session;
+  & $module { $script:TestNow=$script:TestNow.AddMinutes(11) }; Invoke-PdvMonitorTick $session;
+  Assert-Runtime ((@(Get-TestRecords | Where-Object { @('Snapshot','PrinterSnapshot','PortReservations','DeviceChanged','DeviceMissing','WindowsDeviceChange','RecoveryDecision') -contains $_.Kind }).Count -eq 0)) '41 dispositivos normais e 100 sinais WMI não geram inventários de rotina nem decisões desarmadas';
+
+  # COM divergente aparece desarmada, é estável/deduplicada e resolve sozinha.
+  $session=New-TestSession; Add-TestProfile $session;
+  & $module { $script:TestDefaultSnapshot.Devices[0].ProblemCode=0;$script:TestDefaultSnapshot.Devices[0].Status='OK';$script:TestDefaultSnapshot.Devices[0].Port='COM6' };
+  Invoke-PdvMonitorTick $session; Invoke-PdvMonitorTick $session;
+  Assert-Runtime ((@(Get-TestRecords | Where-Object Kind -eq 'ComPortChanged').Count -eq 0)) 'Duas leituras divergentes ainda não alertam';
+  Invoke-PdvMonitorTick $session; Invoke-PdvMonitorTick $session;
+  Assert-Runtime ((@(Get-TestRecords | Where-Object Kind -eq 'ComPortChanged').Count -eq 1) -and (Get-TestMetric 'TestRestarts') -eq 0 -and -not $session.MaintenanceArmed) 'Terceira leitura alerta porta COM sem manutenção e sem executar recuperação';
+  & $module { $script:TestDefaultSnapshot.Devices[0].Port='COM4' };
+  Invoke-PdvMonitorTick $session; Invoke-PdvMonitorTick $session; Invoke-PdvMonitorTick $session;
+  Assert-Runtime ((@(Get-TestRecords | Where-Object { $_.Kind -eq 'DeviceRestored' -and $_.Reason -eq 'ComPortChanged' }).Count -eq 1)) 'Retorno da COM resolve o alerta após três leituras';
+  Save-PdvMonitorProfiles $session @(@{Role='Pinpad';InstanceId='USB\PINPAD\001';ExpectedPort='COM8';RecoveryEnabled=$false});
+  Invoke-PdvMonitorTick $session;
+  Assert-Runtime ((@(Get-TestRecords | Where-Object Kind -eq 'ComPortChanged').Count -eq 1)) 'Alteração do perfil limpa debounce sem emitir um erro imediato';
+
+  $session=New-TestSession; Add-TestProfile $session;
+  $empty=New-TestSnapshot 0 $true $false; $unknown=New-TestSnapshot 0; $unknown.Devices[0].PresenceKnown=$false;
+  & $module {param($Empty,$Unknown);$script:TestSnapshots.Enqueue($Empty);$script:TestSnapshots.Enqueue($Empty);$script:TestSnapshots.Enqueue($Unknown);$script:TestSnapshots.Enqueue($Empty);$script:TestSnapshots.Enqueue($Empty)} $empty $unknown;
+  for($i=0;$i -lt 5;$i++){ Invoke-PdvMonitorTick $session; }
+  Assert-Runtime ((@(Get-TestRecords | Where-Object Kind -eq 'DeviceDisconnected').Count -eq 0)) 'Presença desconhecida interrompe três leituras e nunca vira desconexão';
+  & $module {param($Empty);$script:TestDefaultSnapshot=$Empty} $empty; Invoke-PdvMonitorTick $session; Invoke-PdvMonitorTick $session;
+  Assert-Runtime ((@(Get-TestRecords | Where-Object Kind -eq 'DeviceDisconnected').Count -eq 1)) 'Ausência em três leituras completas gera uma desconexão';
+
+  $session=New-TestSession; Add-TestProfile $session; $healthy=New-TestSnapshot 0;
+  $phantom=New-Object PSObject -Property @{InstanceId='USB\OUTRO';Name='Fantasma';Port='COM4';Present=$false;PresenceKnown=$true;ProblemCode=45;Status='Unknown'};
+  $healthy.Devices=@($healthy.Devices)+@($phantom);
+  & $module {param($Snapshot);$script:TestDefaultSnapshot=$Snapshot} $healthy;
+  Invoke-PdvMonitorTick $session;Invoke-PdvMonitorTick $session;Invoke-PdvMonitorTick $session;
+  Assert-Runtime ((@(Get-TestRecords | Where-Object Kind -eq 'ComPortConflict').Count -eq 0)) 'Reserva e dispositivo fantasma não são ocupação COM concreta';
+  $phantom.Present=$true; $phantom.ProblemCode=0;
+  Invoke-PdvMonitorTick $session;Invoke-PdvMonitorTick $session;Invoke-PdvMonitorTick $session;Invoke-PdvMonitorTick $session;
+  Assert-Runtime ((@(Get-TestRecords | Where-Object Kind -eq 'ComPortConflict').Count -eq 1)) 'Outra instância presente na COM gera conflito uma vez';
+
+  $session=New-TestSession;
+  & $module {
+    $script:TestWindowsEvents=@(1..50 | ForEach-Object {New-Object PSObject -Property @{Channel='System';RecordId=[string]$_;Provider='disk';Id=7;Level=2;TimeCreated='2026-10-15T12:00:00-03:00'}});
+    $script:TestWindowsEvents+=New-Object PSObject -Property @{Channel='System';RecordId='51';Provider='disk';Id=999;Level=4;TimeCreated='2026-10-15T12:00:00-03:00'};
+  };
+  Invoke-PdvMonitorTick $session;
+  & $module {$script:TestNow=$script:TestNow.AddMinutes(1)};Invoke-PdvMonitorTick $session;
+  Assert-Runtime ((@(Get-TestRecords | Where-Object {$_.Kind -in @('WindowsError','WindowsCritical','WindowsEvent','WindowsEventCoverage')}).Count -eq 0)) 'Eventos genéricos e cobertura Windows não são consultados ou publicados';
+  & $module {$script:TestNow=$script:TestNow.AddMinutes(10)};Invoke-PdvMonitorTick $session;
+  Assert-Runtime ((@(Get-TestRecords | Where-Object {$_.Kind -in @('WindowsError','WindowsCritical','WindowsEvent','WindowsEventCoverage')}).Count -eq 0) -and $session.LoggingHealthy) 'Mesmo após dez minutos o monitor segue saudável sem consultar eventos genéricos';
+  # Coleta patrimonial a cada seis horas, envio somente inicial/mudança/24h.
+  $session=New-TestSession;
+  $hardware=@{schemaVersion=1;collectedAt='2026-10-19T12:00:00-03:00';machineId='uuid-teste';hostname='CX4901';manufacturer='Marca';model='Caixa';serialNumber='SN1';os=@{caption='Windows';version='10';build='19045';architecture='64-bit';lastBootAt=''};cpu=@{name='CPU';cores='4';logicalProcessors='8'};memory=@{totalBytes='8589934592';modules=@()};disks=@();systemVolume=@{name='C:';totalBytes='1000';freeBytes='500'};networkAdapters=@();warnings=@()};
+  & $module {param($Hardware);$script:TestHardwareResult=New-Object PSObject -Property @{Success=$true;Hardware=$Hardware;CoverageHealthy=$true}} $hardware;
+  Invoke-PdvMonitorTick $session; Invoke-PdvMonitorTick $session;
+  Assert-Runtime ((Get-TestMetric 'TestHardwareCalls') -eq 1 -and (Get-TestMetric 'TestHardwareQueued') -eq 1 -and (@(Get-TestRecords | Where-Object Kind -eq 'MachineInventory').Count -eq 1) -and [IO.File]::Exists((Join-Path $session.DataDirectory 'inventario-hardware.json'))) 'Primeira consulta guarda patrimônio e uma pendência sem consulta WMI a cada tick';
+  & $module {$script:TestNow=$script:TestNow.AddHours(6);$script:TestHardwareResult.Hardware.systemVolume.freeBytes='1'};Invoke-PdvMonitorTick $session;
+  Assert-Runtime ((Get-TestMetric 'TestHardwareCalls') -eq 2 -and (Get-TestMetric 'TestHardwareQueued') -eq 1 -and (@(Get-TestRecords | Where-Object Kind -eq 'HardwareChanged').Count -eq 0)) 'Variação de espaço livre não renova inventário nem gera mudança de hardware';
+  & $module {$script:TestNow=$script:TestNow.AddHours(18)};Invoke-PdvMonitorTick $session;
+  Assert-Runtime ((Get-TestMetric 'TestHardwareQueued') -eq 2 -and (@(Get-TestRecords | Where-Object Kind -eq 'HardwareChanged').Count -eq 0)) 'Renovação de 24h envia somente documento de inventário';
+  & $module {$script:TestNow=$script:TestNow.AddHours(6);$script:TestHardwareResult.Hardware.memory.totalBytes='17179869184'};Invoke-PdvMonitorTick $session;
+  Assert-Runtime ((Get-TestMetric 'TestHardwareQueued') -eq 3 -and (@(Get-TestRecords | Where-Object Kind -eq 'HardwareChanged').Count -eq 1)) 'Alteração de RAM envia inventário e um resumo de mudança';
+  $before=[IO.File]::ReadAllText((Join-Path $session.DataDirectory 'inventario-hardware.json'));
+  & $module {$script:TestNow=$script:TestNow.AddHours(6);$script:TestHardwareResult.CoverageHealthy=$false;$script:TestHardwareResult.Hardware.model=''};Invoke-PdvMonitorTick $session;
+  Assert-Runtime ([IO.File]::ReadAllText((Join-Path $session.DataDirectory 'inventario-hardware.json')) -ceq $before) 'Falha parcial não sobrescreve inventário válido nem apaga hardware conhecido';
+  # Falha de enfileiramento após mudar o patrimônio não espera 24h para tentar.
+  & $module {$script:TestHardwareResult.CoverageHealthy=$true;$script:TestNow=$script:TestNow.AddMinutes(15);$script:TestHardwareResult.Hardware.model='Modelo novo';$script:TestHardwareQueueFailure=$true};
+  $session.Config.Central.Enabled=$true; Invoke-PdvMonitorTick $session;
+  $attempts=Get-TestMetric 'TestHardwareQueued';
+  Assert-Runtime ($null -eq $session.HardwareLastQueuedAt -and $session.HardwareQueueFailed -and $session.HardwareStatus -like '*envio patrimonial pendente*') 'Falha de fila preserva inventário válido e invalida somente a referência de inclusão anterior';
+  & $module {$script:TestHardwareQueueFailure=$false;$script:TestNow=$script:TestNow.AddMinutes(15)};Invoke-PdvMonitorTick $session;
+  Assert-Runtime ((Get-TestMetric 'TestHardwareQueued') -eq ($attempts+1) -and -not $session.HardwareQueueFailed -and $null -ne $session.HardwareLastQueuedAt) 'Inventário alterado é reenfileirado em 15 minutos após falha, sem esperar renovação de 24h';
   Write-Host ('PASS: ' + $script:assertions + ' verificações offline do runtime; sessão única, logs/rotação, perfis, manutenção, três leituras iguais, revalidação, histórico antes da ação e exportação sem credencial/fila. Nenhum hardware, WMI, processo ou HTTP real foi acessado. PowerShell ' + $PSVersionTable.PSVersion + '.')
 } finally { if ([IO.Directory]::Exists($testRoot)) { [IO.Directory]::Delete($testRoot,$true) } }

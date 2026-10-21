@@ -13,3 +13,27 @@ status.txt
 *.bin
 *.tmp
 .DS_Store
+
+# Inventário local contém identificadores patrimoniais.
+inventario-hardware.json*
+inventario-hardware-parcial.json*
+software-estado.xml*
+inventario-estado.xml*
+hardware-pendente.xml*
+
+# Estado da automação e assinatura privada nunca integra o programa.
+nerus-automacao.xml*
+atualizacoes/
+*-signing.xml
+*.pem
+*.key
+falha-inicializacao-monitor.txt
+
+__pycache__/
+
+nerus-reabertura.xml*
+nerus-servico.xml*
+nerus-servico-tentativas.xml*
+nerus-servico-diagnostico.json*
+inventario-software*.json*
+software-pendente.xml*
