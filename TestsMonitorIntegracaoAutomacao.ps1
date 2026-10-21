@@ -29,6 +29,7 @@ function Assert-Automation([bool]$Condition,[string]$Message) { if (-not $Condit
     return (New-Object PSObject -Property @{Devices=@();Printers=@();ReservedPorts=@();Warnings=@();InventoryComplete=$script:InventoryComplete;PresenceComplete=$script:InventoryComplete;InventoryMode='Mock';Windows=(New-Object PSObject -Property @{Build=19045;IsAdministrator=$false;Caption='Windows mock';});});
   }
   function script:Get-PdvMonitorHardwareInventory { return (New-Object PSObject -Property @{Success=$false;Hardware=$null;}); }
+  function script:Get-PdvMonitorNerusServiceDiscovery { param($Session); return @{Candidates=@();Processes=@();Complete=$true;Reason=''}; }
   function script:Get-PdvMonitorWindowsEvents { param($Cursors,$MaxEventsPerChannel); return (New-Object PSObject -Property @{Events=@();Cursors=@{};ChannelStatus=@();Warnings=@();}); }
   function script:Invoke-PdvMonitorUpload { param($Session); return (New-Object PSObject -Property @{Success=$true;Reason='OutboxEmpty';Sent=0;}); }
   function script:Add-PdvMonitorOutboxRecord {
@@ -159,6 +160,8 @@ try {
   $tokens=$null; $errors=$null; $ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $directory 'MonitorPdv.ps1'),[ref]$tokens,[ref]$errors);
   $definition=$ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq 'Complete-PdvMonitorTickWorker'},$false);
   . ([scriptblock]::Create($definition.Extent.Text));
+  $busyDefinition=$ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq 'Test-PdvMonitorNerusServiceBusy'},$false);
+  . ([scriptblock]::Create($busyDefinition.Extent.Text)); $script:serviceWorker=$null;
   function Update-PdvMonitorView {};
   function Set-PdvMonitorControls { param($Enabled); };
   $script:ApplyCalls=New-Object Collections.ArrayList;

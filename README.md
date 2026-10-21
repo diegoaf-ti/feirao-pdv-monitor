@@ -1,10 +1,10 @@
-# Monitor contínuo do PDV 0.4.0 — Windows 7/10/11
+# Monitor contínuo do PDV 0.5.0 — Windows 7/10/11
 
-Monitor local do pinpad TEF e da impressora para registrar mudanças de porta COM, desconexões observáveis, problemas informados pelo Windows e tentativas de recuperação. Mantém histórico local e pode enviar os registros para a central do Conecta.
+Monitor local do pinpad TEF, da impressora e do componente Nerus para registrar mudanças de porta COM, desconexões observáveis, falhas dos dispositivos vinculados e tentativas de recuperação. Mantém histórico local e pode enviar os registros para a central do Conecta.
 
 **Piloto em validação.** Os testes com dados simulados passaram no macOS com PowerShell 7.5.4 e no Windows com PowerShell 5.1 pelo [GitHub Actions](https://github.com/diegoaf-ti/feirao-pdv-monitor/actions). A interface, a coleta nativa e os equipamentos reais ainda precisam ser validados no caixa. Comece acompanhado pelo suporte, mantendo a recuperação desarmada.
 
-Para correção automática e atualização assinada, consulte o [guia do piloto 0.4.0](GUIA-PILOTO-V3.md) e a [documentação do atualizador](ATUALIZACAO-AUTOMATICA.md). O [guia v2](GUIA-PILOTO-V2.md) preserva as instruções anteriores.
+Para o Caixa Web, consulte primeiro o [guia do Nerus Service](GUIA-NERUS-SERVICE.md). Para correção de fiscalDevice e atualização assinada, consulte o [guia do piloto 0.4.0](GUIA-PILOTO-V3.md) e a [documentação do atualizador](ATUALIZACAO-AUTOMATICA.md). O [guia v2](GUIA-PILOTO-V2.md) preserva as instruções anteriores.
 
 ## Abrir e deixar funcionando
 
@@ -28,6 +28,10 @@ A central pode autorizar por instalação o ajuste de fiscalDevice para uma corr
 
 A versão 0.4.0 acrescenta **Corrigir e reabrir Nerus...** no monitor local. Depois de consultar a divergência pela API, o operador confirma que finalizou ou cancelou venda e pagamento. A tentativa identifica o executável pelo atalho **Nerus** da Área de Trabalho, pede fechamento normal, aguarda a saída, usa a correção transacional existente e reabre uma vez. A aplicação pode recusar o fechamento; não há encerramento forçado ou confirmação automática dos diálogos. Resultado incerto da escrita bloqueia a reabertura automática. A consulta nova da API precisa estar publicada.
 
+Esse fluxo pelo atalho exige um programa local e não atende ao Caixa Web aberto no navegador. Para esse cenário, a versão 0.5.0 acrescenta descoberta de candidatos locais ao **Nerus Service** e recuperação assistida de um serviço Windows previamente vinculado. A tentativa funciona mesmo quando a COM já está correta: após confirmação local, solicita parada normal, comprova a saída do processo próprio e inicia o mesmo serviço uma vez. Não altera COM nem fiscalDevice e não depende das rotas de automação da API. Não há reinício silencioso durante uma venda.
+
+O documento de implantação fornecido confirma um componente local com DLLs e ícone na bandeja, porém não informa seu nome no gerenciador de serviços do Windows. Ele também pode ser um aplicativo de bandeja. A descoberta é somente leitura e não torna um candidato automaticamente autorizado: o suporte precisa confirmar e salvar o vínculo exato. Aplicativo de bandeja, processo compartilhado, dependentes ativos, processos filhos ou identidade incompleta bloqueiam o reinício. A função exige privilégios administrativos já concedidos; não solicita elevação automática. A impressora precisa estar vinculada e saudável em três leituras, na COM esperada, sem conflito e sem impressão pendente. Consulte os [requisitos e o roteiro do piloto](GUIA-NERUS-SERVICE.md).
+
 A versão 0.3.1 explica nos registros por que uma tentativa não pode avançar: inventário incompleto, impressora sem vínculo, identidade ausente, porta sem correspondência homologada ou conflito. Instâncias ausentes de conexões anteriores não são escolhidas para corrigir o caixa. Esses avisos não confirmam falha de impressão nem autorizam associar equipamentos apenas pelo nome/modelo.
 
 Atualizações aprovadas podem ser recebidas automaticamente após uma instalação inicial desta versão. O monitor valida a assinatura, aplica seu próprio programa e restaura o anterior se a nova versão falhar. As duas opções começam desativadas e são independentes. A integração v3 do Conecta/API precisa ser publicada antes de habilitá-las; por solicitação do usuário, essa publicação está pendente.
@@ -36,7 +40,7 @@ Atualizações aprovadas podem ser recebidas automaticamente após uma instalaç
 
 O histórico prioriza problemas que exigem atenção. A enumeração de portas continua local a cada 15 segundos, mas dispositivos normais, filas e reservas COM não são enviados repetidamente. Sinais genéricos WMI não geram uma ocorrência por mudança.
 
-**Os alertas de COM exigem vínculo salvo.** Na primeira instalação, selecione a instância exata do pinpad e da impressora, confirme a porta que o Nerus espera para aquele caixa e use **Salvar vínculo**. Sem esse passo o monitor coleta o patrimônio e as falhas graves do Windows, mas não sabe qual dispositivo deveria estar em qual COM. Nome/modelo ou VID/PID sozinho não identificam uma unidade com segurança.
+**Os alertas de COM exigem vínculo salvo.** Na primeira instalação, selecione a instância exata do pinpad e da impressora, confirme a porta que o Nerus espera para aquele caixa e use **Salvar vínculo**. Sem esse passo o monitor coleta o patrimônio e descobre candidatos ao componente Nerus, mas não sabe qual dispositivo deveria estar em qual COM. Nome/modelo ou VID/PID sozinho não identificam uma unidade com segurança.
 
 | Fonte | Frequência e informação |
 | --- | --- |
@@ -44,18 +48,22 @@ O histórico prioriza problemas que exigem atenção. A enumeração de portas c
 | Persistência e resolução | Um mesmo problema gera um alerta até a condição mudar. Três leituras normais geram resolução. Presença ou código desconhecido não se tornam prova de desconexão ou recuperação. |
 | Patrimônio da máquina | Coleta no início e a cada seis horas: identificação WMI, nome do computador, fabricante/modelo/série, Windows, CPU, RAM/módulos, discos, volume do sistema e adaptadores físicos. Documento próprio de até 32 KiB. |
 | Atualização do patrimônio | Envio inicial, mudança do hardware ou renovação após 24 horas. Horário de captura, boot, espaço livre e ordem dos dispositivos não criam uma mudança de patrimônio. Falha de consulta preserva o último inventário válido. |
-| Falhas graves Windows | Canais relevantes já habilitados, somente níveis crítico/erro de disco, WHEA, energia, USB, serial e impressão. Consulta a cada 60 segundos, até 100 eventos por canal, com repetidos agrupados por canal/provedor/código por dez minutos. |
 | Monitor e manutenção | Início/encerramento, sinal de atividade a cada minuto, mudanças na cobertura de coleta e tentativas/resultados de recuperação. Decisões desarmadas não são publicadas como incidentes. |
+| Nerus Service | Descoberta local a cada 60 segundos. Registra referência inicial e mudanças relevantes de estado/identidade; as informações não são reenviadas a cada consulta. Sem leitura de argumentos, arquivos de pagamento ou conteúdo das DLLs. |
 
 O patrimônio fica separado da lista de ocorrências na central. `MachineInventory` e `HardwareChanged` são resumos informativos. Não há nova remessa periódica de uma linha por driver ou reserva COM. Reservas não provam que a COM está ocupada; um dispositivo histórico ausente não é anunciado como conflito concreto.
 
-Eventos Windows preservam somente horário, canal, provedor, número de registro, código e nível. Mensagens completas, documentos e propriedades livres não são lidos. O monitor não habilita canais desligados. A cobertura inicial começa nos últimos dois minutos; limpeza/rotação, falhas de acesso e limite de coleta ficam explícitos. O agrupamento é por metadados e não determina a causa de uma falha. Não há promessa de capturar todo evento passado.
+O monitor contínuo concentra a coleta em COM, dispositivos vinculados, componente Nerus, patrimônio e funcionamento do próprio monitor. A versão 0.5.0 deixa de consultar o Event Log e de gerar avisos genéricos de canais/cobertura ou falhas gerais do Windows. Os registros históricos já coletados continuam sujeitos à retenção existente.
 
 O inventário usa uma lista explícita de campos. Não coleta usuário, product key, IPs, programas instalados, arquivos, dados de pagamento ou mensagens WMI livres. Arrays têm limites de 16 itens e a cobertura reduzida é informada; o JSON nunca é cortado para caber no transporte.
+
+O diagnóstico do Nerus Service usa metadados limitados do serviço e do executável, como nome, estado, tipo, PID, caminho e versão. O caminho pode conter o nome de uma pasta de usuário. Não inclui linha de comando, argumentos, credenciais, UUID de ativação ou o conteúdo livre das configurações do fornecedor. `ServiceDiagnostic` utiliza o contrato atual de eventos, sem migração adicional. Na central já publicada, esse registro aparece na visualização completa como registro de rotina; a classificação específica no painel continua pendente de publicação. Estado `Running` ou nova execução do serviço não comprova comunicação ou impressão.
 
 As consultas não abrem portas seriais, não realizam pagamentos ou impressões de teste e não leem arquivos de transações/configuração do SiTef. Uma observação indica o que o Windows informou, sem provar a comunicação com o Nerus ou a causa da falha.
 
 ### Particularidades do Windows 7
+
+O manual de implantação do **Caixa Web** fornecido para esta entrega orienta Windows 10 de 64 bits e Google Chrome. A compatibilidade de sintaxe do monitor com Windows 7 não significa que o Caixa Web ou o Nerus Service estejam homologados nesse sistema; validar a instalação com o fornecedor.
 
 O monitor usa consultas WMI/Registro compatíveis com a sintaxe do Windows PowerShell 2.0. A presença física pode ficar **não confirmada**; `Status=OK` ou código de problema `0` não comprovam que o equipamento esteja conectado ou disponível para o Nerus. A enumeração de uma porta também não comprova que outro processo consiga abri-la. Essas limitações estão documentadas em [Win32_PnPEntity](https://learn.microsoft.com/en-us/windows/win32/cimwin32prov/win32-pnpentity).
 
@@ -69,12 +77,15 @@ Os dados ficam em `%LOCALAPPDATA%\Feirao\PdvMonitor`:
 
 - `logs\monitor-*.csv`: histórico técnico, com data, sessão, sequência e identificador único de cada ocorrência.
 - `monitor.xml`: perfis e configurações locais; não contém a chave de envio em texto aberto.
-- `cursores.xml`: posições de leitura dos canais Windows.
+- `cursores.xml`: referência histórica de canais Windows preservada de versões anteriores; o monitor contínuo atual não consulta esses canais.
 - `recuperacoes.xml`: histórico recente das tentativas de reinício.
 - `status.txt`: último estado informado pelo monitor.
 - `inventario-hardware.json`: último patrimônio estruturado válido; incluído na exportação.
 - `inventario-estado.xml`: hash estático e referência da última inclusão para envio.
 - `hardware-pendente.xml`: único documento patrimonial aguardando confirmação; fica fora da exportação, assim como a fila histórica e a credencial.
+- `nerus-servico.xml`: vínculo exato do serviço confirmado pelo suporte, sem argumentos ou credenciais.
+- `nerus-servico-tentativas.xml`: etapas e limites persistidos das tentativas assistidas.
+- `nerus-servico-diagnostico.json`: último diagnóstico limitado do componente local.
 
 Os CSVs são separados por dia/sessão e giram em torno de 5 MB por arquivo. A limpeza mantém até 30 dias e busca limitar o conjunto a 100 MB, removendo os arquivos antigos; o arquivo em uso é preservado. Exporte o atendimento antes de alcançar essa retenção se precisar guardar o histórico por mais tempo.
 
@@ -141,14 +152,16 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\TestsPnpProperties.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\TestsMonitorNerus.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\TestsMonitorNerusRestart.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\TestsMonitorNerusRestartFlow.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\TestsMonitorNerusService.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\TestsMonitorNerusServiceRuntime.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\TestsMonitorAtualizacao.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\TestsMonitorIntegracaoAutomacao.ps1
 ```
 
-A aprovação dos testes simulados no macOS e no Windows PowerShell 5.1 não comprova funcionamento do Windows PowerShell 2.0, interface de bandeja, DPAPI, coleta WMI/Event Log, TLS/HTTPS, driver ou recuperação real.
+A aprovação dos testes simulados no macOS e no Windows PowerShell 5.1 não comprova funcionamento do Windows PowerShell 2.0, interface de bandeja, DPAPI, coleta WMI/PnP, TLS/HTTPS, driver ou recuperação real.
 
 Para atualizar uma instalação existente, encerre o monitor pelo ícone da bandeja, extraia todos os arquivos da nova versão e abra `Monitor.cmd` com o mesmo usuário e pasta de dados. Confirme a configuração central e os vínculos existentes; a chave permanece protegida para esse usuário. Se usa início automático, use novamente o botão de instalação para atualizar os arquivos copiados. Não execute uma versão antiga em paralelo.
 
 No primeiro caixa, validar abertura no usuário comum, presença/COM comparadas com o Gerenciador de Dispositivos, ocultação sem encerrar, exportação, início após novo login e saída explícita. Fora de uma venda, testar desconectar/reconectar um equipamento por vez, falta de rede/reenvio sem duplicar, mudança para offline na central e revogação. Conferir a presença desconhecida no Windows 7 e os avisos de consulta indisponível. Confirme que o patrimônio aparece na central, que não surgem novos snapshots periódicos e que a COM esperada de cada perfil está correta. Fora de venda, simule divergência apenas no perfil do monitor, observe o alerta após três leituras, restaure a referência e confira a resolução. Não renumere a COM do Windows para esse teste. Só depois avaliar recuperação durante manutenção acompanhada.
 
-Registre Windows, modelo do pinpad e da impressora, versões do driver, Nerus e CliSiTef. A documentação de [Get-WinEvent](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.diagnostics/get-winevent?view=powershell-5.1) explica as consultas aos canais Windows. A possibilidade de `AUTO_USB` deve ser validada separadamente com o fornecedor da [CliSiTef](https://dev.softwareexpress.com.br/docs/clisitef/configuracao_da_porta/), conforme equipamento e biblioteca instalados.
+Registre Windows, modelo do pinpad e da impressora, versões do driver, Nerus e CliSiTef. A possibilidade de `AUTO_USB` deve ser validada separadamente com o fornecedor da [CliSiTef](https://dev.softwareexpress.com.br/docs/clisitef/configuracao_da_porta/), conforme equipamento e biblioteca instalados.

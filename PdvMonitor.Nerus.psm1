@@ -733,5 +733,413 @@ function Invoke-PdvMonitorNerusRestartApply {
   } finally { [void]$Session.NerusAutomation.Remove('RestartExpectedBefore');$r.Proposal=$null;$r.Busy=$false;$r.Stage='Idle'; }
 }
 
-Export-ModuleMember -Function Invoke-PdvMonitorNerusAutomation,Invoke-PdvMonitorNerusRestartProbe,Invoke-PdvMonitorNerusRestartApply;
+# Reinicio assistido do servico local: sem SQL, COM, hot reload ou descoberta por tentativa.
+function Test-PdvNerusServiceNerusName {
+  param([string]$Name);
+  $plain=New-Object Text.StringBuilder;
+  foreach($c in $Name.Normalize([Text.NormalizationForm]::FormD).ToCharArray()){if([Globalization.CharUnicodeInfo]::GetUnicodeCategory($c) -ne [Globalization.UnicodeCategory]::NonSpacingMark){[void]$plain.Append($c);}}
+  return ($plain.ToString() -match 'nerus');
+}
+function Get-PdvNerusServiceProcessDiagnostics {
+  $items=@();foreach($p in @(Get-Process -ErrorAction Stop)){if(Test-PdvNerusServiceNerusName ([string]$p.ProcessName)){$items+=,@{ProcessName=[string]$p.ProcessName;ProcessId=[int]$p.Id};if($items.Count -ge 16){break;}}};return $items;
+}
+function Get-PdvNerusServiceRows { return @(Get-WmiObject -Class Win32_Service -ErrorAction Stop); }
+function Get-PdvNerusServiceProcessRows { return @(Get-WmiObject -Class Win32_Process -Property ProcessId,ParentProcessId -ErrorAction Stop); }
+function Get-PdvNerusServiceProcessIdentity {
+  param([int]$ProcessId);
+  $p=$null;
+  try {
+    $p=[Diagnostics.Process]::GetProcessById($ProcessId);$p.Refresh();
+    if($p.HasExited){throw 'NerusServiceProcessChanged';}
+    return @{ProcessId=[int]$p.Id;StartTimeTicks=$p.StartTime.ToUniversalTime().Ticks;ExecutablePath=[string]$p.MainModule.FileName;ProcessName=[string]$p.ProcessName};
+  } finally {if($null -ne $p){$p.Dispose();}}
+}
+function Get-PdvNerusServiceControllerState {
+  param([string]$ServiceName);
+  Add-Type -AssemblyName System.ServiceProcess -ErrorAction Stop;
+  Add-Type -AssemblyName System.ServiceProcess -ErrorAction Stop;
+  $c=New-Object ServiceProcess.ServiceController($ServiceName);
+  try {
+    $active=@();$required=@();
+    foreach($d in @($c.DependentServices)){try{$d.Refresh();if($d.Status -ne [ServiceProcess.ServiceControllerStatus]::Stopped){$active+=,[string]$d.ServiceName;}}finally{$d.Dispose();}}
+    foreach($d in @($c.ServicesDependedOn)){try{$d.Refresh();$required+=,@{Name=[string]$d.ServiceName;Running=($d.Status -eq [ServiceProcess.ServiceControllerStatus]::Running)};}finally{$d.Dispose();}}
+    return @{ActiveDependents=@($active);RequiredServices=@($required)};
+  } finally {$c.Dispose();}
+}
+function Get-PdvNerusServiceModules {
+  param([int]$ProcessId);
+  $p=$null;$items=@();
+  try {
+    $p=[Diagnostics.Process]::GetProcessById($ProcessId);
+    foreach($m in @($p.Modules)){
+      $name=[string]$m.ModuleName;
+      if($name -match '^(mp2032|mp2064|e1_impressora[a-z0-9_.-]*|bemafi[a-z0-9_.-]*|siusbxp[a-z0-9_.-]*|clisitef[a-z0-9_.-]*)\.dll$'){
+        if($items.Count -ge 16){return @{Complete=$false;Items=@($items);Reason='NerusServiceModulesLimited'};}
+        $version=[string]$m.FileVersionInfo.FileVersion;if($version.Length -gt 80 -or $version -match '[\x00-\x1f\x7f]'){$version='';}
+        $items+=,@{Name=$name;Version=$version;Observed=$true};
+      }
+    }
+    return @{Complete=$true;Items=@($items);Reason=''};
+  } catch {return @{Complete=$false;Items=@();Reason='NerusServiceModulesUnknown'};}
+  finally {if($null -ne $p){$p.Dispose();}}
+}
+function Test-PdvNerusServicePermission {
+  param([string]$ServiceName);
+  $identity=[Security.Principal.WindowsIdentity]::GetCurrent();
+  try {$principal=New-Object Security.Principal.WindowsPrincipal($identity);return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator);}
+  finally {$identity.Dispose();}
+}
+function Invoke-PdvNerusServiceStop {
+  param([string]$ServiceName,$Expected);
+  # ServiceController.Stop no .NET Framework pode parar dependentes. WMI envia
+  # somente STOP ao nome exato e o SCM recusa se outro dependente surgir.
+  $allRows=@(Get-PdvNerusServiceRows);$rows=@($allRows | Where-Object {[string]$_.Name -ceq $ServiceName});
+  if($rows.Count -ne 1){throw 'NerusServiceIdentityChanged';}
+  $view=Get-PdvNerusServiceView $ServiceName $allRows;if(-not $view.Eligible){throw $view.Reason;}
+  if($null -eq $Expected -or [int]$rows[0].ProcessId -ne [int]$Expected.ProcessId -or [string]$rows[0].State -cne 'Running' -or (Get-PdvNerusServiceTextHash ([string]$rows[0].PathName)) -cne [string]$Expected.ConfigurationHash){throw 'NerusServiceIdentityChanged';}
+  $identity=Get-PdvNerusServiceProcessIdentity ([int]$Expected.ProcessId);if([long]$identity.StartTimeTicks -ne [long]$Expected.StartTimeTicks -or -not [string]::Equals([string]$identity.ExecutablePath,[string]$Expected.ExecutablePath,[StringComparison]::OrdinalIgnoreCase)){throw 'NerusServiceIdentityChanged';}
+  $result=$rows[0].StopService();if([int]$result.ReturnValue -ne 0){throw 'NerusServiceStopRefused';}
+}
+function Invoke-PdvNerusServiceStart {
+  param([string]$ServiceName);
+  Add-Type -AssemblyName System.ServiceProcess -ErrorAction Stop;
+  Add-Type -AssemblyName System.ServiceProcess -ErrorAction Stop;
+  $c=New-Object ServiceProcess.ServiceController($ServiceName);
+  try {$c.Start();}finally{$c.Dispose();}
+}
+function Wait-PdvNerusServiceStopped {
+  param($Expected,[int]$TimeoutMilliseconds=30000);
+  $watch=[Diagnostics.Stopwatch]::StartNew();
+  try {
+    do {
+      $rows=@(Get-PdvNerusServiceRows | Where-Object {[string]$_.Name -ceq [string]$Expected.ServiceName});
+      if($rows.Count -ne 1){throw 'NerusServiceIdentityChanged';}
+      $row=$rows[0];
+      if(([string]$row.PathName) -and (Get-PdvNerusServiceTextHash ([string]$row.PathName)) -cne [string]$Expected.ConfigurationHash){throw 'NerusServiceIdentityChanged';}
+      $alive=$true;
+      try {$identity=Get-PdvNerusServiceProcessIdentity ([int]$Expected.ProcessId);$alive=([long]$identity.StartTimeTicks -eq [long]$Expected.StartTimeTicks);}
+      catch [ArgumentException] {$alive=$false;}
+      if([string]$row.State -ceq 'Stopped' -and -not $alive){return $true;}
+      if([int]$row.ProcessId -ne 0 -and [int]$row.ProcessId -ne [int]$Expected.ProcessId){throw 'NerusServiceIdentityChanged';}
+      Start-Sleep -Milliseconds 200;
+    } while($watch.ElapsedMilliseconds -lt $TimeoutMilliseconds);
+    return $false;
+  } finally {$watch.Stop();}
+}
+function Wait-PdvNerusServiceRunning {
+  param($Expected,[int]$TimeoutMilliseconds=30000);
+  $watch=[Diagnostics.Stopwatch]::StartNew();
+  try {
+    do {
+      $allRows=@(Get-PdvNerusServiceRows);$rows=@($allRows | Where-Object {[string]$_.Name -ceq [string]$Expected.ServiceName});
+      if($rows.Count -ne 1){throw 'NerusServiceIdentityChanged';}
+      if((Get-PdvNerusServiceTextHash ([string]$rows[0].PathName)) -cne [string]$Expected.ConfigurationHash){throw 'NerusServiceIdentityChanged';}
+      if([string]$rows[0].State -ceq 'Running'){
+        $view=Get-PdvNerusServiceView ([string]$Expected.ServiceName) $allRows;
+        if(-not $view.Eligible){throw $view.Reason;}
+        Test-PdvNerusServiceSameBinding $Expected $view;
+        if([long]$view.StartTimeTicks -eq [long]$Expected.StartTimeTicks -or [long]$view.StartTimeTicks -le [long]$Expected.StartTimeTicks){throw 'NerusServiceOldProcess';}
+        return $view;
+      }
+      Start-Sleep -Milliseconds 200;
+    } while($watch.ElapsedMilliseconds -lt $TimeoutMilliseconds);
+    throw 'NerusServiceStartTimeout';
+  } finally {$watch.Stop();}
+}
+function Get-PdvNerusServiceTextHash {
+  param([string]$Text);
+  $algorithm=[Security.Cryptography.SHA256]::Create();
+  try{return [BitConverter]::ToString($algorithm.ComputeHash([Text.Encoding]::UTF8.GetBytes($Text))).Replace('-','').ToLowerInvariant();}finally{$algorithm.Clear();}
+}
+function Get-PdvNerusServiceExecutable {
+  param([string]$ImagePath);
+  if(-not $ImagePath -or $ImagePath.Length -gt 8192 -or $ImagePath -match '[\x00-\x1f\x7f]'){throw 'NerusServicePathInvalid';}
+  $path='';
+  if($ImagePath -match '^"([^"\r\n]+\.exe)"(?:\s+.*)?$'){$path=$matches[1];}
+  elseif($ImagePath -match '^([A-Za-z]:\\[^\s"]+\.exe)(?:\s+.*)?$'){$path=$matches[1];}
+  else{throw 'NerusServicePathInvalid';}
+  try{$info=Get-PdvNerusRestartPathInfo $path;}catch{throw 'NerusServicePathInvalid';}
+  $name=([string]$info.FullPath -replace '^.*\\','') -replace '\.exe$','';
+  if($name -match '^(svchost|services|cmd|powershell|pwsh|wscript|cscript|rundll32|regsvr32|java|javaw|dotnet|node|python.*|nssm|winsw.*|servicewrapper|srvany|clisitef.*|clientesitef.*|sitef.*|paygo.*)$'){throw 'NerusServiceWrapperNotSupported';}
+  return @{ExecutablePath=$info.FullPath;ExecutableHash=(Get-PdvNerusRestartFileHash $info.FullPath);ConfigurationHash=(Get-PdvNerusServiceTextHash $ImagePath);ProcessName=$name};
+}
+function Get-PdvNerusServiceView {
+  param([string]$ServiceName,$Rows);
+  $view=@{ServiceName=$ServiceName;DisplayName='';State='Unknown';ServiceType='';StartMode='';ProcessId=0;StartTimeTicks=0;ExecutablePath='';ExecutableHash='';ConfigurationHash='';ProcessName='';Eligible=$false;Reason='NerusServiceDiscoveryIncomplete';PrintModules=@();ModulesComplete=$false;TefModuleObserved=$false};
+  try {
+    if($ServiceName -notmatch '^[\p{L}\p{Nd}_. -]{1,128}$' -or $ServiceName -notmatch '\S'){throw 'NerusServiceNameInvalid';}
+    $same=@($Rows | Where-Object {[string]$_.Name -ceq $ServiceName});if($same.Count -ne 1){throw 'NerusServiceIdentityChanged';}
+    $row=$same[0];$view.DisplayName=[string]$row.DisplayName;
+    if($view.DisplayName.Length -gt 256 -or $view.DisplayName -match '[\x00-\x1f\x7f]' -or (-not (Test-PdvNerusServiceNerusName $ServiceName) -and -not (Test-PdvNerusServiceNerusName $view.DisplayName))){throw 'NerusServiceNameInvalid';}
+    $view.State=[string]$row.State;$view.ServiceType=[string]$row.ServiceType;$view.StartMode=[string](Get-PdvNerusValue $row 'StartMode' '');$view.ProcessId=[int]$row.ProcessId;
+    if($view.ProcessId -gt 0){
+      try{$diagnosticIdentity=Get-PdvNerusServiceProcessIdentity $view.ProcessId;$view.ExecutablePath=[string]$diagnosticIdentity.ExecutablePath;$view.StartTimeTicks=[long]$diagnosticIdentity.StartTimeTicks;}catch{}
+      $diagnosticModules=Get-PdvNerusServiceModules $view.ProcessId;$view.PrintModules=@($diagnosticModules.Items);$view.ModulesComplete=[bool]$diagnosticModules.Complete;$view.TefModuleObserved=(@($view.PrintModules | Where-Object {[string]$_.Name -match '^clisitef'}).Count -gt 0);
+    }
+    if($view.ServiceType -cne 'Own Process'){throw 'NerusServiceSharedProcess';}
+    if(@('Auto','Manual') -cnotcontains $view.StartMode){throw 'NerusServiceDisabled';}
+    if($view.State -cne 'Running' -or $view.ProcessId -le 0){throw 'NerusServiceNotRunning';}
+    if($row.AcceptStop -isnot [bool] -or -not $row.AcceptStop){throw 'NerusServiceCannotStop';}
+    if(@($Rows | Where-Object {[int]$_.ProcessId -eq $view.ProcessId -and [int]$_.ProcessId -gt 0}).Count -ne 1){throw 'NerusServiceSharedProcess';}
+    $executable=Get-PdvNerusServiceExecutable ([string]$row.PathName);foreach($key in @('ExecutablePath','ExecutableHash','ConfigurationHash','ProcessName')){$view[$key]=$executable[$key];}
+    $identity=Get-PdvNerusServiceProcessIdentity $view.ProcessId;
+    if(-not [string]::Equals([string]$identity.ExecutablePath,$view.ExecutablePath,[StringComparison]::OrdinalIgnoreCase) -or [long]$identity.StartTimeTicks -le 0 -or [int]$identity.ProcessId -ne $view.ProcessId){throw 'NerusServiceProcessChanged';}
+    $view.StartTimeTicks=[long]$identity.StartTimeTicks;
+    $controller=Get-PdvNerusServiceControllerState $ServiceName;
+    if(@($controller.ActiveDependents).Count -gt 0){throw 'NerusServiceActiveDependents';}
+    foreach($required in @($controller.RequiredServices)){if($required.Running -isnot [bool] -or -not $required.Running){throw 'NerusServiceDependencyNotRunning';}}
+    $processRows=@(Get-PdvNerusServiceProcessRows);
+    if(@($processRows | Where-Object {[int]$_.ParentProcessId -eq $view.ProcessId -and [int]$_.ProcessId -ne $view.ProcessId}).Count -gt 0){throw 'NerusServiceChildProcess';}
+    $view.Eligible=$true;$view.Reason='';
+  } catch {
+    $reason=[string]$_.Exception.Message;if($reason -notmatch '^NerusService[A-Za-z]+$'){$reason='NerusServiceDiscoveryIncomplete';};$view.Reason=$reason;
+  }
+  return $view;
+}
+function Get-PdvMonitorNerusServiceDiscovery {
+  param($Session);
+  Initialize-PdvMonitorNerusServiceContext $Session;
+  $result=@{Candidates=@();Processes=@();Complete=$false;Reason='NerusServiceDiscoveryIncomplete'};
+  try {
+    $rows=@(Get-PdvNerusServiceRows);$candidates=@();$limited=$false;
+    foreach($row in $rows){if((Test-PdvNerusServiceNerusName ([string]$row.Name)) -or (Test-PdvNerusServiceNerusName ([string]$row.DisplayName))){if($candidates.Count -ge 16){$limited=$true;break;};$candidates+=,(Get-PdvNerusServiceView ([string]$row.Name) $rows);}}
+    foreach($process in @(Get-PdvNerusServiceProcessDiagnostics)){$isService=(@($rows | Where-Object {[int]$_.ProcessId -gt 0 -and [int]$_.ProcessId -eq $process.ProcessId}).Count -gt 0);$diagnosis='WindowsService';if(-not $isService){$diagnosis='NonWindowsService';};$result.Processes+=,@{ProcessName=$process.ProcessName;ProcessId=$process.ProcessId;IsWindowsService=$isService;Diagnosis=$diagnosis;Supported=$isService};}
+    $result.Candidates=@($candidates);$result.Complete=(-not $limited);$result.Reason='';if($limited){$result.Reason='NerusServiceDiscoveryLimited';}if($candidates.Count -eq 0){$result.Reason='NerusServiceNotFound';if(@($result.Processes).Count -gt 0){$result.Reason='NerusServiceTrayOnly';}}
+  } catch {}
+  $Session.NerusService.Discovery=$result;return $result;
+}
+function Get-PdvNerusServiceOwnPath {
+  param($Session,[string]$Name);
+  $path=Join-Path $Session.DataDirectory $Name;
+  if(-not [IO.Directory]::Exists($Session.DataDirectory) -or (([IO.File]::GetAttributes($Session.DataDirectory) -band [IO.FileAttributes]::ReparsePoint) -ne 0)){throw 'NerusServiceLocalStateInvalid';}
+  if([IO.File]::Exists($path) -and (([IO.File]::GetAttributes($path) -band [IO.FileAttributes]::ReparsePoint) -ne 0)){throw 'NerusServiceLocalStateInvalid';}
+  return $path;
+}
+function Save-PdvNerusServiceXml {
+  param($Session,[string]$Name,$Xml);
+  $path=Get-PdvNerusServiceOwnPath $Session $Name;$token=[guid]::NewGuid().ToString('N');$tmp=$path+'.'+$token+'.tmp';$backup=$path+'.'+$token+'.bak';
+  try {
+    [IO.File]::WriteAllText($tmp,$Xml.OuterXml,[Text.Encoding]::UTF8);
+    if([IO.File]::Exists($path)){[IO.File]::Replace($tmp,$path,$backup);}else{[IO.File]::Move($tmp,$path);}
+  } catch {throw 'NerusServiceLocalStateWriteFailed';}
+  finally {if([IO.File]::Exists($tmp)){[IO.File]::Delete($tmp);};if([IO.File]::Exists($backup)){[IO.File]::Delete($backup);}}
+}
+function Read-PdvNerusServiceBinding {
+  param($Session);
+  $path=Get-PdvNerusServiceOwnPath $Session 'nerus-servico.xml';if(-not [IO.File]::Exists($path)){return $null;}
+  if((New-Object IO.FileInfo($path)).Length -gt 16384){throw 'NerusServiceBindingInvalid';}
+  try {
+    $xml=Read-PdvNerusXml ([IO.File]::ReadAllText($path,[Text.Encoding]::UTF8)) 'PdvNerusServiceBinding';$root=$xml.DocumentElement;
+    if($root.Attributes.Count -ne 1 -or $root.GetAttribute('schemaVersion') -cne '1'){throw 'Invalid';}
+    $binding=@{};$keys=@('ServiceName','DisplayName','ExecutablePath','ExecutableHash','ConfigurationHash','MachineId','BoundAt');
+    foreach($n in $root.ChildNodes){if($keys -cnotcontains $n.Name -or $binding.ContainsKey($n.Name) -or $n.Attributes.Count -or $n.SelectNodes('*').Count -or $n.NamespaceURI){throw 'Invalid';};$binding[$n.Name]=[string]$n.InnerText;}
+    if($binding.Count -ne $keys.Count -or $binding.ServiceName -notmatch '^[\p{L}\p{Nd}_. -]{1,128}$' -or $binding.DisplayName.Length -gt 256 -or $binding.DisplayName -match '[\x00-\x1f\x7f]' -or (-not (Test-PdvNerusServiceNerusName $binding.ServiceName) -and -not (Test-PdvNerusServiceNerusName $binding.DisplayName)) -or $binding.ExecutablePath -notmatch '^[A-Za-z]:\\[^\r\n]+\.exe$' -or $binding.ExecutableHash -notmatch '^[0-9a-f]{64}$' -or $binding.ConfigurationHash -notmatch '^[0-9a-f]{64}$' -or -not $binding.MachineId -or $binding.MachineId.Length -gt 128 -or $binding.MachineId -match '[\x00-\x1f\x7f]'){throw 'Invalid';}
+    $at=[DateTimeOffset]::Parse($binding.BoundAt,[Globalization.CultureInfo]::InvariantCulture);if($at -gt (Get-PdvNerusNow).AddSeconds(30)){throw 'Invalid';}
+    return $binding;
+  } catch {throw 'NerusServiceBindingInvalid';}
+}
+function Initialize-PdvMonitorNerusServiceContext {
+  param($Session);
+  if($null -ne (Get-PdvNerusValue $Session 'NerusService')){return;}
+  $state=@{Busy=$false;Stage='Idle';Proposal=$null;Reason='';Result='';Discovery=$null;Binding=$null;Events=(New-Object Collections.Queue);Healthy=$true;OperationActive=$false};
+  $Session | Add-Member -MemberType NoteProperty -Name NerusService -Value $state -Force;
+  try{$state.Binding=Read-PdvNerusServiceBinding $Session;}catch{$state.Healthy=$false;$state.Reason='NerusServiceBindingInvalid';$state.Result=Get-PdvNerusServiceMessage $state.Reason;}
+}
+function Save-PdvMonitorNerusServiceBinding {
+  param($Session,[string]$ServiceName);
+  Initialize-PdvMonitorNerusServiceContext $Session;
+  if($Session.NerusService.OperationActive){throw 'NerusServiceBusy';}
+  # Trocar o vinculo nunca apaga uma tentativa que ficou pendente.
+  Test-PdvNerusServiceLimit $Session $true;
+  $machine=[string](Get-PdvNerusValue $Session 'HardwareMachineId' '');if(-not $machine -or $machine.Length -gt 128 -or $machine -match '[\x00-\x1f\x7f]'){throw 'NerusServiceMachineUnknown';}
+  $discovery=Get-PdvMonitorNerusServiceDiscovery $Session;
+  $matches=@($discovery.Candidates | Where-Object {$_.ServiceName -ceq $ServiceName});
+  if(-not $discovery.Complete -or $matches.Count -ne 1){throw 'NerusServiceNotFound';}
+  $view=$matches[0];if(-not $view.Eligible){throw $view.Reason;}
+  $binding=@{ServiceName=$view.ServiceName;DisplayName=$view.DisplayName;ExecutablePath=$view.ExecutablePath;ExecutableHash=$view.ExecutableHash;ConfigurationHash=$view.ConfigurationHash;MachineId=$machine;BoundAt=(Get-PdvNerusNow).ToString('o')};
+  $xml=New-Object Xml.XmlDocument;$root=$xml.CreateElement('PdvNerusServiceBinding');$root.SetAttribute('schemaVersion','1');[void]$xml.AppendChild($root);
+  foreach($key in @('ServiceName','DisplayName','ExecutablePath','ExecutableHash','ConfigurationHash','MachineId','BoundAt')){$n=$xml.CreateElement($key);$n.InnerText=[string]$binding[$key];[void]$root.AppendChild($n);}
+  Save-PdvNerusServiceXml $Session 'nerus-servico.xml' $xml;
+  $Session.NerusService.Binding=$binding;$Session.NerusService.Healthy=$true;$Session.NerusService.Proposal=$null;$Session.NerusService.Reason='';$Session.NerusService.Result='Serviço local vinculado. Nenhum serviço foi reiniciado.';
+  return $binding;
+}
+function Read-PdvNerusServiceJournal {
+  param($Session);
+  $path=Get-PdvNerusServiceOwnPath $Session 'nerus-servico-tentativas.xml';if(-not [IO.File]::Exists($path)){return @();}
+  if((New-Object IO.FileInfo($path)).Length -gt 65536){throw 'NerusServiceJournalInvalid';}
+  try {
+    $xml=Read-PdvNerusXml ([IO.File]::ReadAllText($path,[Text.Encoding]::UTF8)) 'PdvNerusServiceJournal';$root=$xml.DocumentElement;
+    if($root.Attributes.Count -ne 1 -or $root.GetAttribute('schemaVersion') -cne '1' -or $root.SelectNodes('*').Count -ne 1 -or $root.FirstChild.Name -cne 'Attempts' -or $root.FirstChild.Attributes.Count -ne 0){throw 'Invalid';}
+    $rows=@();$seen=@{};
+    foreach($n in $root.FirstChild.ChildNodes){
+      if($n.Name -cne 'Attempt' -or $n.NamespaceURI -or $n.Attributes.Count -ne 7 -or $n.ChildNodes.Count -ne 0){throw 'Invalid';}
+      foreach($a in $n.Attributes){if(@('id','stage','at','startedAt','serviceName','processId','startTimeTicks') -cnotcontains $a.Name){throw 'Invalid';}}
+      $id=$n.GetAttribute('id');$stage=$n.GetAttribute('stage');$name=$n.GetAttribute('serviceName');
+      $at=[DateTimeOffset]::Parse($n.GetAttribute('at'),[Globalization.CultureInfo]::InvariantCulture);$started=[DateTimeOffset]::Parse($n.GetAttribute('startedAt'),[Globalization.CultureInfo]::InvariantCulture);
+      $pidText=$n.GetAttribute('processId');$ticks=$n.GetAttribute('startTimeTicks');
+      if($id -notmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' -or $seen.ContainsKey($id) -or @('stop_requested','stopped','start_requested','running','failed','uncertain') -cnotcontains $stage -or $name -notmatch '^[\p{L}\p{Nd}_. -]{1,128}$' -or $at -gt (Get-PdvNerusNow).AddSeconds(30) -or $started -gt $at -or $pidText -notmatch '^[1-9][0-9]{0,9}$' -or [long]$pidText -gt [int]::MaxValue -or $ticks -notmatch '^[1-9][0-9]{0,18}$' -or [decimal]$ticks -gt [long]::MaxValue){throw 'Invalid';}
+      $seen[$id]=$true;$rows+=,@{Id=$id;Stage=$stage;At=$at;StartedAt=$started;ServiceName=$name;ProcessId=[int]$pidText;StartTimeTicks=[long]$ticks};if($rows.Count -gt 128){throw 'Invalid';}
+    }
+    return $rows;
+  } catch {throw 'NerusServiceJournalInvalid';}
+}
+function Save-PdvNerusServiceJournal {
+  param($Session,$Proposal,[string]$Stage);
+  if(@('stop_requested','stopped','start_requested','running','failed','uncertain') -cnotcontains $Stage){throw 'NerusServiceJournalInvalid';}
+  $rows=@(Read-PdvNerusServiceJournal $Session);$now=Get-PdvNerusNow;$entries=@();$started=$now;
+  foreach($r in $rows){if($r.Id -ceq $Proposal.Id){$started=$r.StartedAt;}elseif($r.StartedAt -gt $now.AddDays(-2) -or @('running','failed') -cnotcontains $r.Stage){$entries+=,$r;}}
+  $entries+=,@{Id=$Proposal.Id;Stage=$Stage;At=$now;StartedAt=$started;ServiceName=$Proposal.ServiceName;ProcessId=$Proposal.ProcessId;StartTimeTicks=$Proposal.StartTimeTicks};if($entries.Count -gt 128){throw 'NerusServiceJournalInvalid';}
+  $xml=New-Object Xml.XmlDocument;$root=$xml.CreateElement('PdvNerusServiceJournal');$root.SetAttribute('schemaVersion','1');[void]$xml.AppendChild($root);$attempts=$xml.CreateElement('Attempts');[void]$root.AppendChild($attempts);
+  foreach($r in $entries){$n=$xml.CreateElement('Attempt');foreach($pair in @(@('id',$r.Id),@('stage',$r.Stage),@('at',$r.At.ToString('o')),@('startedAt',$r.StartedAt.ToString('o')),@('serviceName',$r.ServiceName),@('processId',[string]$r.ProcessId),@('startTimeTicks',[string]$r.StartTimeTicks))){$n.SetAttribute($pair[0],[string]$pair[1]);};[void]$attempts.AppendChild($n);}
+  Save-PdvNerusServiceXml $Session 'nerus-servico-tentativas.xml' $xml;
+}
+function Test-PdvNerusServiceLimit {
+  param($Session,[bool]$OnlyUnresolved=$false);
+  $now=Get-PdvNerusNow;$rows=@(Read-PdvNerusServiceJournal $Session);
+  if(@($rows | Where-Object {@('running','failed') -cnotcontains $_.Stage}).Count -gt 0){throw 'NerusServicePreviousUncertain';}
+  if($OnlyUnresolved){return;}
+  $recent=@($rows | Where-Object {$_.StartedAt -gt $now.AddHours(-1)});
+  if($recent.Count -ge 2 -or @($recent | Where-Object {$_.StartedAt -gt $now.AddMinutes(-15)}).Count -gt 0){throw 'NerusServiceRateLimited';}
+}
+function Test-PdvNerusServiceSession {
+  param($Session);
+  if(-not $Session.NerusService.Healthy -or -not $Session.LoggingHealthy -or [bool](Get-PdvNerusValue $Session 'Stopped' $false) -or [bool](Get-PdvNerusValue $Session 'TickBusy' $false) -or [bool](Get-PdvNerusValue $Session 'UpdateStaged' $false) -or [bool]$Session.MaintenanceArmed){throw 'NerusServiceNotReady';}
+  $restart=Get-PdvNerusValue $Session 'NerusRestart';if($null -ne $restart -and [bool](Get-PdvNerusValue $restart 'Busy' $false)){throw 'NerusServiceNotReady';}
+  $automation=Get-PdvNerusValue $Session 'NerusAutomation';if($null -ne $automation -and ($null -ne (Get-PdvNerusValue $automation 'Pending') -or -not [bool](Get-PdvNerusValue $automation 'Healthy' $false))){throw 'NerusServiceNotReady';}
+  if($null -eq $Session.NerusService.Binding){throw 'NerusServiceBindingMissing';}
+  $diskBinding=Read-PdvNerusServiceBinding $Session;if($null -eq $diskBinding){throw 'NerusServiceBindingMissing';}
+  foreach($key in @('ServiceName','DisplayName','ExecutablePath','ExecutableHash','ConfigurationHash','MachineId','BoundAt')){if([string]$diskBinding[$key] -cne [string]$Session.NerusService.Binding[$key]){throw 'NerusServiceBindingChanged';}}
+  if(-not [string](Get-PdvNerusValue $Session 'HardwareMachineId' '') -or [string]$diskBinding.MachineId -cne [string]$Session.HardwareMachineId){throw 'NerusServiceMachineUnknown';}
+  if(-not (Test-PdvNerusServicePermission ([string]$diskBinding.ServiceName))){throw 'NerusServicePermissionRequired';}
+}
+function Test-PdvNerusServiceSameBinding {
+  param($Binding,$View);
+  foreach($key in @('ServiceName','ExecutablePath','ExecutableHash','ConfigurationHash')){if(-not [string]::Equals([string]$Binding[$key],[string]$View[$key],[StringComparison]::OrdinalIgnoreCase)){throw 'NerusServiceIdentityChanged';}}
+}
+function Get-PdvNerusServicePrinterEvidence {
+  param($Session,[int]$Samples=3);
+  $profiles=@($Session.Config.Profiles | Where-Object {[string]$_.Role -match 'impressora'});if($profiles.Count -ne 1){throw 'NerusServicePrinterProfileRequired';}
+  $profile=$profiles[0];$port=([string]$profile.ExpectedPort).ToUpperInvariant();
+  if(-not $profile.InstanceId -or $port -notmatch '^COM[1-9][0-9]{0,3}$'){throw 'NerusServicePrinterProfileRequired';}
+  $maps=@{};$maps[$port]='0';$policy=@{InstanceId=[string]$profile.InstanceId;PortMappings=$maps};
+  for($i=0;$i -lt $Samples;$i++){
+    if($i){Wait-PdvNerusFreshSample;}
+    $snapshot=Get-PdvNerusFreshSnapshot;$d=Get-PdvNerusSampleDiagnosis $Session $snapshot $policy (Get-PdvNerusNow);
+    if(-not $d.Eligible -or $null -eq $d.Sample -or [string]$d.Sample.actualPort -cne $port){throw 'NerusServicePrinterNotReady';}
+  }
+  return @{InstanceId=[string]$profile.InstanceId;ActualPort=$port};
+}
+function Test-PdvNerusServiceIdle {
+  param($Session,$View);
+  $names=Get-PdvNerusValue $Session.Config 'BlockingProcessNames' @();
+  $normalized=@();foreach($name in @($names)){$n=([string]$name).Trim();if($n.EndsWith('.exe',[StringComparison]::OrdinalIgnoreCase)){$n=$n.Substring(0,$n.Length-4);};if(-not $n -or $n.Length -gt 120 -or $n -match '[*?\\/:;\x00-\x1f\x7f]'){throw 'NerusServiceBlockersRequired';};$normalized+=,$n;}
+  foreach($p in @(Get-PdvNerusProcesses)){
+    if($normalized -icontains [string]$p.ProcessName){if([string]$p.ProcessName -ine [string]$View.ProcessName -or [int]$p.Id -ne [int]$View.ProcessId){throw 'NerusServiceBlockingProcess';}}
+  }
+  if(@(Get-PdvNerusJobs).Count -gt 0){throw 'NerusServicePrinting';}
+}
+function Get-PdvNerusServiceAssessment {
+  param($Session);
+  Test-PdvNerusServiceSession $Session;Test-PdvNerusServiceLimit $Session;
+  $binding=$Session.NerusService.Binding;$rows=@(Get-PdvNerusServiceRows);$view=Get-PdvNerusServiceView $binding.ServiceName $rows;if(-not $view.Eligible){throw $view.Reason;}
+  Test-PdvNerusServiceSameBinding $binding $view;
+  $evidence=Get-PdvNerusServicePrinterEvidence $Session;Test-PdvNerusServiceIdle $Session $view;
+  # A coleta pode levar segundos; repetir identidade/configuracao depois dela.
+  $rows=@(Get-PdvNerusServiceRows);$fresh=Get-PdvNerusServiceView $binding.ServiceName $rows;if(-not $fresh.Eligible){throw $fresh.Reason;};Test-PdvNerusServiceSameBinding $binding $fresh;
+  if($fresh.ProcessId -ne $view.ProcessId -or $fresh.StartTimeTicks -ne $view.StartTimeTicks){throw 'NerusServiceIdentityChanged';}
+  return @{Id=[guid]::NewGuid().ToString();CreatedAt=(Get-PdvNerusNow);ExpiresAt=(Get-PdvNerusNow).AddMinutes(2);ServiceName=$fresh.ServiceName;DisplayName=$fresh.DisplayName;ActualPort=$evidence.ActualPort;InstanceId=$evidence.InstanceId;ProcessId=$fresh.ProcessId;StartTimeTicks=$fresh.StartTimeTicks;ExecutablePath=$fresh.ExecutablePath;ExecutableHash=$fresh.ExecutableHash;ConfigurationHash=$fresh.ConfigurationHash;MachineId=$binding.MachineId;PrintModules=@($fresh.PrintModules);ModulesComplete=$fresh.ModulesComplete;TefModuleObserved=$fresh.TefModuleObserved;ProcessName=$fresh.ProcessName};
+}
+function Get-PdvNerusServiceMessage {
+  param([string]$Reason);
+  switch($Reason){
+    'NerusServiceBindingMissing'{return 'Vincule o serviço Nerus identificado neste computador antes de tentar a reinicialização.';}
+    'NerusServiceBindingInvalid'{return 'O vínculo local do serviço está inválido. O suporte deve conferir o arquivo antes de cadastrar novamente.';}
+    'NerusServiceBindingChanged'{return 'O vínculo do serviço mudou. Consulte novamente antes de confirmar outra tentativa.';}
+    'NerusServiceMachineUnknown'{return 'A identidade desta máquina ainda não foi confirmada ou difere do vínculo do serviço. Aguarde o inventário e confira o computador.';}
+    'NerusServicePermissionRequired'{return 'Esta ação exige o monitor aberto como administrador. Nenhum serviço foi parado.';}
+    'NerusServiceSharedProcess'{return 'O serviço compartilha processo ou não é um serviço de processo próprio. Esta versão não o reinicia.';}
+    'NerusServiceActiveDependents'{return 'Há outros serviços ativos que dependem deste componente. A tentativa não para serviços dependentes.';}
+    'NerusServiceDependencyNotRunning'{return 'Uma dependência do serviço não está em execução. Verifique o componente antes da tentativa.';}
+    'NerusServiceChildProcess'{return 'O serviço possui processo auxiliar ativo. É necessário identificar o hospedeiro da impressão antes de reiniciar.';}
+    'NerusServiceWrapperNotSupported'{return 'O serviço usa um hospedeiro ou iniciador genérico. Esta versão não confirma qual processo carrega a impressão.';}
+    'NerusServiceNotRunning'{return 'O serviço não está em execução normal. Esta tentativa não inicia serviços previamente parados.';}
+    'NerusServiceDisabled'{return 'O serviço está desabilitado ou seu modo de início não foi confirmado. A tentativa não altera sua configuração nem o para para depois tentar habilitar.';}
+    'NerusServiceCannotStop'{return 'O serviço não aceita parada normal. O monitor não força seu encerramento.';}
+    'NerusServicePrinterProfileRequired'{return 'Salve um único vínculo de impressora, com identidade exata e COM esperada confirmada.';}
+    'NerusServicePrinterNotReady'{return 'A impressora não foi confirmada estável e saudável na COM esperada, ou há conflito. A tentativa não altera portas.';}
+    'NerusServiceBlockersRequired'{return 'Cadastre os nomes exatos dos processos PDV/TEF que precisam estar fechados antes da manutenção.';}
+    'NerusServiceBlockingProcess'{return 'Há processo PDV/TEF bloqueador em execução. Finalize a operação e feche esse componente antes de tentar.';}
+    'NerusServicePrinting'{return 'Há impressão pendente no Windows. Aguarde a conclusão antes de reiniciar o serviço.';}
+    'NerusServicePreviousUncertain'{return 'Uma tentativa anterior ficou incompleta ou incerta. Confira o serviço e o histórico; o monitor não repete parada ou início automaticamente.';}
+    'NerusServiceJournalInvalid'{return 'O histórico local do serviço está inválido. Nenhuma nova tentativa será executada até revisão pelo suporte.';}
+    'NerusServiceRateLimited'{return 'Aguarde quinze minutos entre tentativas. São permitidas no máximo duas tentativas por hora.';}
+    'NerusServiceProposalExpired'{return 'A confirmação expirou, já foi utilizada ou os dados mudaram. Consulte novamente antes de outra tentativa.';}
+    'NerusServiceStopTimeout'{return 'A saída do processo do serviço não foi confirmada no prazo. O monitor não forçou o encerramento nem enviou um novo início.';}
+    'NerusServiceStopRefused'{return 'O Windows recusou a parada normal. Nenhum encerramento forçado será realizado.';}
+    'NerusServiceStartTimeout'{return 'O novo processo do serviço não foi confirmado no prazo. Confira o serviço antes de retomar o atendimento.';}
+    'NerusServiceOldProcess'{return 'O serviço não confirmou uma nova execução do processo. A comunicação da impressora não foi considerada recuperada.';}
+    'NerusServiceLocalStateWriteFailed'{return 'Não foi possível registrar a etapa em disco. A sequência foi interrompida; confira o serviço e o histórico antes de retomar.';}
+    'NerusServiceNotReady'{return 'O monitor está ocupado, pausado ou com outra manutenção pendente. Aguarde antes de tentar.';}
+    'NerusServiceIdentityChanged'{return 'O executável, a configuração ou o processo do serviço mudou. Confira o vínculo antes de tentar novamente.';}
+    'NerusServiceProcessChanged'{return 'A identidade do processo do serviço não pôde ser confirmada. Nenhum processo será encerrado à força.';}
+    'NerusServiceTrayOnly'{return 'Foi encontrado um aplicativo Nerus em execução, mas nenhum serviço Windows correspondente. O componente de bandeja precisa de validação; esta versão não o fecha ou reinicia.';}
+    'NerusServiceNotFound'{return 'Não foi encontrado um único serviço Nerus correspondente ao nome escolhido.';}
+    default{return 'Não foi possível confirmar com segurança o serviço e as condições desta tentativa. Nenhuma correção de comunicação foi declarada.';}
+  }
+}
+function Set-PdvNerusServiceFailure {
+  param($Session,[string]$Reason,[bool]$AfterStop=$false);
+  $s=$Session.NerusService;$s.Reason=$Reason;$s.Result=Get-PdvNerusServiceMessage $Reason;
+  $kind='NerusServiceBlocked';if($AfterStop){$kind='RecoveryFailed';$s.Result+=' O serviço pode estar parado ou ter reiniciado; verifique o estado antes de retomar o caixa.';}
+  $s.Events.Enqueue(@{Kind=$kind;Reason=$Reason;Detail=$s.Result});
+}
+function Invoke-PdvMonitorNerusServiceProbe {
+  param($Session);
+  Initialize-PdvMonitorNerusServiceContext $Session;$s=$Session.NerusService;if($s.OperationActive){return;}
+  $s.Busy=$true;$s.OperationActive=$true;$s.Stage='Checking';$s.Proposal=$null;$s.Reason='';$s.Result='';
+  try{$s.Proposal=Get-PdvNerusServiceAssessment $Session;$s.Stage='AwaitingConfirmation';}
+  catch{$reason=[string]$_.Exception.Message;if($reason -notmatch '^NerusService[A-Za-z]+$'){$reason='NerusServiceCheckUnavailable';};Set-PdvNerusServiceFailure $Session $reason;$s.Stage='Idle';}
+  finally{$s.Busy=$false;$s.OperationActive=$false;}
+}
+function Invoke-PdvMonitorNerusServiceApply {
+  param($Session,[string]$ProposalId);
+  Initialize-PdvMonitorNerusServiceContext $Session;$s=$Session.NerusService;if($s.OperationActive){return;}
+  $approved=$s.Proposal;$s.Proposal=$null;$s.Busy=$true;$s.OperationActive=$true;$s.Stage='Checking';$s.Reason='';$s.Result='';$requested=$false;$journalStarted=$false;
+  try {
+    if($null -eq $approved -or $ProposalId -cne [string]$approved.Id -or (Get-PdvNerusNow) -gt $approved.ExpiresAt){throw 'NerusServiceProposalExpired';}
+    $fresh=Get-PdvNerusServiceAssessment $Session;
+    foreach($key in @('ServiceName','DisplayName','ActualPort','InstanceId','ProcessId','StartTimeTicks','ExecutablePath','ExecutableHash','ConfigurationHash','MachineId')){if([string]$approved[$key] -cne [string]$fresh[$key]){throw 'NerusServiceProposalExpired';}}
+    if((Get-PdvNerusNow) -gt $approved.ExpiresAt){throw 'NerusServiceProposalExpired';}
+    Test-PdvNerusServiceSession $Session;Test-PdvNerusServiceIdle $Session $fresh;
+    $rows=@(Get-PdvNerusServiceRows);$last=Get-PdvNerusServiceView $fresh.ServiceName $rows;if(-not $last.Eligible){throw $last.Reason;};Test-PdvNerusServiceSameBinding $approved $last;
+    if($last.ProcessId -ne $approved.ProcessId -or $last.StartTimeTicks -ne $approved.StartTimeTicks){throw 'NerusServiceIdentityChanged';}
+    Save-PdvNerusServiceJournal $Session $approved 'stop_requested';$journalStarted=$true;
+    $s.Events.Enqueue(@{Kind='RecoveryAttempt';Reason='NerusServiceStopRequested';Detail='Operador confirmou venda e pagamento finalizados e autorizou esta tentativa de reiniciar somente o serviço Nerus vinculado. Configuração COM e parâmetro Nerus serão preservados.';});
+    $s.Stage='Stopping';$requested=$true;Invoke-PdvNerusServiceStop $approved.ServiceName $approved;
+    if(-not (Wait-PdvNerusServiceStopped $approved 30000)){throw 'NerusServiceStopTimeout';}
+    Save-PdvNerusServiceJournal $Session $approved 'stopped';
+    # Somente iniciar depois de comprovar parada e saida. Revalidar arquivos e
+    # configuracao sem exigir estado Running nesta fase.
+    Test-PdvNerusServiceSession $Session;
+    $rows=@(Get-PdvNerusServiceRows);$stopped=@($rows | Where-Object {[string]$_.Name -ceq $approved.ServiceName});
+    if($stopped.Count -ne 1 -or [string]$stopped[0].State -cne 'Stopped' -or [int]$stopped[0].ProcessId -ne 0 -or [string]$stopped[0].ServiceType -cne 'Own Process'){throw 'NerusServiceIdentityChanged';}
+    if(@('Auto','Manual') -cnotcontains [string]$stopped[0].StartMode){throw 'NerusServiceDisabled';}
+    $exe=Get-PdvNerusServiceExecutable ([string]$stopped[0].PathName);Test-PdvNerusServiceSameBinding $approved @{ServiceName=$approved.ServiceName;ExecutablePath=$exe.ExecutablePath;ExecutableHash=$exe.ExecutableHash;ConfigurationHash=$exe.ConfigurationHash};
+    $controller=Get-PdvNerusServiceControllerState $approved.ServiceName;if(@($controller.ActiveDependents).Count -gt 0){throw 'NerusServiceActiveDependents';};foreach($d in @($controller.RequiredServices)){if(-not $d.Running){throw 'NerusServiceDependencyNotRunning';}}
+    if(@(Get-PdvNerusServiceProcessRows | Where-Object {[int]$_.ParentProcessId -eq [int]$approved.ProcessId}).Count -gt 0){throw 'NerusServiceChildProcess';}
+    Test-PdvNerusServiceIdle $Session $fresh;$printer=Get-PdvNerusServicePrinterEvidence $Session 1;if([string]$printer.InstanceId -cne [string]$approved.InstanceId -or [string]$printer.ActualPort -cne [string]$approved.ActualPort){throw 'NerusServicePrinterNotReady';}
+    Save-PdvNerusServiceJournal $Session $approved 'start_requested';$s.Stage='Starting';Invoke-PdvNerusServiceStart $approved.ServiceName;
+    $new=Wait-PdvNerusServiceRunning $approved 30000;
+    if($null -eq $new -or [long]$new.StartTimeTicks -le [long]$approved.StartTimeTicks){throw 'NerusServiceOldProcess';}
+    Save-PdvNerusServiceJournal $Session $approved 'running';$s.Reason='NerusServiceRestarted';$s.Stage='Idle';
+    $s.Result='O serviço Nerus foi reiniciado em uma nova execução. A COM e a configuração do Nerus foram preservadas. Confirme a impressão antes de retomar o atendimento; comunicação ainda não validada pelo monitor.';
+    $s.Events.Enqueue(@{Kind='NerusServiceRestarted';Reason='NerusServiceRestarted';Detail=$s.Result;});
+  } catch {
+    $reason=[string]$_.Exception.Message;if($reason -notmatch '^NerusService[A-Za-z]+$'){$reason='NerusServiceActionUnavailable';}
+    if($journalStarted){try{$stage='failed';if($requested){$stage='uncertain';};Save-PdvNerusServiceJournal $Session $approved $stage;}catch{$reason='NerusServiceLocalStateWriteFailed';$s.Healthy=$false;}}
+    Set-PdvNerusServiceFailure $Session $reason $requested;
+  } finally {$s.Proposal=$null;$s.Busy=$false;$s.OperationActive=$false;$s.Stage='Idle';}
+}
+
+Export-ModuleMember -Function Invoke-PdvMonitorNerusAutomation,Invoke-PdvMonitorNerusRestartProbe,Invoke-PdvMonitorNerusRestartApply,Get-PdvMonitorNerusServiceDiscovery,Save-PdvMonitorNerusServiceBinding,Initialize-PdvMonitorNerusServiceContext,Invoke-PdvMonitorNerusServiceProbe,Invoke-PdvMonitorNerusServiceApply;
 

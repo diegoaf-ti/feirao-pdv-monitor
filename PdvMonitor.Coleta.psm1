@@ -86,7 +86,24 @@ function Get-PdvMonitorSnapshot {
   return (ConvertTo-PdvMonitorSnapshot (Get-PdvLegacySnapshot) 'WMI-Legado');
 }
 
+function Get-PdvMonitorNerusServiceNames {
+  param([string[]]$Names = @());
+  # Recebe somente nomes exatos obtidos do serviço vinculado. Não descobre por
+  # substring, não expande curingas e não devolve entradas inválidas no erro.
+  # XPath do Event Log não oferece concat(); com ambas as aspas a lista falha
+  # fechada em vez de compor uma expressão a partir de texto não representável.
+  if (@($Names).Count -gt 8) { throw 'InvalidNerusServiceNames'; }
+  $safe = @();
+  foreach ($name in @($Names)) {
+    if ($null -eq $name -or $name.Length -lt 1 -or $name.Length -gt 256 -or $name -ne $name.Trim() -or $name -match '[\x00-\x1f\x7f-\x9f]' -or ($name.Contains("'") -and $name.Contains('"'))) { throw 'InvalidNerusServiceNames'; }
+    if ($safe -cnotcontains $name) { $safe += $name; }
+  }
+  return $safe;
+}
+
 function Get-PdvMonitorSystemEventXPath {
+  param([string[]]$NerusServiceNames = @());
+  $serviceNames = @(Get-PdvMonitorNerusServiceNames -Names $NerusServiceNames);
   # Somente níveis crítico/erro de provedores relacionados a hardware, disco,
   # energia, USB, serial e impressão. Informações/warnings de rotina não viram
   # incidentes. Cada seleção fica abaixo do limite de expressões nativo.
@@ -100,6 +117,19 @@ function Get-PdvMonitorSystemEventXPath {
     $terms += 'System[(Level=1 or Level=2) and ('+($providers -join ' or ')+')]';
   }
   $terms += "(System[(Level=1 or Level=2) and Provider[@Name='Service Control Manager']] and EventData[Data='Spooler' or Data='Print Spooler' or Data='Spooler de Impressão' or Data='SiTef' or Data='CliSiTef' or Data='Cliente SiTef'])";
+  # Cada seleção tem um nome e no máximo seis IDs: mesmo com intervalo,
+  # baseline e nível, permanece abaixo de 20 expressões do Event Log.
+  # O SCM usa ServiceName ou DisplayName conforme evento/versão do Windows;
+  # o chamador fornece os dois valores vinculados. Só metadados são convertidos.
+  $failureGroups = @(@(7000,7001,7009,7011,7022), @(7023,7024,7031,7032,7034,7043));
+  foreach ($name in $serviceNames) {
+    $literal = "'" + $name + "'";
+    if ($name.Contains("'")) { $literal = '"' + $name + '"'; }
+    foreach ($group in $failureGroups) {
+      $ids = @($group | ForEach-Object { 'EventID=' + [int]$_ });
+      $terms += "(System[(Level=1 or Level=2) and Provider[@Name='Service Control Manager'] and (" + ($ids -join ' or ') + ')] and EventData[Data=' + $literal + '])';
+    }
+  }
   return $terms;
 }
 
@@ -140,7 +170,10 @@ function ConvertTo-PdvMonitorEvent {
 
 function Get-PdvMonitorWindowsEvents {
   [CmdletBinding()]
-  param([hashtable]$Cursors = @{}, [ValidateRange(1, 100)][int]$MaxEventsPerChannel = 100, [DateTime]$StartAfter = [DateTime]::MinValue);
+  param([hashtable]$Cursors = @{}, [ValidateRange(1, 100)][int]$MaxEventsPerChannel = 100, [DateTime]$StartAfter = [DateTime]::MinValue, [string[]]$NerusServiceNames = @());
+  # Valida antes de consultar qualquer canal. Entrada inválida não amplia a
+  # consulta nem produz cursores novos que possam ser persistidos pelo chamador.
+  $serviceNames = @(Get-PdvMonitorNerusServiceNames -Names $NerusServiceNames);
   $channels = @('System', 'Microsoft-Windows-PrintService/Operational', 'Microsoft-Windows-PrintService/Admin', 'Microsoft-Windows-DriverFrameworks-UserMode/Operational', 'Microsoft-Windows-Kernel-PnP/Configuration', 'Microsoft-Windows-DeviceSetupManager/Admin', 'Microsoft-Windows-USB-USBHUB3/Operational', 'Microsoft-Windows-USB-UCX/Operational');
   $warnings = New-Object 'System.Collections.Generic.List[string]';
   $events = New-Object 'System.Collections.Generic.List[object]';
@@ -201,7 +234,7 @@ function Get-PdvMonitorWindowsEvents {
       $range = '*[System[' + $conditions + ' and (Level=1 or Level=2)]]';
       $xpath = $range; $queryXml = '';
       if ($channel -eq 'System') {
-        $terms = @(Get-PdvMonitorSystemEventXPath);
+        $terms = @(Get-PdvMonitorSystemEventXPath -NerusServiceNames $serviceNames);
         # Seleções estruturadas: cada XPath fica abaixo do limite de 20
         # expressões do Windows Event Log. As seleções são deduplicadas pelo Windows.
         $selects = @($terms | ForEach-Object {

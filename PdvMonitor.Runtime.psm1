@@ -257,10 +257,12 @@ function Start-PdvMonitorSession {
     HardwareFingerprint = ''; HardwareLastQueuedAt = $null; HardwareQueueFailed = $false;
     HardwareMachineId = ''; ProgramDirectory = $ProgramDirectory; NerusAutomation = $null;
     NerusRestart = @{ Busy=$false; Stage='Idle'; Proposal=$null; Reason=''; Result=''; };
+    NerusService = $null; LastNerusServiceAt = $null; NerusServiceSignatures = @{};
     AutoUpdateEnabled = $false; NextUpdateCheckAt = [DateTimeOffset]::MinValue;
     UpdateStatus = ''; LastUpdateReason = ''; UpdateStaged = $false; MonitorVersion = (Get-PdvMonitorVersion);
   };
   Initialize-PdvMonitorCentral -Session $session | Out-Null;
+  & $script:nerusModule { param($CurrentSession); Initialize-PdvMonitorNerusServiceContext -Session $CurrentSession; } $session;
   if ($ProgramDirectory -and [IO.File]::Exists((Join-Path $ProgramDirectory 'atualizacoes-chave-publica.xml'))) {
     [void](Initialize-PdvMonitorUpdateTrust -DataDirectory $data -PublicKeyPath (Join-Path $ProgramDirectory 'atualizacoes-chave-publica.xml'));
   }
@@ -573,7 +575,8 @@ function Invoke-PdvMonitorTick {
   [CmdletBinding()]
   param($Session);
   $restart = Get-PdvRuntimeValue $Session 'NerusRestart' $null;
-  if ($Session.Stopped -or $Session.TickBusy -or [bool](Get-PdvRuntimeValue $restart 'Busy' $false)) { return; }
+  $service = Get-PdvRuntimeValue $Session 'NerusService' $null;
+  if ($Session.Stopped -or $Session.TickBusy -or [bool](Get-PdvRuntimeValue $restart 'Busy' $false) -or [bool](Get-PdvRuntimeValue $service 'Busy' $false)) { return; }
   $Session.TickBusy = $true;
   try {
     # Conseguir gravar antes de avaliar qualquer ação também bloqueia recuperação
@@ -591,6 +594,9 @@ function Invoke-PdvMonitorTick {
     $signalCount = 0;
     while ($Session.Signals.Count -gt 0 -and $signalCount -lt 1000) { [void]$Session.Signals.Dequeue(); $signalCount++; }
     $snapshot = Get-PdvMonitorSnapshot; $snapshotAt=Get-PdvRuntimeNow; $Session.Snapshot = $snapshot;
+    if ($Session.ProgramDirectory -and ($null -eq $Session.LastNerusServiceAt -or ($now - $Session.LastNerusServiceAt).TotalSeconds -ge 60)) {
+      Update-PdvMonitorNerusServiceDiagnostic -Session $Session -Now $now;
+    }
     if ($Session.ProgramDirectory) {
       Invoke-PdvMonitorNerusAutomation -Session $Session -Snapshot $snapshot -ObservedAt $snapshotAt;
       if ($null -ne $Session.NerusAutomation) {
@@ -612,19 +618,8 @@ function Invoke-PdvMonitorTick {
     if ($complete) { $Session.HasBaseline = $true; }
     Invoke-PdvMonitorComAlerts $Session $snapshot;
     if ($null -eq $Session.LastHardwareAt -or ($now - $Session.LastHardwareAt).TotalHours -ge 6) { Update-PdvMonitorHardware $Session $now; }
-    if ($null -eq $Session.LastEventsAt -or ($now - $Session.LastEventsAt).TotalSeconds -ge 60) {
-      $events = Get-PdvMonitorWindowsEvents -Cursors $Session.Cursors -MaxEventsPerChannel 100;
-      Invoke-PdvMonitorWindowsAlerts $Session @($events.Events) $now;
-      $coverage = @($events.ChannelStatus | ForEach-Object { $_.Channel + ':ok=' + $_.Success + ';enabled=' + $_.Enabled + ';gap=' + $_.Gap + ';reset=' + $_.Reset + ';backlog=' + $_.Truncated + ';início=' + $_.CoverageStart; }) -join ' | ';
-      if ($coverage -ne $Session.ChannelStatusSignature) {
-        Write-PdvMonitorRecord $Session 'WindowsEventCoverage' $coverage;
-        foreach ($warning in @($events.Warnings)) { Write-PdvMonitorRecord $Session 'CollectionWarning' $warning; }
-        $Session.ChannelStatusSignature = $coverage;
-      }
-      # Somente após gravar todos os eventos. Falha aqui permite repetição local,
-      # mas nunca confirma um cursor cujo lote não foi escrito por completo.
-      Save-PdvMonitorCursors $Session $events.Cursors; $Session.LastEventsAt = $now;
-    }
+    # Escopo solicitado: dispositivos/COM, hardware e ponte local do Nerus.
+    # Não consultar Event Log genérico, mesmo com canais Windows habilitados.
     foreach ($profile in @($Session.Config.Profiles)) {
       $id = $profile.InstanceId;
       $found = @($snapshot.Devices | Where-Object { $_.InstanceId -eq $id });
@@ -743,6 +738,129 @@ function Invoke-PdvMonitorTick {
   } finally { $Session.TickBusy = $false; }
 }
 
+function Get-PdvRuntimeNerusServiceNames {
+  param($Session);
+  $state=Get-PdvRuntimeValue $Session 'NerusService' $null;
+  $binding=Get-PdvRuntimeValue $state 'Binding' $null;
+  $names=@();
+  foreach ($key in @('ServiceName','DisplayName')) {
+    $value=[string](Get-PdvRuntimeValue $binding $key '');
+    if ($value -and $value.Length -le 256 -and $value.Trim() -ceq $value -and $value -notmatch '[\x00-\x1f\x7f]' -and -not ($value.Contains('"') -and $value.Contains("'")) -and $names -notcontains $value) { $names+=@($value); }
+  }
+  return $names;
+}
+
+function Publish-PdvMonitorNerusServiceNotices {
+  param($Session);
+  $state=Get-PdvRuntimeValue $Session 'NerusService' $null;
+  $events=$null; if($null -ne $state){$events=$state.Events;}
+  if ($null -eq $events) { return; }
+  while ($events.Count) {
+    $notice=$events.Peek();
+    Write-PdvMonitorRecord $Session ([string]$notice.Kind) ([string]$notice.Detail) -Role 'Serviço Nerus' -Reason ([string]$notice.Reason);
+    [void]$events.Dequeue();
+  }
+}
+
+function Update-PdvMonitorNerusServiceDiagnostic {
+  param($Session, [DateTimeOffset]$Now);
+  try {
+    $discovery=Get-PdvMonitorNerusServiceDiscovery -Session $Session;
+    $items=@(); $processItems=@(); $seen=@{};
+    $summary=@{schemaVersion=1;scope='discovery';complete=[bool](Get-PdvRuntimeValue $discovery 'Complete' $false);reason=(ConvertTo-PdvProtocolText (Get-PdvRuntimeValue $discovery 'Reason' '') 96);};
+    $summaryJson=ConvertTo-PdvHardwareJson $summary;
+    if ($Session.NerusServiceSignatures['discovery'] -cne $summaryJson) {
+      $kind='ServiceDiagnostic';
+      if (-not $summary.complete -and $null -ne $Session.NerusService.Binding) { $kind='CollectionWarning'; }
+      Write-PdvMonitorRecord $Session $kind $summaryJson -Role 'Serviço Nerus' -Reason 'NerusServiceDiscovery';
+      $Session.NerusServiceSignatures['discovery']=$summaryJson;
+    }
+    $candidates=@(Get-PdvRuntimeValue $discovery 'Candidates' @());
+    foreach ($candidate in @($candidates | Select-Object -First 16)) {
+      $name=ConvertTo-PdvProtocolText (Get-PdvRuntimeValue $candidate 'ServiceName' '') 128;
+      if (-not $name) { continue; }
+      $modules=@();
+      foreach ($entry in @(Get-PdvRuntimeValue $candidate 'PrintModules' @()) | Select-Object -First 8) {
+        $modules+=@(@{name=(ConvertTo-PdvProtocolText (Get-PdvRuntimeValue $entry 'Name' '') 64);version=(ConvertTo-PdvProtocolText (Get-PdvRuntimeValue $entry 'Version' '') 48);});
+      }
+      $item=@{schemaVersion=1;scope='service';serviceName=$name;displayName=(ConvertTo-PdvProtocolText (Get-PdvRuntimeValue $candidate 'DisplayName' '') 128);state=(ConvertTo-PdvProtocolText (Get-PdvRuntimeValue $candidate 'State' '') 32);serviceType=(ConvertTo-PdvProtocolText (Get-PdvRuntimeValue $candidate 'ServiceType' '') 40);processId=(ConvertTo-PdvProtocolText (Get-PdvRuntimeValue $candidate 'ProcessId' '') 20);eligible=[bool](Get-PdvRuntimeValue $candidate 'Eligible' $false);reason=(ConvertTo-PdvProtocolText (Get-PdvRuntimeValue $candidate 'Reason' '') 96);executablePath=(ConvertTo-PdvProtocolText (Get-PdvRuntimeValue $candidate 'ExecutablePath' '') 256);modulesComplete=[bool](Get-PdvRuntimeValue $candidate 'ModulesComplete' $false);tefModuleObserved=[bool](Get-PdvRuntimeValue $candidate 'TefModuleObserved' $false);modules=$modules;};
+      $json=ConvertTo-PdvHardwareJson $item;
+      # Nunca enviar JSON recortado pelo normalizador do protocolo.
+      if ($json.Length -gt 1900) { $item.modules=@(); $item.modulesOmitted=$true; $item.executablePath=''; $json=ConvertTo-PdvHardwareJson $item; }
+      if ($json.Length -gt 1900) { throw 'NerusServiceDiagnosticTooLarge'; }
+      $items+=@($item); $seen[$name]=$true;
+      if ($Session.NerusServiceSignatures[$name] -cne $json) {
+        $kind='ServiceDiagnostic';
+        if ($null -ne $Session.NerusService.Binding -and [string]$Session.NerusService.Binding.ServiceName -ceq $name -and $item.state -cne 'Running') { $kind='CollectionWarning'; }
+        Write-PdvMonitorRecord $Session $kind $json -Role 'Serviço Nerus' -Reason 'NerusServiceState';
+        $Session.NerusServiceSignatures[$name]=$json;
+      }
+    }
+    foreach ($process in @(Get-PdvRuntimeValue $discovery 'Processes' @()) | Select-Object -First 16) {
+      $processName=ConvertTo-PdvProtocolText (Get-PdvRuntimeValue $process 'ProcessName' '') 128;
+      if(-not $processName){continue;}
+      $processItem=@{schemaVersion=1;scope='process';processName=$processName;processId=(ConvertTo-PdvProtocolText (Get-PdvRuntimeValue $process 'ProcessId' '') 20);isWindowsService=[bool](Get-PdvRuntimeValue $process 'IsWindowsService' $false);diagnosis=(ConvertTo-PdvProtocolText (Get-PdvRuntimeValue $process 'Diagnosis' '') 96);};
+      $key='process|'+$processItem.processId+'|'+$processName; $seen[$key]=$true; $processItems+=@($processItem);
+      $json=ConvertTo-PdvHardwareJson $processItem;
+      if($Session.NerusServiceSignatures[$key] -cne $json){Write-PdvMonitorRecord $Session 'ServiceDiagnostic' $json -Role 'Serviço Nerus' -Reason 'NerusServiceProcess';$Session.NerusServiceSignatures[$key]=$json;}
+    }
+    # Consulta incompleta não comprova remoção de um serviço.
+    if ($summary.complete) {
+      foreach ($oldName in @($Session.NerusServiceSignatures.Keys)) {
+        if ($oldName -ceq 'discovery' -or $seen.ContainsKey($oldName)) { continue; }
+        $detail='Componente anteriormente observado não foi localizado nesta consulta: '+(ConvertTo-PdvProtocolText $oldName 128)+'. Nenhuma recuperação foi executada.';
+        Write-PdvMonitorRecord $Session 'ServiceDiagnostic' $detail -Role 'Serviço Nerus' -Reason 'NerusServiceNotObserved';
+        [void]$Session.NerusServiceSignatures.Remove($oldName);
+      }
+    }
+    $document=@{schemaVersion=1;collectedAt=$Now.ToString('o');complete=$summary.complete;reason=$summary.reason;services=$items;processes=$processItems;};
+    Write-PdvRuntimeAtomic (Join-Path $Session.DataDirectory 'nerus-servico-diagnostico.json') (ConvertTo-PdvHardwareJson $document);
+    $Session.NerusService.DiagnosticFailure='';
+    $Session.LastNerusServiceAt=$Now;
+    Publish-PdvMonitorNerusServiceNotices $Session;
+  } catch {
+    $signature='NerusServiceDiagnosticUnavailable';
+    if ((Get-PdvRuntimeValue $Session.NerusService 'DiagnosticFailure' '') -cne $signature) {
+      Write-PdvMonitorRecord $Session 'CollectionWarning' 'Não foi possível concluir o diagnóstico do Nerus Service. O último vínculo e os demais registros foram preservados; nenhuma ação no serviço foi executada.' -Role 'Serviço Nerus' -Reason $signature;
+      $Session.NerusService.DiagnosticFailure=$signature;
+    }
+    $Session.LastNerusServiceAt=$Now;
+  }
+}
+
+function Get-PdvMonitorNerusServiceDiscovery {
+  [CmdletBinding()]param($Session);
+  $value=& $script:nerusModule {param($CurrentSession); Get-PdvMonitorNerusServiceDiscovery -Session $CurrentSession;} $Session;
+  return $value;
+}
+
+function Save-PdvMonitorNerusServiceBinding {
+  [CmdletBinding()]param($Session,[string]$ServiceName,[string[]]$BlockingProcessNames=@());
+  $names=@();
+  foreach ($name in @($BlockingProcessNames)) {
+    if ($name -notmatch '^[A-Za-z0-9_.-]{1,80}$' -or $name -match '\.exe$') { throw 'Use nomes exatos de processos, sem caminho, .exe ou curingas.'; }
+    if ($names -notcontains $name) { $names+=@($name); }
+  }
+  if ($names.Count -gt 16) { throw 'Informe no máximo 16 processos bloqueadores.'; }
+  $old=$Session.Config.BlockingProcessNames; $Session.Config.BlockingProcessNames=$names;
+  try { Save-PdvRuntimeConfig $Session; }
+  catch { $Session.Config.BlockingProcessNames=$old; throw 'Não foi possível salvar os processos que bloqueiam a recuperação.'; }
+  try { & $script:nerusModule {param($CurrentSession,$Name); Save-PdvMonitorNerusServiceBinding -Session $CurrentSession -ServiceName $Name;} $Session $ServiceName; }
+  finally { Publish-PdvMonitorNerusServiceNotices $Session; }
+}
+
+function Invoke-PdvMonitorNerusServiceProbe {
+  [CmdletBinding()]param($Session);
+  try { & $script:nerusModule {param($CurrentSession); Invoke-PdvMonitorNerusServiceProbe -Session $CurrentSession;} $Session; }
+  finally { Publish-PdvMonitorNerusServiceNotices $Session; }
+}
+
+function Invoke-PdvMonitorNerusServiceApply {
+  [CmdletBinding()]param($Session,[string]$ProposalId);
+  try { & $script:nerusModule {param($CurrentSession,$Id); Invoke-PdvMonitorNerusServiceApply -Session $CurrentSession -ProposalId $Id;} $Session $ProposalId; }
+  finally { Publish-PdvMonitorNerusServiceNotices $Session; }
+}
+
 function Export-PdvMonitorLogs {
   [CmdletBinding()]
   param($Session, [string]$DestinationDirectory);
@@ -750,7 +868,7 @@ function Export-PdvMonitorLogs {
   $destination = Join-Path $DestinationDirectory ('PDV-diagnostico-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N').Substring(0, 6));
   [void][IO.Directory]::CreateDirectory($destination);
   foreach ($file in @(Get-ChildItem -LiteralPath $Session.LogDirectory -Filter 'monitor-*.csv' | Where-Object { -not $_.PSIsContainer })) { [IO.File]::Copy($file.FullName, (Join-Path $destination $file.Name)); }
-  foreach ($name in @('monitor.xml', 'central.xml', 'cursores.xml', 'recuperacoes.xml', 'status.txt', 'inventario-hardware.json', 'inventario-estado.xml')) {
+  foreach ($name in @('monitor.xml', 'central.xml', 'cursores.xml', 'recuperacoes.xml', 'status.txt', 'inventario-hardware.json', 'inventario-estado.xml', 'nerus-servico.xml', 'nerus-servico-tentativas.xml', 'nerus-servico-diagnostico.json')) {
     $path = Join-Path $Session.DataDirectory $name;
     if ([IO.File]::Exists($path)) { [IO.File]::Copy($path, (Join-Path $destination $name)); }
   }
@@ -761,12 +879,14 @@ function Export-PdvMonitorLogs {
 function Invoke-PdvMonitorNerusRestartProbe {
   [CmdletBinding()]
   param($Session);
+  if ([bool](Get-PdvRuntimeValue (Get-PdvRuntimeValue $Session 'NerusService' $null) 'Busy' $false)) { return; }
   & $script:nerusModule { param($CurrentSession); Invoke-PdvMonitorNerusRestartProbe -Session $CurrentSession; } $Session;
 }
 
 function Invoke-PdvMonitorNerusRestartApply {
   [CmdletBinding()]
   param($Session, [string]$ProposalId);
+  if ([bool](Get-PdvRuntimeValue (Get-PdvRuntimeValue $Session 'NerusService' $null) 'Busy' $false)) { return; }
   & $script:nerusModule { param($CurrentSession, $Id); Invoke-PdvMonitorNerusRestartApply -Session $CurrentSession -ProposalId $Id; } $Session $ProposalId;
 }
 
@@ -779,4 +899,4 @@ function Stop-PdvMonitorSession {
   finally { $Session.Stopped = $true; }
 }
 
-Export-ModuleMember -Function Start-PdvMonitorSession, Invoke-PdvMonitorTick, Stop-PdvMonitorSession, Export-PdvMonitorLogs, Set-PdvMonitorMaintenance, Save-PdvMonitorProfiles, Set-PdvMonitorCentral, Invoke-PdvMonitorNerusRestartProbe, Invoke-PdvMonitorNerusRestartApply;
+Export-ModuleMember -Function Start-PdvMonitorSession, Invoke-PdvMonitorTick, Stop-PdvMonitorSession, Export-PdvMonitorLogs, Set-PdvMonitorMaintenance, Save-PdvMonitorProfiles, Set-PdvMonitorCentral, Invoke-PdvMonitorNerusRestartProbe, Invoke-PdvMonitorNerusRestartApply, Get-PdvMonitorNerusServiceDiscovery, Save-PdvMonitorNerusServiceBinding, Invoke-PdvMonitorNerusServiceProbe, Invoke-PdvMonitorNerusServiceApply;

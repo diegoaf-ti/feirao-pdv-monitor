@@ -30,3 +30,6 @@ falha-inicializacao-monitor.txt
 __pycache__/
 
 nerus-reabertura.xml*
+nerus-servico.xml*
+nerus-servico-tentativas.xml*
+nerus-servico-diagnostico.json*

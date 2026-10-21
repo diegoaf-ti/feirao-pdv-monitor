@@ -56,7 +56,7 @@ $testRoot = Join-Path ([IO.Path]::GetTempPath()) ('pdv-runtime-testes-' + [Guid]
   }
   function script:Get-PdvMonitorWindowsEvents {
     param($Cursors, $MaxEventsPerChannel)
-    return (New-Object PSObject -Property @{Events=@($script:TestWindowsEvents); Cursors=@{System=@{RecordId=42; AnchorRecordId=42; AnchorTime='2026-10-15T12:00:00-03:00'; OldestRecordId=1; LogEpoch='teste'; CoverageStart='2026-10-15T11:58:00-03:00'}}; ChannelStatus=@(); Warnings=@()})
+    throw 'A coleta normal não deve consultar eventos genéricos do Windows';
   }
   function script:Get-Process {
     [CmdletBinding()]param()
@@ -158,7 +158,7 @@ try {
   Invoke-PdvMonitorTick $session
   Assert-Runtime (-not $session.TickBusy -and $session.LastTickAt -and $session.LoggingHealthy) 'Rodada termina e atualiza a mesma sessão'
   Assert-Runtime ((Get-TestMetric 'TestProcessCalls') -eq 0 -and (Get-TestMetric 'TestPrintCalls') -eq 0 -and (Get-TestMetric 'TestRestarts') -eq 0) 'Monitoramento desarmado não consulta processos/fila nem reinicia dispositivos'
-  Assert-Runtime ($session.Cursors.System.RecordId -eq 42 -and [IO.File]::Exists((Join-Path $session.DataDirectory 'cursores.xml'))) 'Cursores só avançam após logs locais e persistência'
+  Assert-Runtime ($session.Cursors.Count -eq 0 -and -not [IO.File]::Exists((Join-Path $session.DataDirectory 'cursores.xml'))) 'A coleta normal não cria cursores de eventos genéricos do Windows'
   $session.SignalDropCount=3; Invoke-PdvMonitorTick $session; Invoke-PdvMonitorTick $session
   Assert-Runtime ($session.LastLoggedSignalDropCount -eq 3 -and (@(Get-TestRecords | Where-Object { $_.Kind -eq 'LogGap' -and $_.Detail -like '*sinais descartados*' }).Count -eq 1)) 'Perda de sinais vira LogGap uma vez por aumento do contador'
   $before=$session.Sequence; $session.TickBusy=$true; Invoke-PdvMonitorTick $session; $session.TickBusy=$false
@@ -405,9 +405,9 @@ try {
   };
   Invoke-PdvMonitorTick $session;
   & $module {$script:TestNow=$script:TestNow.AddMinutes(1)};Invoke-PdvMonitorTick $session;
-  Assert-Runtime ((@(Get-TestRecords | Where-Object Kind -eq 'WindowsError').Count -eq 1) -and (@(Get-TestRecords | Where-Object Kind -eq 'WindowsEvent').Count -eq 0)) '100 erros repetidos coalescem e evento informativo é omitido';
+  Assert-Runtime ((@(Get-TestRecords | Where-Object {$_.Kind -in @('WindowsError','WindowsCritical','WindowsEvent','WindowsEventCoverage')}).Count -eq 0)) 'Eventos genéricos e cobertura Windows não são consultados ou publicados';
   & $module {$script:TestNow=$script:TestNow.AddMinutes(10)};Invoke-PdvMonitorTick $session;
-  Assert-Runtime ((@(Get-TestRecords | Where-Object Kind -eq 'WindowsError').Count -eq 2)) 'Erro persistente volta no máximo a cada dez minutos com contagem agrupada';
+  Assert-Runtime ((@(Get-TestRecords | Where-Object {$_.Kind -in @('WindowsError','WindowsCritical','WindowsEvent','WindowsEventCoverage')}).Count -eq 0) -and $session.LoggingHealthy) 'Mesmo após dez minutos o monitor segue saudável sem consultar eventos genéricos';
   # Coleta patrimonial a cada seis horas, envio somente inicial/mudança/24h.
   $session=New-TestSession;
   $hardware=@{schemaVersion=1;collectedAt='2026-10-19T12:00:00-03:00';machineId='uuid-teste';hostname='CX4901';manufacturer='Marca';model='Caixa';serialNumber='SN1';os=@{caption='Windows';version='10';build='19045';architecture='64-bit';lastBootAt=''};cpu=@{name='CPU';cores='4';logicalProcessors='8'};memory=@{totalBytes='8589934592';modules=@()};disks=@();systemVolume=@{name='C:';totalBytes='1000';freeBytes='500'};networkAdapters=@();warnings=@()};

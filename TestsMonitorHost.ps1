@@ -39,7 +39,7 @@ try {
 } finally { $worker.Dispose(); }
 # A interface é isolada por funções substitutas; somente o runspace local real é usado.
 foreach ($definition in $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $false)) {
-  if (@('Get-PdvMonitorNerusRestartPrompt','Start-PdvMonitorNerusRestartWorker','Complete-PdvMonitorNerusRestartWorker','Start-PdvMonitorTickWorker') -contains $definition.Name) { . ([scriptblock]::Create($definition.Extent.Text)); }
+  if (@('Test-PdvMonitorNerusServiceBusy','Get-PdvMonitorNerusRestartPrompt','Start-PdvMonitorNerusRestartWorker','Complete-PdvMonitorNerusRestartWorker','Start-PdvMonitorTickWorker') -contains $definition.Name) { . ([scriptblock]::Create($definition.Extent.Text)); }
 }
 $script:Prompts = 0; $script:Answer = $false; $script:Messages = @(); $script:Controls = @();
 function Confirm-PdvMonitorNerusRestart { param($Proposal); $script:Prompts++; [void](Get-PdvMonitorNerusRestartPrompt $Proposal); return $script:Answer; }
@@ -52,7 +52,7 @@ function Wait-HostWorker {
   Assert-Host ($null -ne $script:nerusWorker -and $script:nerusWorkerResult.IsCompleted) 'Worker assistido simulado deve terminar dentro do limite.';
 }
 function Reset-HostRestartSession {
-  $script:closing = $false; $script:worker = $null; $script:workerResult = $null;
+  $script:closing = $false; $script:worker = $null; $script:workerResult = $null; $script:serviceWorker = $null;
   $script:nerusWorker = $null; $script:nerusWorkerResult = $null; $script:nerusWorkerMode = '';
   $script:session = New-Object PSObject -Property @{ TickBusy=$false; ProbeBehavior='normal'; ProbeCount=0; ApplyCount=0; TickCount=0; NerusRestart=@{Busy=$false;Stage='Idle';Proposal=$null;Reason='';Result=''}; };
 }
