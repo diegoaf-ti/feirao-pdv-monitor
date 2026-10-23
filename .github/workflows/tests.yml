@@ -22,6 +22,9 @@ jobs:
             [void][System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errors)
             if ($errors.Count) { throw ($_.Name + ': ' + ($errors | Out-String)) }
           }
+          # Compile somente os fontes; nao invoque CSP, ACL ou P/Invoke reais.
+          Add-Type -Path ./piloto-remoto/windows/RemoteEnrollmentCrypto.cs -ErrorAction Stop
+          Add-Type -Path ./piloto-remoto/windows/RemoteEnrollmentStorage.cs -ErrorAction Stop
           Get-ChildItem -Filter 'Tests*.ps1' -File | Where-Object { (Get-Content -LiteralPath $_.FullName -TotalCount 1) -notmatch '#requires -Version 7\.0' } | Sort-Object Name | ForEach-Object {
             & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $_.FullName
             if ($LASTEXITCODE -ne 0) { throw ('Falha em ' + $_.Name) }
