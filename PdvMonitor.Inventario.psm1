@@ -35,6 +35,7 @@ function ConvertTo-PdvHardwareTime {
   param($Value);
   if (-not $Value) { return ''; }
   try {
+    if ($Value -is [DateTimeOffset]) { return $Value.ToString('o'); }
     if ($Value -is [DateTime]) { return ([DateTimeOffset]$Value).ToString('o'); }
     if ([string]$Value -match '^\d{14}\.\d{6}[+-]\d{3}$') {
       return ([DateTimeOffset][Management.ManagementDateTimeConverter]::ToDateTime([string]$Value)).ToString('o');

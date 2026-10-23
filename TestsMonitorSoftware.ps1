@@ -99,7 +99,10 @@ try {
     Assert-Software ($source -notmatch "GetValue\('(UninstallString|QuietUninstallString|InstallSource|InstallLocation|ProductID|ProductKey)'") 'Leu campos privados desnecessarios';
   };
   Test-Software 'datas de deteccao com fusos diferentes usam instante UTC e resultado da mais recente' {
-    Reset-Software;& $module {
+    Reset-Software;
+    $literalOffset=& $module {ConvertTo-PdvHardwareTime ([DateTimeOffset]::Parse('2026-10-21T12:00:00-03:00'));};
+    Assert-Software ($literalOffset -ceq '2026-10-21T12:00:00.0000000-03:00') 'DateTimeOffset perdeu fuso ao ser convertido para string';
+    & $module {
       $script:SoftwareDefender.Threats=@(@{ThreatID=9;ThreatName='Teste';SeverityID=1;IsActive=$false});
       $script:SoftwareDefender.Detections=@(@{ThreatID=9;ActionSuccess=$false;LastThreatStatusChangeTime=[DateTimeOffset]::Parse('2026-10-21T12:00:00-03:00')},@{ThreatID=9;ActionSuccess=$true;LastThreatStatusChangeTime=[DateTimeOffset]::Parse('2026-10-21T14:00:00+00:00')});
     };$r=Get-SoftwareDocument;
