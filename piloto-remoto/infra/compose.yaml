@@ -1,0 +1,83 @@
+# MODELO LOCAL. Perfil explícito e configuração enabled=false por padrão.
+# Não inclui Conecta/API/banco e não executa migrações.
+name: conecta-pdv-remote-pilot
+services:
+  remote-gateway:
+    profiles: [pilot]
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile
+      args:
+        NODE_IMAGE: ${PDV_NODE_IMAGE:?Defina imagem oficial Node24LTS por digest após revisão}
+    environment:
+      PDV_REMOTE_GATEWAY_CONFIG: /run/pdv/gateway.json
+    volumes:
+      - ${PDV_REMOTE_CONFIG_DIR:?Diretório privado de configuração}:/run/pdv:ro
+      - ${PDV_REMOTE_STATE_DIR:?Journal privado persistente}:/var/lib/pdv-remote:rw
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    mem_limit: 128m
+    tmpfs: ['/tmp:rw,noexec,nosuid,size=16m']
+    restart: 'no'
+    ports:
+      - '127.0.0.1:${PDV_REMOTE_DEVICE_LOCAL_PORT:-5443}:5443'
+      - '127.0.0.1:${PDV_REMOTE_VIEWER_LOCAL_PORT:-8443}:8443'
+    networks:
+      viewer:
+        ipv4_address: 172.30.249.2
+      control: {}
+      guac_bus: {}
+      ingress: {}
+
+  guacd:
+    profiles: [pilot]
+    image: ${PDV_GUACD_IMAGE:?Defina guacamole/guacd1.6.0 oficial por digest após revisão}
+    environment:
+      LOG_LEVEL: warning
+    restart: 'no'
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+    mem_limit: 256m
+    networks:
+      viewer:
+        ipv4_address: 172.30.249.3
+      guac_bus: {}
+    # Não publicar4822. guacd não tem autenticação própria.
+
+  guacamole:
+    profiles: [pilot]
+    image: ${PDV_GUACAMOLE_IMAGE:?Defina guacamole/guacamole1.6.0 oficial por digest após revisão}
+    environment:
+      GUACD_HOSTNAME: guacd
+      GUACD_PORT: '4822'
+      JSON_ENABLED: 'true'
+      JSON_SECRET_KEY: ${PDV_REMOTE_GUACAMOLE_JSON_KEY:?Chave aleatória128bits privada compartilhada apenas gateway e Guacamole}
+      REMOTE_IP_VALVE_ENABLED: 'true'
+      WEBAPP_CONTEXT: guacamole
+    restart: 'no'
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 256
+    mem_limit: 512m
+    networks:
+      guac_bus: {}
+      ingress: {}
+
+networks:
+  viewer:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.30.249.0/28
+  guac_bus:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.30.248.0/28
+  control:
+    external: true
+    name: ${PDV_REMOTE_CONTROL_NETWORK:?Rede privada compartilhada com backend autorizado}
+  ingress: {}

@@ -5,6 +5,10 @@ $script:runtimeDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path;
 Import-Module (Join-Path $script:runtimeDirectory 'PdvMonitor.Coleta.psm1') -Force;
 Import-Module (Join-Path $script:runtimeDirectory 'PdvMonitor.Politica.psm1') -Force;
 Import-Module (Join-Path $script:runtimeDirectory 'PdvMonitor.Transporte.psm1') -Force;
+Import-Module (Join-Path $script:runtimeDirectory 'PdvMonitor.Inventario.psm1');
+$script:nerusModule = Import-Module (Join-Path $script:runtimeDirectory 'PdvMonitor.Nerus.psm1') -PassThru;
+Import-Module (Join-Path $script:runtimeDirectory 'PdvMonitor.Atualizacao.psm1');
+Import-Module (Join-Path $script:runtimeDirectory 'PdvMonitor.Version.psm1');
 
 function Get-PdvRuntimeNow { return [DateTimeOffset]::Now; }
 
@@ -214,7 +218,7 @@ function New-PdvMonitorRecoveryState {
 
 function Start-PdvMonitorSession {
   [CmdletBinding()]
-  param([string]$DataDirectory = (Join-Path $env:LOCALAPPDATA 'Feirao\PdvMonitor'));
+  param([string]$DataDirectory = (Join-Path $env:LOCALAPPDATA 'Feirao\PdvMonitor'), [string]$ProgramDirectory = '');
   $data = [IO.Path]::GetFullPath($DataDirectory);
   [void][IO.Directory]::CreateDirectory($data);
   $logDirectory = Join-Path $data 'logs'; [void][IO.Directory]::CreateDirectory($logDirectory);
@@ -246,11 +250,24 @@ function Start-PdvMonitorSession {
     LastTickAt = $null; LastHeartbeatAt = $null; LastSnapshotAt = $null; LastEventsAt = $null;
     StatusText = 'Iniciando monitoramento'; UploadStatusText = 'Envio central não configurado';
     MaintenanceArmed = $false; MaintenanceExpiresAt = $null; Signals = [Collections.Queue]::Synchronized((New-Object Collections.Queue));
-    Stopped = $false; TickBusy = $false; HasBaseline = $false; RecoveryHistoryHealthy = $true;
+    Stopped = $false; TickBusy = $false; RemoteBusy = $false; HasBaseline = $false; RecoveryHistoryHealthy = $true;
     SignalDropCount = 0L; LastLoggedSignalDropCount = 0L;
     PreviousUploadFailureReason = ''; LastLoggedOutboxGapCount = 0L;
+    ComAlertStates = @{}; WindowsAlertStates = @{}; LastHardwareAt = $null; HardwareStatus = '';
+    HardwareFingerprint = ''; HardwarePartialFingerprint = ''; HardwareLastQueuedAt = $null; HardwareQueueFailed = $false;
+    HardwareMachineId = ''; ProgramDirectory = $ProgramDirectory; NerusAutomation = $null;
+    LastSoftwareAt=$null; SoftwareFingerprint=''; SoftwareLastQueuedAt=$null; SoftwareStatus='Aguardando inventário de softwares'; SoftwareQueueFailed=$false;
+    PreviousSoftwareUploadFailure=''; SoftwareThreatSignatures=@{};
+    NerusRestart = @{ Busy=$false; Stage='Idle'; Proposal=$null; Reason=''; Result=''; };
+    NerusService = $null; LastNerusServiceAt = $null; NerusServiceSignatures = @{};
+    AutoUpdateEnabled = $false; NextUpdateCheckAt = [DateTimeOffset]::MinValue;
+    UpdateStatus = ''; LastUpdateReason = ''; UpdateStaged = $false; MonitorVersion = (Get-PdvMonitorVersion);
   };
   Initialize-PdvMonitorCentral -Session $session | Out-Null;
+  & $script:nerusModule { param($CurrentSession); Initialize-PdvMonitorNerusServiceContext -Session $CurrentSession; } $session;
+  if ($ProgramDirectory -and [IO.File]::Exists((Join-Path $ProgramDirectory 'atualizacoes-chave-publica.xml'))) {
+    [void](Initialize-PdvMonitorUpdateTrust -DataDirectory $data -PublicKeyPath (Join-Path $ProgramDirectory 'atualizacoes-chave-publica.xml'));
+  }
   $historyPath = Join-Path $data 'recuperacoes.xml';
   if ([IO.File]::Exists($historyPath)) {
     try {
@@ -287,7 +304,40 @@ function Start-PdvMonitorSession {
       }
     } catch { Write-PdvMonitorRecord $session 'CollectionWarning' 'Cursores anteriores inválidos. A nova coleta terá cobertura inicial limitada e explícita.'; }
   }
-  Write-PdvMonitorRecord $session 'SessionStarted' ('Monitor iniciado; computador=' + $env:COMPUTERNAME + '; PowerShell=' + $PSVersionTable.PSVersion + '; recuperação desarmada.');
+  $hardwareStatePath=Join-Path $data 'inventario-estado.xml';
+  if ([IO.File]::Exists($hardwareStatePath)) {
+    try {
+      $xml=Read-PdvRuntimeXml $hardwareStatePath;
+      $fingerprint=[string]$xml.inventory.GetAttribute('fingerprint');
+      if ($fingerprint -notmatch '^[a-f0-9]{64}$') { throw 'InventoryStateInvalid'; }
+      $session.HardwareFingerprint=$fingerprint;
+      $lastQueued=[string]$xml.inventory.GetAttribute('lastQueuedAt');
+      if ($lastQueued) { $session.HardwareLastQueuedAt=[DateTimeOffset]::Parse($lastQueued,[Globalization.CultureInfo]::InvariantCulture); }
+    } catch { Write-PdvMonitorRecord $session 'CollectionWarning' 'Estado anterior do inventário indisponível; a coleta será refeita sem alterar equipamentos.'; }
+  }
+  $softwareStatePath=Join-Path $data 'software-estado.xml';
+  if([IO.File]::Exists($softwareStatePath)){
+    try{
+      $xml=Read-PdvRuntimeXml $softwareStatePath;
+      $root=$xml.DocumentElement;
+      if($null -eq $root -or $root.Name -cne 'software' -or $root.NamespaceURI -ne '' -or $root.Attributes.Count -ne 2){throw 'SoftwareStateInvalid';}
+      foreach($attribute in $root.Attributes){if(@('fingerprint','lastQueuedAt') -cnotcontains $attribute.Name){throw 'SoftwareStateInvalid';}}
+      $fingerprint=$root.GetAttribute('fingerprint');
+      if($fingerprint -notmatch '^[a-f0-9]{64}$'){throw 'SoftwareStateInvalid';}
+      $signatures=@{};
+      foreach($node in $root.ChildNodes){
+        if($node.Name -cne 'threat' -or $node.NamespaceURI -ne '' -or $node.Attributes.Count -ne 2 -or $node.ChildNodes.Count -ne 0 -or $signatures.Count -ge 64){throw 'SoftwareStateInvalid';}
+        foreach($attribute in $node.Attributes){if(@('id','signature') -cnotcontains $attribute.Name){throw 'SoftwareStateInvalid';}}
+        $id=$node.GetAttribute('id');$signature=$node.GetAttribute('signature');
+        if($id -notmatch '^\d{1,20}$' -or $signature -cnotmatch '^(True|False)\|(True|False)?\|[^\x00-\x1f\x7f]{0,48}$' -or $signatures.ContainsKey($id)){throw 'SoftwareStateInvalid';}
+        $signatures[$id]=$signature;
+      }
+      $lastQueued=$root.GetAttribute('lastQueuedAt');$queuedAt=$null;
+      if($lastQueued){$queuedAt=[DateTimeOffset]::Parse($lastQueued,[Globalization.CultureInfo]::InvariantCulture);if($queuedAt -gt (Get-PdvRuntimeNow).AddMinutes(5)){throw 'SoftwareStateInvalid';}}
+      $session.SoftwareFingerprint=$fingerprint;$session.SoftwareLastQueuedAt=$queuedAt;$session.SoftwareThreatSignatures=$signatures;
+    }catch{Write-PdvMonitorRecord $session 'CollectionWarning' 'Estado anterior dos softwares indisponível; a coleta será refeita preservando os documentos de inventário.' -Reason 'SoftwareStateUnavailable';}
+  }
+  Write-PdvMonitorRecord $session 'SessionStarted' ('Monitor iniciado; versão=' + $session.MonitorVersion + '; computador=' + $env:COMPUTERNAME + '; PowerShell=' + $PSVersionTable.PSVersion + '; recuperação desarmada.');
   Remove-PdvMonitorOldLogs $session;
   return $session;
 }
@@ -312,6 +362,7 @@ function Save-PdvMonitorProfiles {
   $old = $Session.Config.Profiles; $Session.Config.Profiles = @($checked);
   try { Save-PdvRuntimeConfig $Session; } catch { $Session.Config.Profiles = $old; throw; }
   $Session.MaintenanceArmed = $false; $Session.Config.AutoRecoveryEnabled = $false;
+  $Session.ComAlertStates = @{};
   foreach ($state in $Session.RecoveryStates.Values) { $state.ConsecutiveFailures = 0; $state.LastObservedSignature = ''; }
   Write-PdvMonitorRecord $Session 'ProfileChanged' 'Referências de dispositivos atualizadas. Recuperação desarmada; nenhuma configuração do Windows ou Nerus foi alterada.';
 }
@@ -321,7 +372,8 @@ function Set-PdvMonitorCentral {
   param($Session, [string]$Endpoint, [string]$StoreId, [string]$Terminal, [string]$AgentId, [string]$Token);
   $result = Set-PdvMonitorCentralConfig -Session $Session -Endpoint $Endpoint -StoreId $StoreId -Terminal $Terminal -AgentId $AgentId -Token $Token;
   if (-not $result.Success) { throw ('Não foi possível configurar o envio: ' + $result.Reason + '. ' + $Session.UploadStatusText); }
-  $Session.LastSnapshotAt = $null;
+  $Session.LastSnapshotAt = $null; $Session.LastHardwareAt=$null; $Session.HardwareLastQueuedAt=$null;
+  $Session.LastSoftwareAt=$null; $Session.SoftwareLastQueuedAt=$null;
   Write-PdvMonitorRecord $Session 'CentralConfigured' 'Destino central configurado para esta instalação; chave de envio protegida localmente.';
 }
 
@@ -332,6 +384,7 @@ function Set-PdvMonitorMaintenance {
     $Session.MaintenanceArmed = $false; $Session.MaintenanceExpiresAt = $null; $Session.Config.AutoRecoveryEnabled = $false;
     Write-PdvMonitorRecord $Session 'MaintenanceDisarmed' 'Recuperação automática desarmada.'; return;
   }
+  if ([bool](Get-PdvRuntimeValue $Session 'RemoteBusy' $false)) { throw 'Encerre o suporte remoto antes de armar uma recuperação.'; }
   if ($Minutes -lt 1 -or $Minutes -gt 15) { throw 'A janela de manutenção deve durar de 1 a 15 minutos.'; }
   if (-not $Session.RecoveryHistoryHealthy) { throw 'O histórico de recuperações precisa ser analisado pelo suporte antes de permitir novas tentativas.'; }
   $names = @();
@@ -363,7 +416,7 @@ function Get-PdvMonitorRecoveryContext {
     try { $jobs = @(Get-WmiObject -Class Win32_PrintJob -ErrorAction Stop).Count; $printOk = $true; } catch { }
   }
   return (New-Object PSObject -Property @{
-    AutoRecoveryEnabled = $Session.Config.AutoRecoveryEnabled; MaintenanceArmed = $Session.MaintenanceArmed;
+    AutoRecoveryEnabled = ($Session.Config.AutoRecoveryEnabled -and -not [bool](Get-PdvRuntimeValue $Session 'RemoteBusy' $false)); MaintenanceArmed = $Session.MaintenanceArmed;
     MaintenanceExpiresAt = $Session.MaintenanceExpiresAt;
     WindowsBuild = [int](Get-PdvRuntimeValue $Snapshot.Windows 'Build' 0); IsAdministrator = [bool](Get-PdvRuntimeValue $Snapshot.Windows 'IsAdministrator' $false);
     ProcessCheckSucceeded = $processOk; BlockingProcessNames = @($blocked);
@@ -384,10 +437,286 @@ function Get-PdvRuntimeDeviceSignature {
   return ('{0}|{1}|{2}|{3}|{4}' -f $Device.Present, $Device.PresenceKnown, $Device.Port, $Device.Status, $Device.ProblemCode);
 }
 
+function Save-PdvMonitorHardwareState {
+  param($Session);
+  $xml=New-Object Xml.XmlDocument; $root=$xml.CreateElement('inventory'); [void]$xml.AppendChild($root);
+  $root.SetAttribute('fingerprint',[string]$Session.HardwareFingerprint);
+  $lastQueued=''; if ($null -ne $Session.HardwareLastQueuedAt) { $lastQueued=$Session.HardwareLastQueuedAt.ToString('o'); }
+  $root.SetAttribute('lastQueuedAt',$lastQueued);
+  Write-PdvRuntimeAtomic (Join-Path $Session.DataDirectory 'inventario-estado.xml') $xml.OuterXml;
+}
+
+function Update-PdvMonitorHardware {
+  param($Session, [DateTimeOffset]$Now);
+  try {
+    $result=Get-PdvMonitorHardwareInventory;
+    if (-not $result.Success -or $null -eq $result.Hardware) { throw 'InventoryUnavailable'; }
+    $hardware=$result.Hardware; $Session.HardwareMachineId=[string]$hardware.machineId; $fingerprint=Get-PdvHardwareFingerprint $hardware;
+    $json=ConvertTo-PdvHardwareJson $hardware;
+    if(-not [bool](Get-PdvRuntimeValue $result 'CoverageHealthy' $true)){
+      if([int]$hardware.schemaVersion -lt 2){throw 'InventoryCoverageIncomplete';}
+      # A cobertura por classe permite ao servidor preservar os componentes
+      # desconhecidos e registrar mudanças apenas nas partes observadas.
+      Write-PdvRuntimeAtomic (Join-Path $Session.DataDirectory 'inventario-hardware-parcial.json') $json;
+      $partialChanged=([string](Get-PdvRuntimeValue $Session 'HardwarePartialFingerprint' '') -cne $fingerprint);
+      if($partialChanged -or $null -eq $Session.HardwareLastQueuedAt -or ($Now-$Session.HardwareLastQueuedAt).TotalHours -ge 24){
+        $queued=Set-PdvMonitorHardwarePending -Session $Session -Hardware $hardware;
+        if($queued.Success -and $queued.Queued){$Session.HardwareLastQueuedAt=$Now;$Session.HardwareQueueFailed=$false;}
+        elseif([bool](Get-PdvRuntimeValue $Session.Config.Central 'Enabled' $false)){
+          $Session.HardwareLastQueuedAt=$null;
+          if(-not $Session.HardwareQueueFailed){Write-PdvMonitorRecord $Session 'UploadWarning' 'Inventário parcial preservado localmente, mas sua fila de envio não pôde ser gravada. Nova tentativa em quinze minutos; os dados anteriores da central permanecem.' -Reason 'HardwareQueueFailed';}
+          $Session.HardwareQueueFailed=$true;
+        }
+      }
+      if($Session.HardwareStatus -cne 'Inventário com cobertura parcial'){
+        Write-PdvMonitorRecord $Session 'CollectionWarning' 'Inventário com cobertura parcial por componente. A última coleta completa foi preservada; partes não consultadas não significam hardware removido.' -Reason 'MachineInventoryPartial';
+      }
+      if($null -eq $Session.PSObject.Properties['HardwarePartialFingerprint']){$Session|Add-Member NoteProperty HardwarePartialFingerprint '';}
+      $Session.HardwarePartialFingerprint=$fingerprint;$Session.HardwareStatus='Inventário com cobertura parcial';$Session.LastHardwareAt=$Now.AddHours(-6).AddMinutes(15);return;
+    }
+    $previousFingerprint=$Session.HardwareFingerprint;
+    $changed=($fingerprint -cne $previousFingerprint);
+    $extendedBaseline=$false;$hardwarePath=Join-Path $Session.DataDirectory 'inventario-hardware.json';
+    if($changed -and $previousFingerprint -and [IO.File]::Exists($hardwarePath)){
+      try{
+        $oldText=[IO.File]::ReadAllText($hardwarePath);
+        if($oldText -match '"schemaVersion"\s*:\s*1(?:\s*[,}])' -and [int]$hardware.schemaVersion -eq 2){
+          $legacy=@{};foreach($key in $hardware.Keys){if(@('baseboard','coverage') -notcontains $key){$legacy[$key]=$hardware[$key];}}
+          $legacy.schemaVersion=1;$legacy.cpu=@{};foreach($key in @('name','cores','logicalProcessors')){$legacy.cpu[$key]=$hardware.cpu[$key];}
+          $modules=@();foreach($item in @($hardware.memory.modules)){$oldModule=@{};foreach($key in @('capacityBytes','manufacturer','partNumber','serialNumber','speedMHz')){$oldModule[$key]=$item[$key];};$modules+=@($oldModule);}
+          $legacy.memory=@{totalBytes=$hardware.memory.totalBytes;modules=$modules};
+          $extendedBaseline=((Get-PdvHardwareFingerprint $legacy) -ceq $previousFingerprint);
+        }
+      }catch{}
+    }
+    # Snapshot é um documento próprio. O histórico recebe somente um resumo
+    # de mudança; nunca JSON cortado ou uma linha por driver normal.
+    Write-PdvRuntimeAtomic (Join-Path $Session.DataDirectory 'inventario-hardware.json') $json;
+    $queueFailed=$false;
+    if ($changed -or [string](Get-PdvRuntimeValue $Session 'HardwarePartialFingerprint' '') -or $null -eq $Session.HardwareLastQueuedAt -or ($Now - $Session.HardwareLastQueuedAt).TotalHours -ge 24) {
+      $queued=Set-PdvMonitorHardwarePending -Session $Session -Hardware $hardware;
+      if ($queued.Success -and $queued.Queued) { $Session.HardwareLastQueuedAt=$Now; $Session.HardwareQueueFailed=$false; }
+      elseif ([bool](Get-PdvRuntimeValue $Session.Config.Central 'Enabled' $false)) {
+        # Um inventário válido continua válido quando a escrita da fila falha.
+        # Não deixar a marca da versão anterior atrasar a nova tentativa em 24h.
+        $Session.HardwareLastQueuedAt=$null; $queueFailed=$true;
+        if (-not $Session.HardwareQueueFailed) { Write-PdvMonitorRecord $Session 'UploadWarning' 'Inventário local atualizado, mas a fila patrimonial não pôde ser gravada. Nova tentativa em 15 minutos; o último patrimônio confirmado na central permanece disponível.' -Reason 'HardwareQueueFailed'; }
+        $Session.HardwareQueueFailed=$true;
+      }
+    }
+    if ($changed) {
+      $kind='HardwareChanged'; $reason='MachineHardwareChanged';
+      if (-not $previousFingerprint) { $kind='MachineInventory'; $reason='MachineHardwareBaseline'; }
+      if($extendedBaseline){$kind='MachineInventory';$reason='MachineHardwareBaselineExtended';}
+      Write-PdvMonitorRecord $Session $kind ('Inventário da máquina atualizado; computador=' + $hardware.hostname + '; fabricante=' + $hardware.manufacturer + '; modelo=' + $hardware.model + '; CPU=' + $hardware.cpu.name + '; memória em bytes=' + $hardware.memory.totalBytes + '; discos=' + @($hardware.disks).Count + '. Consulte o inventário estruturado da instalação.') -Reason $reason;
+    }
+    $Session.HardwareFingerprint=$fingerprint; Save-PdvMonitorHardwareState $Session;
+    if($null -ne $Session.PSObject.Properties['HardwarePartialFingerprint']){$Session.HardwarePartialFingerprint='';}
+    $Session.LastHardwareAt=$Now; $Session.HardwareStatus='Inventário da máquina atualizado';
+    if ($queueFailed) { $Session.LastHardwareAt=$Now.AddHours(-6).AddMinutes(15); $Session.HardwareStatus='Inventário local atualizado; envio patrimonial pendente'; }
+  } catch {
+    # Não substituir um patrimônio válido por um objeto vazio após falha WMI.
+    if ($Session.HardwareStatus -ne 'Inventário temporariamente indisponível') { Write-PdvMonitorRecord $Session 'CollectionWarning' 'Inventário da máquina indisponível nesta consulta. Último inventário válido preservado; nova tentativa em 15 minutos.' -Reason 'MachineInventoryUnavailable'; }
+    $Session.HardwareStatus='Inventário temporariamente indisponível'; $Session.LastHardwareAt=$Now.AddHours(-6).AddMinutes(15);
+  }
+}
+
+function Save-PdvMonitorSoftwareState {
+  param($Session);
+  $xml=New-Object Xml.XmlDocument;$root=$xml.CreateElement('software');[void]$xml.AppendChild($root);
+  $root.SetAttribute('fingerprint',[string]$Session.SoftwareFingerprint);$lastQueued='';
+  if($null -ne $Session.SoftwareLastQueuedAt){$lastQueued=$Session.SoftwareLastQueuedAt.ToString('o');}
+  $root.SetAttribute('lastQueuedAt',$lastQueued);
+  foreach($id in @($Session.SoftwareThreatSignatures.Keys | Sort-Object | Select-Object -First 64)){
+    $node=$xml.CreateElement('threat');$node.SetAttribute('id',[string]$id);$node.SetAttribute('signature',[string]$Session.SoftwareThreatSignatures[$id]);[void]$root.AppendChild($node);
+  }
+  Write-PdvRuntimeAtomic (Join-Path $Session.DataDirectory 'software-estado.xml') $xml.OuterXml;
+}
+
+function Update-PdvMonitorSoftware {
+  param($Session,[DateTimeOffset]$Now);
+  try{
+    $result=Get-PdvMonitorSoftwareInventory;
+    if(-not $result.Success -or $null -eq $result.Software -or $result.Fingerprint -notmatch '^[a-f0-9]{64}$'){throw 'SoftwareUnavailable';}
+    $software=$result.Software;$json=ConvertTo-PdvHardwareJson $software;
+    if([Text.Encoding]::UTF8.GetByteCount($json) -gt 131072){throw 'SoftwareTooLarge';}
+    Write-PdvRuntimeAtomic (Join-Path $Session.DataDirectory 'inventario-software.json') $json;
+    if($software.complete){Write-PdvRuntimeAtomic (Join-Path $Session.DataDirectory 'inventario-software-completo.json') $json;}
+    $changed=($Session.SoftwareFingerprint -cne $result.Fingerprint);$queueFailed=$false;
+    if($changed -or $null -eq $Session.SoftwareLastQueuedAt -or ($Now-$Session.SoftwareLastQueuedAt).TotalHours -ge 24){
+      $queued=Set-PdvMonitorSoftwarePending -Session $Session -Software $software -Fingerprint $result.Fingerprint;
+      if($queued.Success -and $queued.Queued){$Session.SoftwareLastQueuedAt=$Now;$Session.SoftwareQueueFailed=$false;}
+      elseif([bool](Get-PdvRuntimeValue $Session.Config.Central 'Enabled' $false)){
+        $Session.SoftwareLastQueuedAt=$null;$queueFailed=$true;
+        if(-not $Session.SoftwareQueueFailed){Write-PdvMonitorRecord $Session 'UploadWarning' 'Inventário de softwares preservado localmente, mas a fila de envio não pôde ser gravada. Os eventos de dispositivos continuam independentes.' -Reason 'SoftwareQueueFailed';}
+        $Session.SoftwareQueueFailed=$true;
+      }
+    }
+    if($changed){
+      $kind='SoftwareInventory';if($Session.SoftwareFingerprint){$kind='SoftwareInventoryChanged';}
+      Write-PdvMonitorRecord $Session $kind ('Inventário de softwares observado; aplicativos='+@($software.apps).Count+'; cobertura completa do escopo='+$software.complete+'; proteção consultada='+$software.security.provider+'; estado da consulta='+$software.security.status+'. Os dados detalhados ficam no inventário da instalação.') -Reason 'SoftwareSnapshotObserved';
+    }
+    if($software.security.provider -ceq 'MicrosoftDefender'){
+      $observedThreats=@{};
+      foreach($threat in @($software.security.threats)){
+        if($threat.source -cne 'MicrosoftDefender' -or $threat.id -notmatch '^\d{1,20}$'){continue;}
+        $observedThreats[[string]$threat.id]=$true;
+        $signature=([string]$threat.active)+'|'+[string]$threat.actionSuccess+'|'+[string]$threat.lastSeenAt;
+        $old=$Session.SoftwareThreatSignatures[[string]$threat.id];
+        if($signature -cne $old -and ($threat.active -or $old)){
+          $kind='SecurityThreatStatusChanged';if($threat.active){$kind='SecurityThreatDetected';}
+          Write-PdvMonitorRecord $Session $kind ('Microsoft Defender reportou ameaça; identificador='+$threat.id+'; nome='+(ConvertTo-PdvProtocolText $threat.name 160)+'; gravidade='+$threat.severity+'; ativa='+$threat.active+'; ação confirmada='+[string]$threat.actionSuccess+'. Informação do antivírus, sem coleta de arquivos ou conteúdo.') -Reason 'MicrosoftDefenderDetection';
+        }
+        $Session.SoftwareThreatSignatures[[string]$threat.id]=$signature;
+      }
+      if($Session.SoftwareThreatSignatures.Count -gt 64){
+        foreach($id in @($Session.SoftwareThreatSignatures.Keys | Sort-Object)){
+          if($Session.SoftwareThreatSignatures.Count -le 64){break;}
+          if(-not $observedThreats.ContainsKey($id)){$Session.SoftwareThreatSignatures.Remove($id);}
+        }
+      }
+    }
+    $Session.SoftwareFingerprint=$result.Fingerprint;$Session.LastSoftwareAt=$Now;
+    Save-PdvMonitorSoftwareState $Session;
+    $Session.SoftwareStatus='Softwares atualizados; consulta de proteção: '+$software.security.status;
+    if(-not $software.complete){$Session.SoftwareStatus='Softwares com cobertura parcial; último inventário completo preservado';}
+    if($queueFailed){$Session.SoftwareStatus+='; envio pendente';}
+  }catch{
+    if($Session.SoftwareStatus -cne 'Inventário de softwares indisponível'){Write-PdvMonitorRecord $Session 'CollectionWarning' 'Inventário de softwares indisponível nesta consulta. Os documentos locais anteriores foram preservados; nova tentativa em quinze minutos.' -Reason 'SoftwareInventoryUnavailable';}
+    $Session.SoftwareStatus='Inventário de softwares indisponível';$Session.LastSoftwareAt=$Now;
+  }
+}
+
+function Publish-PdvMonitorSoftwareUpload {
+  param($Session);
+  try{$result=Invoke-PdvMonitorSoftwareUpload $Session;}catch{$result=@{Success=$false;Reason='SoftwareUploadFailed'};}
+  $reason=[string](Get-PdvRuntimeValue $result 'Reason' 'SoftwareUploadFailed');
+  if(@('CentralDisabled','BackoffActive') -contains $reason){return;}
+  if(@('SoftwareAcknowledged','SoftwareOutboxEmpty') -contains $reason){
+    if($Session.PreviousSoftwareUploadFailure){Write-PdvMonitorRecord $Session 'UploadResumed' 'Envio do inventário de softwares voltou ao estado normal.' -Reason 'SoftwareUploadResumed';}
+    $Session.PreviousSoftwareUploadFailure='';return;
+  }
+  if($reason -notmatch '^Software(Http[0-9]{3}|IdentityMismatch|CredentialUnavailable|UploadFailed)$'){$reason='SoftwareUploadFailed';}
+  if($Session.PreviousSoftwareUploadFailure -cne $reason){Write-PdvMonitorRecord $Session 'UploadWarning' ('Inventário de softwares ainda não confirmado pela central; motivo='+$reason+'. A pendência local e o envio de dispositivos foram preservados. A API precisa receber a integração empresarial para aceitar softwares.') -Reason $reason;$Session.PreviousSoftwareUploadFailure=$reason;}
+}
+
+function Update-PdvMonitorAlert {
+  param($Session, [string]$Key, [string]$Kind, [string]$Signature, [string]$Detail, $Device, [string]$Role, [string]$Reason);
+  if (-not $Session.ComAlertStates.ContainsKey($Key)) {
+    $Session.ComAlertStates[$Key] = New-Object PSObject -Property @{ Candidate=''; Count=0; Active=''; LastDevice=$null; };
+  }
+  $state = $Session.ComAlertStates[$Key];
+  if ($state.Candidate -ceq $Signature) { $state.Count++; } else { $state.Candidate=$Signature; $state.Count=1; }
+  if ($state.Count -lt 3) { return; }
+  if ($Signature) {
+    if ($state.Active -cne $Signature) {
+      Write-PdvMonitorRecord $Session $Kind $Detail $Device $Role $Reason;
+      $state.Active = $Signature; $state.LastDevice = $Device;
+    }
+  } elseif ($state.Active) {
+    Write-PdvMonitorRecord $Session 'DeviceRestored' ('Condição normal confirmada em três leituras; alerta resolvido=' + $Kind + '. A comunicação no Nerus não foi testada.') $Device $Role $Kind;
+    $state.Active=''; $state.LastDevice=$null;
+  }
+}
+
+function Invoke-PdvMonitorComAlerts {
+  param($Session, $Snapshot);
+  # Uma consulta parcial ou presença desconhecida nunca prova desconexão e
+  # interrompe a contagem de estabilidade, sem encerrar um alerta já confirmado.
+  $complete = ([bool](Get-PdvRuntimeValue $Snapshot 'InventoryComplete' $false) -and [bool](Get-PdvRuntimeValue $Snapshot 'PresenceComplete' $false));
+  foreach ($profile in @($Session.Config.Profiles)) {
+    $id=[string]$profile.InstanceId; $found=@($Snapshot.Devices | Where-Object { $_.InstanceId -eq $id });
+    $device=$null; if ($found.Count -eq 1) { $device=$found[0]; }
+    $known=($complete -and ($null -eq $device -or [bool](Get-PdvRuntimeValue $device 'PresenceKnown' $false)));
+    if (-not $known -or $found.Count -gt 1) {
+      foreach ($kind in @('DeviceDisconnected','ComPortChanged','ComPortConflict','HardwareFault')) {
+        $key=$id+'|'+$kind; if ($Session.ComAlertStates.ContainsKey($key)) { $Session.ComAlertStates[$key].Count=0; $Session.ComAlertStates[$key].Candidate=''; }
+      }
+      continue;
+    }
+    $present=($null -ne $device -and [bool]$device.Present);
+    $disconnected=''; if (-not $present) { $disconnected='absent'; }
+    $absenceEvidence=$device;
+    if ($null -eq $absenceEvidence) { $absenceEvidence=New-Object PSObject -Property @{InstanceId=$id;Name=[string]$profile.Name;Port=[string]$profile.ExpectedPort;Present=$false;PresenceKnown=$true;Status='NotPresent';ProblemCode=45;}; }
+    Update-PdvMonitorAlert $Session ($id+'|DeviceDisconnected') 'DeviceDisconnected' $disconnected 'Dispositivo do perfil ausente em três consultas completas. Verificar cabo USB, alimentação e driver; nenhuma porta foi aberta para testar.' $absenceEvidence $profile.Role 'DeviceNotPresent';
+    if (-not $present) {
+      foreach ($kind in @('ComPortChanged','ComPortConflict','HardwareFault')) { $key=$id+'|'+$kind; if ($Session.ComAlertStates.ContainsKey($key)) { $Session.ComAlertStates[$key].Count=0; $Session.ComAlertStates[$key].Candidate=''; } }
+      continue;
+    }
+    $expected=[string]$profile.ExpectedPort; $actual=[string]$device.Port;
+    $drift=''; if ($expected -and $actual -match '^COM[1-9][0-9]*$' -and $actual -ne $expected) { $drift=$expected+'>'+ $actual; }
+    if ($actual -match '^COM[1-9][0-9]*$' -or -not $expected) {
+    Update-PdvMonitorAlert $Session ($id+'|ComPortChanged') 'ComPortChanged' $drift ('Porta esperada=' + $expected + '; porta atual=' + $actual + '. Ajustar a referência do aplicativo ou a associação do Windows somente após confirmar o equipamento; nenhum ajuste foi aplicado.') $device $profile.Role 'ExpectedPortMismatch';
+    } elseif ($Session.ComAlertStates.ContainsKey($id+'|ComPortChanged')) { $Session.ComAlertStates[$id+'|ComPortChanged'].Count=0; $Session.ComAlertStates[$id+'|ComPortChanged'].Candidate=''; }
+    $occupants=@();
+    foreach ($other in @($Snapshot.Devices)) {
+      if ($other.InstanceId -ne $id -and $other.PresenceKnown -and $other.Present -and $other.Port -and (($expected -and $other.Port -eq $expected) -or ($actual -and $other.Port -eq $actual))) { $occupants += ([string]$other.InstanceId+'@'+[string]$other.Port); }
+    }
+    $conflict=''; if ($occupants.Count) { $conflict=(@($occupants | Sort-Object -Unique) -join ';'); }
+    Update-PdvMonitorAlert $Session ($id+'|ComPortConflict') 'ComPortConflict' $conflict ('Outra instância presente ocupa a porta esperada ou atual: ' + $conflict + '. Recuperação bloqueada para evitar agir sobre outro equipamento.') $device $profile.Role 'PortOccupiedByPresentDevice';
+    $code=[string]$device.ProblemCode; $fault='';
+    if ($code -match '^[0-9]{1,4}$' -and [int]$code -gt 0 -and [int]$code -ne 45) { $fault=$code+'|'+[string]$device.Status; }
+    if ($code -match '^[0-9]{1,4}$') {
+    Update-PdvMonitorAlert $Session ($id+'|HardwareFault') 'HardwareFault' $fault ('Windows informa falha persistente no dispositivo; código=' + $code + '; estado=' + $device.Status + '. Confirmado em três leituras; a elegibilidade para reinício é avaliada separadamente.') $device $profile.Role 'PersistentDeviceProblem';
+    } elseif ($Session.ComAlertStates.ContainsKey($id+'|HardwareFault')) { $Session.ComAlertStates[$id+'|HardwareFault'].Count=0; $Session.ComAlertStates[$id+'|HardwareFault'].Candidate=''; }
+  }
+}
+
+function Invoke-PdvMonitorWindowsAlerts {
+  param($Session, [object[]]$Events, [DateTimeOffset]$Now);
+  $groups=@{};
+  foreach ($event in $Events) {
+    $level=[int](Get-PdvRuntimeValue $event 'Level' 0);
+    if (@(1,2) -notcontains $level) { continue; }
+    $key=[string]$event.Channel+'|'+[string]$event.Provider+'|'+[string]$event.Id+'|'+$level;
+    if (-not $groups.ContainsKey($key)) { $groups[$key]=New-Object PSObject -Property @{ Event=$event; Count=0; }; }
+    $groups[$key].Count++;
+  }
+  foreach ($key in $groups.Keys) {
+    $group=$groups[$key]; $event=$group.Event;
+    $previous=$Session.WindowsAlertStates[$key];
+    if ($null -eq $previous -and $Session.WindowsAlertStates.Count -ge 512) {
+      $oldestKey=@($Session.WindowsAlertStates.Keys | Sort-Object { $Session.WindowsAlertStates[$_].LastAt } | Select-Object -First 1);
+      if ($oldestKey.Count) { [void]$Session.WindowsAlertStates.Remove($oldestKey[0]); }
+    }
+    if ($null -eq $previous) { $previous=New-Object PSObject -Property @{ LastAt=[DateTimeOffset]::MinValue; Suppressed=0L; }; $Session.WindowsAlertStates[$key]=$previous; }
+    if (($Now - $previous.LastAt).TotalMinutes -lt 10) { $previous.Suppressed += $group.Count; continue; }
+    $kind='WindowsError'; if ([int]$event.Level -eq 1) { $kind='WindowsCritical'; }
+    Write-PdvMonitorRecord $Session $kind ('Falha Windows; ocorrências agrupadas=' + ($group.Count+$previous.Suppressed) + '; primeira desta leitura=' + $event.TimeCreated + '; nível=' + $event.Level + '. Somente metadados técnicos; mensagens livres omitidas.') -Reason 'RelevantWindowsFailure' -WindowsEvent $event;
+    $previous.LastAt=$Now; $previous.Suppressed=0;
+  }
+  # Memória limitada mesmo com múltiplos provedores/IDs inesperados.
+  if ($Session.WindowsAlertStates.Count -gt 512) {
+    foreach ($key in @($Session.WindowsAlertStates.Keys)) { if (($Now - $Session.WindowsAlertStates[$key].LastAt).TotalHours -gt 24) { [void]$Session.WindowsAlertStates.Remove($key); } }
+  }
+}
+
+function Publish-PdvMonitorUpdateResult {
+  param($Session);
+  $path=Join-Path (Join-Path $Session.DataDirectory 'atualizacoes') 'estado.xml';
+  if (-not [IO.File]::Exists($path)) { return; }
+  try {
+    $xml=Read-PdvRuntimeXml $path; $root=$xml.DocumentElement;
+    if ($root.Name -cne 'Update' -or $root.NamespaceURI -or $root.Attributes.Count -ne 4 -or $root.SelectNodes('*').Count) { return; }
+    $status=$root.GetAttribute('status'); $version=$root.GetAttribute('version'); $reason=$root.GetAttribute('reason'); $at=$root.GetAttribute('at');
+    if (@('installed','rolledBack','failed') -cnotcontains $status -or $version -notmatch '^[0-9]{1,4}[.][0-9]{1,4}[.][0-9]{1,4}$' -or $reason -notmatch '^Update[A-Za-z]{1,80}$' -or $at.Length -gt 48) { return; }
+    [void][DateTimeOffset]::Parse($at,[Globalization.CultureInfo]::InvariantCulture);
+    $signature=$status+'|'+$version+'|'+$reason+'|'+$at;
+    $marker=Join-Path (Join-Path $Session.DataDirectory 'atualizacoes') 'ultimo-resultado-enviado.txt';
+    if ([IO.File]::Exists($marker) -and (New-Object IO.FileInfo($marker)).Length -le 512 -and [IO.File]::ReadAllText($marker) -ceq $signature) { return; }
+  } catch { return; }
+  $kind='UpdateFailed'; if ($status -ceq 'installed') { $kind='UpdateApplied'; } elseif ($status -ceq 'rolledBack') { $kind='UpdateRollback'; }
+  $previousGap=$Session.OutboxGapCount;
+  Write-PdvMonitorRecord $Session $kind ('Resultado da atualização do próprio monitor: '+$status+'; versão candidata='+$version+'; motivo='+$reason+'; informado em='+$at+'. PDV e TEF não foram encerrados.') -Reason $reason;
+  if ($Session.OutboxGapCount -eq $previousGap) { Write-PdvRuntimeAtomic $marker $signature; }
+}
+
 function Invoke-PdvMonitorTick {
   [CmdletBinding()]
   param($Session);
-  if ($Session.Stopped -or $Session.TickBusy) { return; }
+  $restart = Get-PdvRuntimeValue $Session 'NerusRestart' $null;
+  $service = Get-PdvRuntimeValue $Session 'NerusService' $null;
+  if ($Session.Stopped -or $Session.TickBusy -or [bool](Get-PdvRuntimeValue $restart 'Busy' $false) -or [bool](Get-PdvRuntimeValue $service 'Busy' $false)) { return; }
   $Session.TickBusy = $true;
   try {
     # Conseguir gravar antes de avaliar qualquer ação também bloqueia recuperação
@@ -400,57 +729,38 @@ function Invoke-PdvMonitorTick {
       Write-PdvMonitorRecord $Session 'LogGap' ('Fila de notificações do Windows atingiu o limite; sinais descartados nesta sessão=' + $droppedSignals + '; novos desde o último registro=' + ($droppedSignals - $Session.LastLoggedSignalDropCount) + '. A coleta periódica continua.');
       $Session.LastLoggedSignalDropCount = $droppedSignals;
     }
+    # Notificações WMI apenas provocam a próxima observação. Não são incidentes:
+    # um sinal genérico não identifica dispositivo e não precisa chegar ao suporte.
     $signalCount = 0;
-    while ($Session.Signals.Count -gt 0 -and $signalCount -lt 1000) {
-      $signal = $Session.Signals.Dequeue(); $signalCount++;
-      Write-PdvMonitorRecord $Session 'WindowsDeviceChange' ('Sinal genérico do Windows: tipo=' + (Get-PdvRuntimeValue $signal 'EventType' '') + '; horário=' + (Get-PdvRuntimeValue $signal 'Time' '') + '. Não identifica qual dispositivo mudou.');
+    while ($Session.Signals.Count -gt 0 -and $signalCount -lt 1000) { [void]$Session.Signals.Dequeue(); $signalCount++; }
+    $snapshot = Get-PdvMonitorSnapshot; $snapshotAt=Get-PdvRuntimeNow; $Session.Snapshot = $snapshot;
+    if ($Session.ProgramDirectory -and ($null -eq $Session.LastNerusServiceAt -or ($now - $Session.LastNerusServiceAt).TotalSeconds -ge 60)) {
+      Update-PdvMonitorNerusServiceDiagnostic -Session $Session -Now $now;
     }
-    $snapshot = Get-PdvMonitorSnapshot; $Session.Snapshot = $snapshot;
+    if($Session.ProgramDirectory -and ($null -eq $Session.LastSoftwareAt -or ($now-$Session.LastSoftwareAt).TotalMinutes -ge 15)){Update-PdvMonitorSoftware $Session $now;}
+    if ($Session.ProgramDirectory -and -not [bool](Get-PdvRuntimeValue $Session 'RemoteBusy' $false)) {
+      Invoke-PdvMonitorNerusAutomation -Session $Session -Snapshot $snapshot -ObservedAt $snapshotAt;
+      if ($null -ne $Session.NerusAutomation) {
+        while ($Session.NerusAutomation.Events.Count) {
+          $notice=$Session.NerusAutomation.Events.Dequeue();
+          Write-PdvMonitorRecord $Session $notice.Kind $notice.Detail -Role 'Impressora Nerus' -Reason $notice.Reason;
+        }
+      }
+    }
     $warningText = @($snapshot.Warnings) -join ' | ';
     if ($warningText -ne $Session.PreviousWarnings) {
-      Write-PdvMonitorRecord $Session 'CollectionWarning' $(if ($warningText) { $warningText } else { 'As consultas desta rodada não retornaram avisos.'; });
+      if ($warningText) { Write-PdvMonitorRecord $Session 'CollectionWarning' $warningText; }
+      elseif ($Session.PreviousWarnings) { Write-PdvMonitorRecord $Session 'CollectionRestored' 'As consultas voltaram ao estado normal.'; }
       $Session.PreviousWarnings = $warningText;
     }
     $complete = [bool](Get-PdvRuntimeValue $snapshot 'InventoryComplete' $false);
-    $nextDevices = @{};
-    foreach ($device in @($snapshot.Devices)) {
-      $id = [string]$device.InstanceId; if (-not $id) { continue; }
-      $signature = Get-PdvRuntimeDeviceSignature $device; $nextDevices[$id] = $device;
-      if (-not $Session.PreviousDevices.ContainsKey($id) -or (Get-PdvRuntimeDeviceSignature $Session.PreviousDevices[$id]) -ne $signature) {
-        $kind = 'DeviceChanged'; if (-not $Session.HasBaseline) { $kind = 'Snapshot'; }
-        Write-PdvMonitorRecord $Session $kind ('Inventário ' + $snapshot.InventoryMode + '; esta observação não testa comunicação com o PDV.') $device;
-      }
-    }
-    if ($complete) {
-      foreach ($id in $Session.InventoryBaseline.Keys) {
-        if ($Session.HasBaseline -and -not $nextDevices.ContainsKey($id)) { Write-PdvMonitorRecord $Session 'DeviceMissing' 'Instância deixou de ser enumerada em uma consulta completa; não houve reassociação automática.' $Session.InventoryBaseline[$id]; }
-      }
-      # Somente inventários completos definem a base para afirmar remoção.
-      $Session.InventoryBaseline = $nextDevices.Clone();
-      $Session.PreviousDevices = $nextDevices; $Session.HasBaseline = $true;
-    } else {
-      # Não transformar uma falha da consulta em desaparecimento de todos os dispositivos.
-      foreach ($id in $nextDevices.Keys) { $Session.PreviousDevices[$id] = $nextDevices[$id]; }
-    }
-    if ($null -eq $Session.LastSnapshotAt -or ($now - $Session.LastSnapshotAt).TotalMinutes -ge 10) {
-      foreach ($device in @($snapshot.Devices)) { Write-PdvMonitorRecord $Session 'Snapshot' ('Modo=' + $snapshot.InventoryMode + '; fabricante=' + $device.Manufacturer + '; driver=' + $device.DriverVersion) $device; }
-      foreach ($printer in @($snapshot.Printers)) { Write-PdvMonitorRecord $Session 'PrinterSnapshot' ('Fila=' + $printer.Name + '; porta=' + $printer.PortName + '; driver=' + $printer.DriverName + '; offline=' + $printer.WorkOffline); }
-      Write-PdvMonitorRecord $Session 'PortReservations' (@($snapshot.ReservedPorts) -join ';');
-      $Session.LastSnapshotAt = $now;
-    }
-    if ($null -eq $Session.LastEventsAt -or ($now - $Session.LastEventsAt).TotalSeconds -ge 60) {
-      $events = Get-PdvMonitorWindowsEvents -Cursors $Session.Cursors -MaxEventsPerChannel 100;
-      foreach ($event in @($events.Events)) { Write-PdvMonitorRecord $Session 'WindowsEvent' ('Ocorrência Windows em ' + $event.TimeCreated + '; nível=' + $event.Level + '; detalhes livres omitidos.') -WindowsEvent $event; }
-      $coverage = @($events.ChannelStatus | ForEach-Object { $_.Channel + ':ok=' + $_.Success + ';enabled=' + $_.Enabled + ';gap=' + $_.Gap + ';reset=' + $_.Reset + ';backlog=' + $_.Truncated + ';início=' + $_.CoverageStart; }) -join ' | ';
-      if ($coverage -ne $Session.ChannelStatusSignature) {
-        Write-PdvMonitorRecord $Session 'WindowsEventCoverage' $coverage;
-        foreach ($warning in @($events.Warnings)) { Write-PdvMonitorRecord $Session 'CollectionWarning' $warning; }
-        $Session.ChannelStatusSignature = $coverage;
-      }
-      # Somente após gravar todos os eventos. Falha aqui permite repetição local,
-      # mas nunca confirma um cursor cujo lote não foi escrito por completo.
-      Save-PdvMonitorCursors $Session $events.Cursors; $Session.LastEventsAt = $now;
-    }
+    # A enumeração completa continua local para detectar conflitos. Inventários
+    # normais de dezenas de drivers não geram eventos nem snapshots periódicos.
+    if ($complete) { $Session.HasBaseline = $true; }
+    Invoke-PdvMonitorComAlerts $Session $snapshot;
+    if ($null -eq $Session.LastHardwareAt -or ($now - $Session.LastHardwareAt).TotalHours -ge 6) { Update-PdvMonitorHardware $Session $now; }
+    # Escopo solicitado: dispositivos/COM, hardware e ponte local do Nerus.
+    # Não consultar Event Log genérico, mesmo com canais Windows habilitados.
     foreach ($profile in @($Session.Config.Profiles)) {
       $id = $profile.InstanceId;
       $found = @($snapshot.Devices | Where-Object { $_.InstanceId -eq $id });
@@ -475,11 +785,11 @@ function Invoke-PdvMonitorTick {
       }
       $context = Get-PdvMonitorRecoveryContext $Session $snapshot $conflict;
       $decision = Get-PdvRecoveryDecision -Profile $profile -Device $device -Context $context -State $state -Now $now;
-      if ($Session.PreviousDecisions[$id] -ne $decision.Reason) {
+      if ($Session.MaintenanceArmed -and $Session.PreviousDecisions[$id] -ne $decision.Reason) {
         Write-PdvMonitorRecord $Session 'RecoveryDecision' $decision.Detail $device $profile.Role $decision.Reason;
         $Session.PreviousDecisions[$id] = $decision.Reason;
       }
-      if ($decision.Allowed -and $Session.LoggingHealthy) {
+      if ($decision.Allowed -and $Session.LoggingHealthy -and -not [bool](Get-PdvRuntimeValue $Session 'RemoteBusy' $false)) {
         # Reconsultar imediatamente antes de agir. Nenhuma decisão usa o estado
         # de uma rodada anterior para inferir que o caixa continua fechado.
         $fresh = Get-PdvMonitorSnapshot;
@@ -498,7 +808,7 @@ function Invoke-PdvMonitorTick {
           continue;
         }
         $final = Get-PdvRecoveryDecision -Profile $profile -Device $freshDevice -Context $freshContext -State $state -Now (Get-PdvRuntimeNow);
-        if ($final.Allowed) {
+        if ($final.Allowed -and -not [bool](Get-PdvRuntimeValue $Session 'RemoteBusy' $false)) {
           Write-PdvMonitorRecord $Session 'RecoveryAttempt' 'Solicitando ao Windows o reinício da instância exata; caixa em manutenção autorizada.' $freshDevice $profile.Role $final.Reason;
           $state.LastAttemptAt = Get-PdvRuntimeNow; $state.Attempts += $state.LastAttemptAt; $state.SessionAttempts++;
           Save-PdvMonitorRecoveryHistory $Session;
@@ -511,8 +821,23 @@ function Invoke-PdvMonitorTick {
       }
     }
     if ($null -eq $Session.LastHeartbeatAt -or ($now - $Session.LastHeartbeatAt).TotalSeconds -ge 60) {
-      Write-PdvMonitorRecord $Session 'Heartbeat' ('Monitor ativo; modo=' + $snapshot.InventoryMode + '; inventário completo=' + $snapshot.InventoryComplete + '; presença completa=' + $snapshot.PresenceComplete + '; dispositivos=' + @($snapshot.Devices).Count + '; recuperação armada=' + $Session.MaintenanceArmed + '; eventos sem fila central=' + $Session.OutboxGapCount);
+      Write-PdvMonitorRecord $Session 'Heartbeat' ('Monitor ativo; modo=' + $snapshot.InventoryMode + '; inventário completo=' + $snapshot.InventoryComplete + '; presença completa=' + $snapshot.PresenceComplete + '; dispositivos=' + @($snapshot.Devices).Count + '; recuperação armada=' + $Session.MaintenanceArmed + '; versão=' + $Session.MonitorVersion + '; eventos sem fila central=' + $Session.OutboxGapCount);
       $Session.LastHeartbeatAt = $now; Remove-PdvMonitorOldLogs $Session;
+    }
+    if ($Session.ProgramDirectory) {
+      Publish-PdvMonitorUpdateResult $Session;
+      if (-not [bool](Get-PdvRuntimeValue $Session 'RemoteBusy' $false) -and $Session.AutoUpdateEnabled -and $now -ge $Session.NextUpdateCheckAt -and ($null -eq $Session.NerusAutomation -or $null -eq $Session.NerusAutomation.Pending) -and -not $Session.MaintenanceArmed) {
+        $Session.NextUpdateCheckAt=$now.AddHours(6);
+        $update=Invoke-PdvMonitorUpdateCheck -Session $Session -ProgramDirectory $Session.ProgramDirectory -CurrentVersion $Session.MonitorVersion -Enabled $true;
+        $Session.UpdateStatus=[string]$update.Reason; $Session.UpdateStaged=[bool]$update.Staged;
+        if (-not $update.Success) { $Session.NextUpdateCheckAt=$now.AddMinutes(15); }
+        if ($Session.LastUpdateReason -cne [string]$update.Reason) {
+          if ($update.Staged) { Write-PdvMonitorRecord $Session 'UpdateStaged' ('Versão '+$update.Version+' aprovada e verificada. Aguardando o monitor ficar livre para reiniciar somente sua própria coleta.') -Reason $update.Reason; }
+          elseif (-not $update.Success) { Write-PdvMonitorRecord $Session 'UpdateFailed' ('Atualização não aplicada; motivo='+$update.Reason+'. Versão atual continua em uso.') -Reason $update.Reason; }
+          $Session.LastUpdateReason=[string]$update.Reason;
+        }
+      }
+      [void](Write-PdvMonitorUpdateHealth -Session $Session -ProgramDirectory $Session.ProgramDirectory -TickHealthy ($Session.LoggingHealthy -and $complete));
     }
     $Session.LastTickAt = Get-PdvRuntimeNow;
     $Session.StatusText = 'Coletando | última consulta ' + (Get-Date -Format 'HH:mm:ss') + ' | ' + $snapshot.InventoryMode;
@@ -546,12 +871,138 @@ function Invoke-PdvMonitorTick {
       # o contador depois dela impede um ciclo de alertas causado pelo alerta.
       $Session.LastLoggedOutboxGapCount = $Session.OutboxGapCount;
     }
+    if($Session.ProgramDirectory){Publish-PdvMonitorSoftwareUpload $Session;}
   } catch {
     $Session.LoggingHealthy = $false;
     $Session.MaintenanceArmed = $false; $Session.Config.AutoRecoveryEnabled = $false;
     $Session.StatusText = 'Coleta com falha; recuperação desarmada. ' + $_.Exception.Message;
     try { Write-PdvMonitorRecord $Session 'CollectionWarning' $Session.StatusText; } catch { }
   } finally { $Session.TickBusy = $false; }
+}
+
+function Get-PdvRuntimeNerusServiceNames {
+  param($Session);
+  $state=Get-PdvRuntimeValue $Session 'NerusService' $null;
+  $binding=Get-PdvRuntimeValue $state 'Binding' $null;
+  $names=@();
+  foreach ($key in @('ServiceName','DisplayName')) {
+    $value=[string](Get-PdvRuntimeValue $binding $key '');
+    if ($value -and $value.Length -le 256 -and $value.Trim() -ceq $value -and $value -notmatch '[\x00-\x1f\x7f]' -and -not ($value.Contains('"') -and $value.Contains("'")) -and $names -notcontains $value) { $names+=@($value); }
+  }
+  return $names;
+}
+
+function Publish-PdvMonitorNerusServiceNotices {
+  param($Session);
+  $state=Get-PdvRuntimeValue $Session 'NerusService' $null;
+  $events=$null; if($null -ne $state){$events=$state.Events;}
+  if ($null -eq $events) { return; }
+  while ($events.Count) {
+    $notice=$events.Peek();
+    Write-PdvMonitorRecord $Session ([string]$notice.Kind) ([string]$notice.Detail) -Role 'Serviço Nerus' -Reason ([string]$notice.Reason);
+    [void]$events.Dequeue();
+  }
+}
+
+function Update-PdvMonitorNerusServiceDiagnostic {
+  param($Session, [DateTimeOffset]$Now);
+  try {
+    $discovery=Get-PdvMonitorNerusServiceDiscovery -Session $Session;
+    $items=@(); $processItems=@(); $seen=@{};
+    $summary=@{schemaVersion=1;scope='discovery';complete=[bool](Get-PdvRuntimeValue $discovery 'Complete' $false);reason=(ConvertTo-PdvProtocolText (Get-PdvRuntimeValue $discovery 'Reason' '') 96);};
+    $summaryJson=ConvertTo-PdvHardwareJson $summary;
+    if ($Session.NerusServiceSignatures['discovery'] -cne $summaryJson) {
+      $kind='ServiceDiagnostic';
+      if (-not $summary.complete -and $null -ne $Session.NerusService.Binding) { $kind='CollectionWarning'; }
+      Write-PdvMonitorRecord $Session $kind $summaryJson -Role 'Serviço Nerus' -Reason 'NerusServiceDiscovery';
+      $Session.NerusServiceSignatures['discovery']=$summaryJson;
+    }
+    $candidates=@(Get-PdvRuntimeValue $discovery 'Candidates' @());
+    foreach ($candidate in @($candidates | Select-Object -First 16)) {
+      $name=ConvertTo-PdvProtocolText (Get-PdvRuntimeValue $candidate 'ServiceName' '') 128;
+      if (-not $name) { continue; }
+      $modules=@();
+      foreach ($entry in @(Get-PdvRuntimeValue $candidate 'PrintModules' @()) | Select-Object -First 8) {
+        $modules+=@(@{name=(ConvertTo-PdvProtocolText (Get-PdvRuntimeValue $entry 'Name' '') 64);version=(ConvertTo-PdvProtocolText (Get-PdvRuntimeValue $entry 'Version' '') 48);});
+      }
+      $item=@{schemaVersion=1;scope='service';serviceName=$name;displayName=(ConvertTo-PdvProtocolText (Get-PdvRuntimeValue $candidate 'DisplayName' '') 128);state=(ConvertTo-PdvProtocolText (Get-PdvRuntimeValue $candidate 'State' '') 32);serviceType=(ConvertTo-PdvProtocolText (Get-PdvRuntimeValue $candidate 'ServiceType' '') 40);processId=(ConvertTo-PdvProtocolText (Get-PdvRuntimeValue $candidate 'ProcessId' '') 20);eligible=[bool](Get-PdvRuntimeValue $candidate 'Eligible' $false);reason=(ConvertTo-PdvProtocolText (Get-PdvRuntimeValue $candidate 'Reason' '') 96);executablePath=(ConvertTo-PdvProtocolText (Get-PdvRuntimeValue $candidate 'ExecutablePath' '') 256);modulesComplete=[bool](Get-PdvRuntimeValue $candidate 'ModulesComplete' $false);tefModuleObserved=[bool](Get-PdvRuntimeValue $candidate 'TefModuleObserved' $false);modules=$modules;};
+      $json=ConvertTo-PdvHardwareJson $item;
+      # Nunca enviar JSON recortado pelo normalizador do protocolo.
+      if ($json.Length -gt 1900) { $item.modules=@(); $item.modulesOmitted=$true; $item.executablePath=''; $json=ConvertTo-PdvHardwareJson $item; }
+      if ($json.Length -gt 1900) { throw 'NerusServiceDiagnosticTooLarge'; }
+      $items+=@($item); $seen[$name]=$true;
+      if ($Session.NerusServiceSignatures[$name] -cne $json) {
+        $kind='ServiceDiagnostic';
+        if ($null -ne $Session.NerusService.Binding -and [string]$Session.NerusService.Binding.ServiceName -ceq $name -and $item.state -cne 'Running') { $kind='CollectionWarning'; }
+        Write-PdvMonitorRecord $Session $kind $json -Role 'Serviço Nerus' -Reason 'NerusServiceState';
+        $Session.NerusServiceSignatures[$name]=$json;
+      }
+    }
+    foreach ($process in @(Get-PdvRuntimeValue $discovery 'Processes' @()) | Select-Object -First 16) {
+      $processName=ConvertTo-PdvProtocolText (Get-PdvRuntimeValue $process 'ProcessName' '') 128;
+      if(-not $processName){continue;}
+      $processItem=@{schemaVersion=1;scope='process';processName=$processName;processId=(ConvertTo-PdvProtocolText (Get-PdvRuntimeValue $process 'ProcessId' '') 20);isWindowsService=[bool](Get-PdvRuntimeValue $process 'IsWindowsService' $false);diagnosis=(ConvertTo-PdvProtocolText (Get-PdvRuntimeValue $process 'Diagnosis' '') 96);};
+      $key='process|'+$processItem.processId+'|'+$processName; $seen[$key]=$true; $processItems+=@($processItem);
+      $json=ConvertTo-PdvHardwareJson $processItem;
+      if($Session.NerusServiceSignatures[$key] -cne $json){Write-PdvMonitorRecord $Session 'ServiceDiagnostic' $json -Role 'Serviço Nerus' -Reason 'NerusServiceProcess';$Session.NerusServiceSignatures[$key]=$json;}
+    }
+    # Consulta incompleta não comprova remoção de um serviço.
+    if ($summary.complete) {
+      foreach ($oldName in @($Session.NerusServiceSignatures.Keys)) {
+        if ($oldName -ceq 'discovery' -or $seen.ContainsKey($oldName)) { continue; }
+        $detail='Componente anteriormente observado não foi localizado nesta consulta: '+(ConvertTo-PdvProtocolText $oldName 128)+'. Nenhuma recuperação foi executada.';
+        Write-PdvMonitorRecord $Session 'ServiceDiagnostic' $detail -Role 'Serviço Nerus' -Reason 'NerusServiceNotObserved';
+        [void]$Session.NerusServiceSignatures.Remove($oldName);
+      }
+    }
+    $document=@{schemaVersion=1;collectedAt=$Now.ToString('o');complete=$summary.complete;reason=$summary.reason;services=$items;processes=$processItems;};
+    Write-PdvRuntimeAtomic (Join-Path $Session.DataDirectory 'nerus-servico-diagnostico.json') (ConvertTo-PdvHardwareJson $document);
+    $Session.NerusService.DiagnosticFailure='';
+    $Session.LastNerusServiceAt=$Now;
+    Publish-PdvMonitorNerusServiceNotices $Session;
+  } catch {
+    $signature='NerusServiceDiagnosticUnavailable';
+    if ((Get-PdvRuntimeValue $Session.NerusService 'DiagnosticFailure' '') -cne $signature) {
+      Write-PdvMonitorRecord $Session 'CollectionWarning' 'Não foi possível concluir o diagnóstico do Nerus Service. O último vínculo e os demais registros foram preservados; nenhuma ação no serviço foi executada.' -Role 'Serviço Nerus' -Reason $signature;
+      $Session.NerusService.DiagnosticFailure=$signature;
+    }
+    $Session.LastNerusServiceAt=$Now;
+  }
+}
+
+function Get-PdvMonitorNerusServiceDiscovery {
+  [CmdletBinding()]param($Session);
+  $value=& $script:nerusModule {param($CurrentSession); Get-PdvMonitorNerusServiceDiscovery -Session $CurrentSession;} $Session;
+  return $value;
+}
+
+function Save-PdvMonitorNerusServiceBinding {
+  [CmdletBinding()]param($Session,[string]$ServiceName,[string[]]$BlockingProcessNames=@());
+  $names=@();
+  foreach ($name in @($BlockingProcessNames)) {
+    if ($name -notmatch '^[A-Za-z0-9_.-]{1,80}$' -or $name -match '\.exe$') { throw 'Use nomes exatos de processos, sem caminho, .exe ou curingas.'; }
+    if ($names -notcontains $name) { $names+=@($name); }
+  }
+  if ($names.Count -gt 16) { throw 'Informe no máximo 16 processos bloqueadores.'; }
+  $old=$Session.Config.BlockingProcessNames; $Session.Config.BlockingProcessNames=$names;
+  try { Save-PdvRuntimeConfig $Session; }
+  catch { $Session.Config.BlockingProcessNames=$old; throw 'Não foi possível salvar os processos que bloqueiam a recuperação.'; }
+  try { & $script:nerusModule {param($CurrentSession,$Name); Save-PdvMonitorNerusServiceBinding -Session $CurrentSession -ServiceName $Name;} $Session $ServiceName; }
+  finally { Publish-PdvMonitorNerusServiceNotices $Session; }
+}
+
+function Invoke-PdvMonitorNerusServiceProbe {
+  [CmdletBinding()]param($Session);
+  if ([bool](Get-PdvRuntimeValue $Session 'RemoteBusy' $false)) { throw 'RemoteSupportBusy'; }
+  try { & $script:nerusModule {param($CurrentSession); Invoke-PdvMonitorNerusServiceProbe -Session $CurrentSession;} $Session; }
+  finally { Publish-PdvMonitorNerusServiceNotices $Session; }
+}
+
+function Invoke-PdvMonitorNerusServiceApply {
+  [CmdletBinding()]param($Session,[string]$ProposalId);
+  if ([bool](Get-PdvRuntimeValue $Session 'RemoteBusy' $false)) { throw 'RemoteSupportBusy'; }
+  try { & $script:nerusModule {param($CurrentSession,$Id); Invoke-PdvMonitorNerusServiceApply -Session $CurrentSession -ProposalId $Id;} $Session $ProposalId; }
+  finally { Publish-PdvMonitorNerusServiceNotices $Session; }
 }
 
 function Export-PdvMonitorLogs {
@@ -561,12 +1012,28 @@ function Export-PdvMonitorLogs {
   $destination = Join-Path $DestinationDirectory ('PDV-diagnostico-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N').Substring(0, 6));
   [void][IO.Directory]::CreateDirectory($destination);
   foreach ($file in @(Get-ChildItem -LiteralPath $Session.LogDirectory -Filter 'monitor-*.csv' | Where-Object { -not $_.PSIsContainer })) { [IO.File]::Copy($file.FullName, (Join-Path $destination $file.Name)); }
-  foreach ($name in @('monitor.xml', 'central.xml', 'cursores.xml', 'recuperacoes.xml', 'status.txt')) {
+  foreach ($name in @('monitor.xml', 'central.xml', 'cursores.xml', 'recuperacoes.xml', 'status.txt', 'inventario-hardware.json','inventario-hardware-parcial.json', 'inventario-estado.xml', 'nerus-servico.xml', 'nerus-servico-tentativas.xml', 'nerus-servico-diagnostico.json','inventario-software.json','inventario-software-completo.json')) {
     $path = Join-Path $Session.DataDirectory $name;
     if ([IO.File]::Exists($path)) { [IO.File]::Copy($path, (Join-Path $destination $name)); }
   }
-  [IO.File]::WriteAllText((Join-Path $destination 'LEIA-ME.txt'), 'Diagnóstico local do monitor. Contém identificadores de hardware, loja/caixa e metadados de eventos. Não contém a chave de envio, dados de pagamento nem mensagens completas dos eventos do Windows. Datas incluem o fuso do computador; o relógio local pode estar incorreto. Logs locais têm retenção de 30 dias e limite total de 100 MB. O monitor não lê a configuração do Nerus nem executa pagamentos de teste.', [Text.Encoding]::UTF8);
+  [IO.File]::WriteAllText((Join-Path $destination 'LEIA-ME.txt'), 'Diagnóstico local do monitor. Contém identificadores de hardware, loja/caixa e metadados de eventos. Não contém a chave de envio, dados de pagamento nem mensagens completas dos eventos do Windows. Datas incluem o fuso do computador; o relógio local pode estar incorreto. Logs locais têm retenção de 30 dias e limite total de 100 MB. A integração autorizada consulta e ajusta somente o fiscalDevice da impressora pela API; não executa pagamentos de teste.', [Text.Encoding]::UTF8);
   return $destination;
+}
+
+function Invoke-PdvMonitorNerusRestartProbe {
+  [CmdletBinding()]
+  param($Session);
+  if ([bool](Get-PdvRuntimeValue $Session 'RemoteBusy' $false)) { return; }
+  if ([bool](Get-PdvRuntimeValue (Get-PdvRuntimeValue $Session 'NerusService' $null) 'Busy' $false)) { return; }
+  & $script:nerusModule { param($CurrentSession); Invoke-PdvMonitorNerusRestartProbe -Session $CurrentSession; } $Session;
+}
+
+function Invoke-PdvMonitorNerusRestartApply {
+  [CmdletBinding()]
+  param($Session, [string]$ProposalId);
+  if ([bool](Get-PdvRuntimeValue $Session 'RemoteBusy' $false)) { return; }
+  if ([bool](Get-PdvRuntimeValue (Get-PdvRuntimeValue $Session 'NerusService' $null) 'Busy' $false)) { return; }
+  & $script:nerusModule { param($CurrentSession, $Id); Invoke-PdvMonitorNerusRestartApply -Session $CurrentSession -ProposalId $Id; } $Session $ProposalId;
 }
 
 function Stop-PdvMonitorSession {
@@ -578,4 +1045,4 @@ function Stop-PdvMonitorSession {
   finally { $Session.Stopped = $true; }
 }
 
-Export-ModuleMember -Function Start-PdvMonitorSession, Invoke-PdvMonitorTick, Stop-PdvMonitorSession, Export-PdvMonitorLogs, Set-PdvMonitorMaintenance, Save-PdvMonitorProfiles, Set-PdvMonitorCentral;
+Export-ModuleMember -Function Start-PdvMonitorSession, Invoke-PdvMonitorTick, Stop-PdvMonitorSession, Export-PdvMonitorLogs, Set-PdvMonitorMaintenance, Save-PdvMonitorProfiles, Set-PdvMonitorCentral, Invoke-PdvMonitorNerusRestartProbe, Invoke-PdvMonitorNerusRestartApply, Get-PdvMonitorNerusServiceDiscovery, Save-PdvMonitorNerusServiceBinding, Invoke-PdvMonitorNerusServiceProbe, Invoke-PdvMonitorNerusServiceApply;

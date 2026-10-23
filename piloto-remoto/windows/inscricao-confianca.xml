@@ -1,0 +1,2 @@
+﻿<?xml version='1.0' encoding='utf-8'?>
+<PdvRemoteEnrollmentTrust schemaVersion="1"><ApiEnrollmentUrl>https://nxstore.shop/api/pdv-monitor/remote-enrollment</ApiEnrollmentUrl><GatewayHost>nxstore.shop</GatewayHost><GatewayPort>5443</GatewayPort><ServerCaFile>identity-server-ca.crt</ServerCaFile><ServerCaSha256>7825c224b4e80161b2581572803f418819af2bb5206249e70f6d8c67b5daec9d</ServerCaSha256><DeviceCaFile>identity-device-ca.crt</DeviceCaFile><DeviceCaSha256>6ae22e349374fc6c9689fbedaebd100c37d0b2fa4c4136a48c91afcdc6d6fe33</DeviceCaSha256></PdvRemoteEnrollmentTrust>

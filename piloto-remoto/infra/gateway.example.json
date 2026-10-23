@@ -1,0 +1,53 @@
+{
+  "enabled": false,
+  "hostname": "remote-gateway",
+  "viewerHost": "172.30.249.2",
+  "viewerIps": [
+    "172.30.249.3"
+  ],
+  "portRange": [
+    24000,
+    24255
+  ],
+  "maxLeases": 4,
+  "controlClientSha256": "SUBSTITUIR_PELO_SHA256_DO_CERTIFICADO_CLIENTE_DA_API",
+  "listen": {
+    "controlHost": "0.0.0.0",
+    "controlPort": 9444,
+    "deviceHost": "0.0.0.0",
+    "devicePort": 5443,
+    "browserHost": "0.0.0.0",
+    "browserPort": 8443
+  },
+  "web": {
+    "enabled": false,
+    "publicOrigin": "https://suporte.exemplo.invalid",
+    "conectaOrigin": "https://conecta.exemplo.invalid",
+    "guacamoleUrl": "http://guacamole:8080/guacamole/",
+    "allowPrivateHttp": true,
+    "commonJsSha256": "SUBSTITUIR_SHA256_DO_BUNDLE_COMMON_JS_DA_IMAGEM_GUACAMOLE_HOMOLOGADA"
+  },
+  "files": {
+    "journal": "/var/lib/pdv-remote/leases.json",
+    "bindings": "/run/pdv/bindings.json",
+    "devicePasswords": "/run/pdv/device-passwords.json",
+    "serverKey": "/run/pdv/server.key",
+    "serverCert": "/run/pdv/server.crt",
+    "controlCa": "/run/pdv/control-ca.crt",
+    "deviceCa": "/run/pdv/device-ca.crt",
+    "guacamoleJsonKey": "/run/pdv/guacamole-json.key",
+    "viewerServerKey": "/run/pdv/viewer-server.key",
+    "viewerServerCert": "/run/pdv/viewer-server.crt"
+  },
+  "enrollment": {
+    "enabled": false,
+    "journal": "/var/lib/pdv-remote/device-enrollment.json",
+    "issuer": {
+      "enabled": false,
+      "openssl": "/usr/bin/openssl",
+      "caCertificateFile": "/run/pdv/device-issuing-ca.crt",
+      "caPrivateKeyFile": "/run/pdv/device-issuing-ca.key",
+      "validityDays": 90
+    }
+  }
+}

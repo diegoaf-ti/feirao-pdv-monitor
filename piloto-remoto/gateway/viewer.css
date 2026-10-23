@@ -1,0 +1,9 @@
+:root { color-scheme: light; font-family: system-ui, sans-serif; background: #f1f4f8; color: #17273b; }
+body { margin: 0; }
+header { display: flex; flex-wrap: wrap; gap: 1rem; align-items: center; padding: 1rem 1.25rem; background: #075da3; color: #fff; }
+header strong { margin-right: auto; }
+button { padding: .65rem 1rem; border: 1px solid #fff; border-radius: .4rem; color: #fff; background: #a61c2a; font: inherit; cursor: pointer; }
+button:focus-visible, #display:focus-visible { outline: 3px solid #ffce3b; outline-offset: 3px; }
+main { padding: 1rem; }
+#message { margin: 0 0 1rem; }
+#display { display: inline-block; position: relative; isolation: isolate; max-width: 100%; overflow: auto; background: #111; }

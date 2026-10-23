@@ -9,6 +9,7 @@ Add-Type -AssemblyName System.Windows.Forms;
 Add-Type -AssemblyName System.Drawing;
 [System.Windows.Forms.Application]::EnableVisualStyles();
 Import-Module $script:runtimePath -Force;
+Import-Module (Join-Path $script:programDirectory 'PdvMonitor.Atualizacao.psm1');
 
 function Show-PdvMonitorMessage {
   param([string]$Message, [string]$Title = 'Monitor do PDV');
@@ -57,6 +58,34 @@ function New-PdvMonitorList {
   return $list;
 }
 
+function Get-PdvMonitorRemoteStatusText {
+  param($Controller);
+  if($null -eq $Controller){return 'Suporte remoto: aguardando preparação administrativa.';}
+  $reason=[string]$Controller.Reason;
+  if(-not $Controller.Enabled){
+    switch($reason){
+      'RemoteDisabled'{return 'Suporte remoto: desativado; aguarda configuração administrativa.';}
+      'RemoteExtensionNotInstalled'{return 'Suporte remoto: aguardando instalação da extensão administrativa.';}
+      'RemotePrerequisitesMissing'{return 'Suporte remoto: pré-requisitos do Windows ou .NET ausentes.';}
+      'RemoteExtensionUntrusted'{return 'Suporte remoto: bloqueado; conferir a instalação e as permissões da extensão.';}
+      'RemoteCentralConfigurationRequired'{return 'Suporte remoto: aguarda vínculo válido com a central.';}
+      default{return 'Suporte remoto: preparação pendente; conferir o perfil administrativo e os pré-requisitos.';}
+    }
+  }
+  if($null -ne $Controller.Broker){
+    switch([string]$Controller.Broker.Stage){
+      'requested'{return 'Suporte remoto: aguardando confirmação neste caixa.';}
+      'consent_approved'{return 'Suporte remoto: confirmando autorização com a central.';}
+      'authorized'{return 'Suporte remoto: autorizado; conexão supervisionada pela central.';}
+      'close_required'{return 'Suporte remoto: encerrando e confirmando a parada.';}
+      'interrupted'{return 'Suporte remoto: verificação de sessão anterior pendente.';}
+      'blocked'{return 'Suporte remoto: bloqueado; conferir o estado local antes de um novo acesso.';}
+    }
+  }
+  if($Controller.Paused){return 'Suporte remoto: novos pedidos suspensos neste caixa.';}
+  return 'Suporte remoto: preparado; cada acesso exige confirmação do operador.';
+}
+
 function Update-PdvMonitorView {
   $selectedId = '';
   if ($deviceList.SelectedItems.Count -eq 1) { $selectedId = $deviceList.SelectedItems[0].Tag.InstanceId; }
@@ -95,18 +124,33 @@ function Update-PdvMonitorView {
   if ($script:session.LastTickAt) { $statusLabel.Text += ' | Coleta: ' + [string]$script:session.LastTickAt; }
   $warnings = @($script:session.Snapshot.Warnings | Where-Object { $_ });
   if ($script:wmiWarning) { $warnings += $script:wmiWarning; }
+  if (@($script:session.Config.Profiles).Count -eq 0) { $warnings += 'Para receber alertas de COM: selecione o pinpad e a impressora corretos, confirme a COM esperada e use Salvar vínculo. O inventário da máquina funciona sem vínculos.'; }
   $warningLabel.Text = $warnings -join ' | ';
   if (-not $warningLabel.Text) { $warningLabel.Text = 'Presença no Windows não comprova comunicação com o Nérus. O monitor não abre a porta COM nem lê dados de pagamentos.'; }
-  $dataLabel.Text = 'Logs e configuração: ' + $script:dataDirectory + [Environment]::NewLine + 'Envio central: ' + [string]$script:session.UploadStatusText;
+  $dataLabel.Text = 'Logs e configuração: ' + $script:dataDirectory + [Environment]::NewLine + 'Envio central: ' + [string]$script:session.UploadStatusText + ' | ' + [string]$script:session.HardwareStatus + ' | ' + [string]$script:session.SoftwareStatus + ' | Versão ' + $script:session.MonitorVersion;
+  $dataLabel.Text += [Environment]::NewLine + (Get-PdvMonitorRemoteStatusText $script:remoteController);
+}
+
+function Test-PdvMonitorNerusServiceBusy {
+  if ($null -ne $script:serviceWorker) { return $true; }
+  if ($null -eq $script:session -or $null -eq $script:session.PSObject.Properties['NerusService'] -or $null -eq $script:session.NerusService) { return $false; }
+  return [bool]$script:session.NerusService.Busy;
 }
 
 function Set-PdvMonitorControls {
   param([bool]$Enabled);
-  foreach ($control in @($refreshButton, $bindButton, $removeButton, $roleBox, $portBox, $recoveryBox, $processBox, $armButton, $disarmButton, $exportButton, $installButton, $centralButton)) {
+  foreach ($control in @($refreshButton, $nerusRestartButton, $nerusServiceButton, $bindButton, $removeButton, $roleBox, $portBox, $recoveryBox, $processBox, $armButton, $disarmButton, $exportButton, $installButton, $centralButton)) {
     $control.Enabled = $Enabled;
   }
   $script:exportMenu.Enabled = $Enabled;
+  if ($null -ne $script:session -and $null -ne $script:session.PSObject.Properties['RemoteBusy'] -and $script:session.RemoteBusy) {
+    foreach ($control in @($nerusRestartButton,$nerusServiceButton,$armButton,$centralButton,$bindButton,$removeButton,$installButton)) { $control.Enabled=$false; }
+  }
+  $restartBusy = (($null -ne $script:session -and $null -ne $script:session.NerusRestart -and $script:session.NerusRestart.Busy) -or (Test-PdvMonitorNerusServiceBusy));
+  $exitButton.Enabled = -not $restartBusy;
+  $exitMenu.Enabled = -not $restartBusy;
 }
+
 
 function Show-PdvMonitorCentralConfiguration {
   $dialog = New-Object System.Windows.Forms.Form;
@@ -176,7 +220,7 @@ function Receive-PdvMonitorDeviceSignals {
 }
 
 function Start-PdvMonitorTickWorker {
-  if ($null -ne $script:worker -or $script:closing) { return; }
+  if ($null -ne $script:worker -or $null -ne $script:nerusWorker -or $script:closing -or $script:session.NerusRestart.Busy -or (Test-PdvMonitorNerusServiceBusy)) { return; }
   Set-PdvMonitorControls $false;
   $statusLabel.Text = 'Consultando dispositivos e gravando o diagnóstico...';
   $script:worker = [System.Management.Automation.PowerShell]::Create();
@@ -204,11 +248,262 @@ function Complete-PdvMonitorTickWorker {
   if ($failure) { $statusLabel.Text = 'Falha na coleta; nova tentativa em 15 segundos: ' + $failure; }
   $script:nextTickAt = (Get-Date).AddSeconds(15);
   Set-PdvMonitorControls (-not $script:closing);
+  if (-not $script:closing -and -not $failure -and $script:session.UpdateStaged -and $script:session.AutoUpdateEnabled) {
+    $idle=(-not $script:session.MaintenanceArmed -and ($null -eq $script:session.NerusAutomation -or $null -eq $script:session.NerusAutomation.Pending));
+    if ($null -ne $script:session.PSObject.Properties['NerusRestart'] -and $null -ne $script:session.NerusRestart -and $script:session.NerusRestart.Busy) { $idle=$false; }
+    if (Test-PdvMonitorNerusServiceBusy) { $idle=$false; }
+    if ($null -ne $script:session.PSObject.Properties['RemoteBusy'] -and $script:session.RemoteBusy) { $idle=$false; }
+    $apply=Start-PdvMonitorUpdateApply -Session $script:session -ProgramDirectory $script:programDirectory -Enabled $script:session.AutoUpdateEnabled -OperationsIdle $idle;
+    $script:session.UpdateStatus=$apply.Reason;
+    if ($apply.Started) { $script:closing=$true; }
+  }
   if ($script:closing) { $form.Close(); }
 }
 
+function Get-PdvMonitorNerusRestartPrompt {
+  param($Proposal);
+  $terminal = [string]$Proposal.Terminal; $port = [string]$Proposal.ActualPort;
+  $before = [string]$Proposal.BeforeValue; $after = [string]$Proposal.AfterValue;
+  if ($terminal -notmatch '^[A-Za-z0-9_-]{1,8}$' -or $port -notmatch '^COM[1-9][0-9]{0,3}$' -or $before -notmatch '^[0-9]{1,4}$' -or $after -notmatch '^[0-9]{1,4}$') { throw 'InvalidRestartProposal'; }
+  return ('Caixa: ' + $terminal + '. Impressora identificada no Windows em ' + $port + '. Parâmetro do Nerus: ' + $before + ' → ' + $after + ".`r`n`r`nAntes de continuar, finalize ou cancele qualquer venda e pagamento, e aguarde terminar as impressões. O monitor não identifica uma venda ativa.`r`n`r`nAo escolher Sim, você confirma que não há venda nem pagamento em andamento e autoriza fechar o Nerus normalmente, corrigir a porta e reabri-lo pelo atalho Nerus da Área de Trabalho. Se o Nerus pedir alguma confirmação, responda no próprio Nerus; o monitor não responderá por você.`r`n`r`nA impressão precisará ser testada depois. Deseja fazer esta tentativa agora?");
+}
+
+function Confirm-PdvMonitorNerusRestart {
+  param($Proposal);
+  $message = Get-PdvMonitorNerusRestartPrompt -Proposal $Proposal;
+  return ([System.Windows.Forms.MessageBox]::Show($form, $message, 'Corrigir e reabrir Nerus', 'YesNo', 'Warning', 'Button2') -eq 'Yes');
+}
+
+function Start-PdvMonitorNerusRestartWorker {
+  param([string]$Mode = 'Check', [string]$ProposalId = '');
+  if ($Mode -ne 'Check' -and $Mode -ne 'Apply') { return; }
+  if ($script:closing -or $null -ne $script:worker -or $null -ne $script:nerusWorker -or $script:session.TickBusy -or (Test-PdvMonitorNerusServiceBusy)) { return; }
+  if ($null -ne $script:session.PSObject.Properties['RemoteBusy'] -and $script:session.RemoteBusy) { return; }
+  $state = $script:session.NerusRestart;
+  if ($Mode -eq 'Check' -and $state.Busy) { return; }
+  if ($Mode -eq 'Apply' -and ($null -eq $state.Proposal -or [string]$state.Proposal.Id -cne $ProposalId)) { return; }
+  $state.Busy = $true; $state.Result = ''; $state.Reason = '';
+  if ($Mode -eq 'Check') { $state.Stage = 'Checking'; $state.Proposal = $null; $statusLabel.Text = 'Conferindo a impressora, a porta do Nerus e o atalho da Área de Trabalho...'; }
+  else { $state.Stage = 'Applying'; $statusLabel.Text = 'Tentativa autorizada: aguardando o Nerus fechar e reabrir. Não inicie venda ou pagamento...'; }
+  Set-PdvMonitorControls $false;
+  $script:nerusWorkerMode = $Mode;
+  try {
+    $script:nerusWorker = [System.Management.Automation.PowerShell]::Create();
+    [void]$script:nerusWorker.AddScript('param($runtimePath, $session, $mode, $proposalId) $ErrorActionPreference = "Stop"; Import-Module $runtimePath -Force; if ($mode -eq "Check") { [void](Invoke-PdvMonitorNerusRestartProbe -Session $session); } else { [void](Invoke-PdvMonitorNerusRestartApply -Session $session -ProposalId $proposalId); }');
+    [void]$script:nerusWorker.AddArgument($script:runtimePath);
+    [void]$script:nerusWorker.AddArgument($script:session);
+    [void]$script:nerusWorker.AddArgument($Mode);
+    [void]$script:nerusWorker.AddArgument($ProposalId);
+    $script:nerusWorkerResult = $script:nerusWorker.BeginInvoke();
+  } catch {
+    if ($null -ne $script:nerusWorker) { $script:nerusWorker.Dispose(); }
+    $script:nerusWorker = $null; $script:nerusWorkerResult = $null; $script:nerusWorkerMode = '';
+    $state.Busy = $false; $state.Stage = 'Failed'; $state.Proposal = $null; $state.Reason = 'WorkerStartFailed';
+    $state.Result = 'Não foi possível iniciar a tentativa. Confira se o Nerus está aberto antes de retomar o atendimento e consulte o suporte.';
+    Set-PdvMonitorControls $true; Update-PdvMonitorView;
+    Show-PdvMonitorMessage $state.Result 'Tentativa de correção do Nerus';
+  }
+}
+
+function Complete-PdvMonitorNerusRestartWorker {
+  if ($null -eq $script:nerusWorker -or -not $script:nerusWorkerResult.IsCompleted) { return; }
+  $failed = $false; $mode = $script:nerusWorkerMode;
+  try {
+    [void]$script:nerusWorker.EndInvoke($script:nerusWorkerResult);
+    if ($script:nerusWorker.Streams.Error.Count) { $failed = $true; }
+  } catch { $failed = $true; }
+  finally {
+    $script:nerusWorker.Dispose(); $script:nerusWorker = $null;
+    $script:nerusWorkerResult = $null; $script:nerusWorkerMode = '';
+  }
+  $state = $script:session.NerusRestart;
+  if ($failed) {
+    $state.Busy = $false; $state.Stage = 'Failed'; $state.Proposal = $null; $state.Reason = 'WorkerFailed';
+    $state.Result = 'A tentativa foi interrompida. Confira se o Nerus está aberto antes de retomar o atendimento e consulte o suporte. O monitor não confirmou que a impressão voltou a funcionar.';
+  } elseif ($mode -eq 'Check' -and $null -ne $state.Proposal -and -not $script:closing) {
+    $proposal = $state.Proposal;
+    if ($proposal.ExpiresAt -gt [DateTimeOffset]::Now) {
+      $state.Stage = 'AwaitingConfirmation'; $state.Busy = $true;
+      try { $confirmed = Confirm-PdvMonitorNerusRestart -Proposal $proposal; }
+      catch { $confirmed = $false; $state.Reason = 'InvalidRestartProposal'; }
+      if ($confirmed) {
+        Start-PdvMonitorNerusRestartWorker -Mode 'Apply' -ProposalId ([string]$proposal.Id);
+        return;
+      }
+      $state.Proposal = $null; $state.Busy = $false; $state.Stage = 'Idle';
+      if (-not $state.Reason) { $state.Reason = 'OperatorCancelled'; }
+      $state.Result = 'Tentativa cancelada. Nenhum pedido para fechar o Nerus ou alterar a porta foi enviado.';
+    } else {
+      $state.Proposal = $null; $state.Busy = $false; $state.Stage = 'Blocked'; $state.Reason = 'ProposalExpired';
+      $state.Result = 'A conferência expirou. Solicite uma nova tentativa; nenhum pedido para fechar o Nerus ou alterar a porta foi enviado.';
+    }
+  }
+  $state.Busy = $false;
+  $script:nextTickAt = Get-Date;
+  Set-PdvMonitorControls (-not $script:closing); Update-PdvMonitorView;
+  $message = [string]$state.Result;
+  if (-not $message) { $message = 'A tentativa terminou sem confirmação de correção. Confira o Nerus e teste a impressora antes de retomar o atendimento.'; }
+  Show-PdvMonitorMessage $message 'Tentativa de correção do Nerus';
+  if ($script:closing) { $form.Close(); }
+}
+
+function Get-PdvMonitorNerusServicePrompt {
+  param($Proposal);
+  $name=[string]$Proposal.ServiceName; $display=[string]$Proposal.DisplayName; $port=[string]$Proposal.ActualPort;
+  if ($name -notmatch '^[^\x00-\x1f\x7f-\x9f]{1,256}$' -or $display -notmatch '^[^\x00-\x1f\x7f-\x9f]{1,256}$' -or $port -notmatch '^COM[1-9][0-9]{0,3}$') { throw 'InvalidServiceProposal'; }
+  return ('Serviço: '+$display+' ('+$name+'). Impressora vinculada em '+$port+".`r`n`r`nFinalize ou cancele qualquer venda e pagamento e aguarde terminar as impressões. O monitor não identifica uma venda ativa.`r`n`r`nAo escolher Sim, você confirma que não há venda, pagamento ou impressão em andamento e autoriza uma tentativa de parar e iniciar somente este serviço. Todas as integrações atendidas por ele, inclusive o TEF se estiver no mesmo componente, ficarão temporariamente indisponíveis.`r`n`r`nA COM e o parâmetro do Nerus serão preservados. Não inicie atendimento durante a tentativa. Depois será necessário conferir a conexão no Nerus e testar a impressão.`r`n`r`nDeseja executar a tentativa agora?");
+}
+
+function Confirm-PdvMonitorNerusService {
+  param($Proposal);
+  $message=Get-PdvMonitorNerusServicePrompt $Proposal;
+  return ([System.Windows.Forms.MessageBox]::Show($form,$message,'Recuperar comunicação do Nerus Service','YesNo','Warning','Button2') -eq 'Yes');
+}
+
+function Show-PdvMonitorNerusServiceDialog {
+  $dialog=New-Object System.Windows.Forms.Form;
+  $dialog.Text='Nerus Service | Caixa Web'; $dialog.Size=New-Object System.Drawing.Size(950,520);
+  $dialog.StartPosition='CenterParent'; $dialog.Font=$form.Font; $dialog.MinimizeBox=$false;
+  $grid=New-Object System.Windows.Forms.TableLayoutPanel; $grid.Dock='Fill'; $grid.Padding=New-Object System.Windows.Forms.Padding(12); $grid.ColumnCount=1; $grid.RowCount=5;
+  foreach ($height in @(84,44,0,66,42)) { $row=New-Object System.Windows.Forms.RowStyle; if($height){$row.SizeType='Absolute';$row.Height=$height;}else{$row.SizeType='Percent';$row.Height=100;};[void]$grid.RowStyles.Add($row); }
+  $dialog.Controls.Add($grid);
+  $intro=New-Object System.Windows.Forms.Label; $intro.Dock='Fill';
+  $intro.Text="Selecione o serviço do Caixa Web e use Vincular para registrar sua identidade. O vínculo não reinicia o serviço.`r`nA recuperação exige impressora vinculada na COM esperada e confirmação de venda e pagamento encerrados. O monitor pode precisar ser aberto como administrador.`r`nA lista abaixo distingue serviço do Windows de aplicativo de bandeja; o UUID do Nerus é diferente da identidade Windows usada pelo monitor.";
+  $grid.Controls.Add($intro,0,0);
+  $bindingLabel=New-Object System.Windows.Forms.Label; $bindingLabel.Dock='Fill'; $bindingLabel.Text='Nenhum serviço vinculado.';
+  if($null -ne $script:session.NerusService.Binding){$bindingLabel.Text='Vinculado: '+$script:session.NerusService.Binding.DisplayName+' ('+$script:session.NerusService.Binding.ServiceName+').';}
+  $grid.Controls.Add($bindingLabel,0,1);
+  $list=New-PdvMonitorList @('Nome no Windows','Descrição','Estado','Recuperação','Processo','Executável') @(150,160,85,100,65,330);
+  foreach($candidate in @($script:session.NerusService.Discovery.Candidates)) {
+    if($null -eq $candidate){continue;}; $eligibility='Bloqueada';if($candidate.Eligible){$eligibility='Pode conferir';}
+    [void](Add-PdvMonitorRow $list @([string]$candidate.ServiceName,[string]$candidate.DisplayName,[string]$candidate.State,$eligibility,[string]$candidate.ProcessId,[string]$candidate.ExecutablePath) $candidate);
+  }
+  $grid.Controls.Add($list,0,2);
+  $note=New-Object System.Windows.Forms.Label; $note.Dock='Fill';
+  $note.Text='Serviços compartilhados, dependentes ativos, processos auxiliares ou identificação incompleta impedem a tentativa. Os processos bloqueadores da tela principal são salvos ao vincular. A COM divergente precisa ser resolvida antes.';
+  if(-not $list.Items.Count){$note.Text='Nenhum serviço do Windows elegível foi localizado. Se houver apenas o aplicativo Nerus na bandeja, o diagnóstico será registrado; o monitor não força seu encerramento. Use Exportar diagnóstico para o suporte.';}
+  $grid.Controls.Add($note,0,3);
+  $buttons=New-Object System.Windows.Forms.FlowLayoutPanel; $buttons.Dock='Fill';
+  $bind=New-Object System.Windows.Forms.Button; $bind.Text='Vincular selecionado';$bind.AutoSize=$true;$bind.Enabled=$false;
+  $recover=New-Object System.Windows.Forms.Button; $recover.Text='Tentar recuperar comunicação...';$recover.AutoSize=$true;$recover.Enabled=($null -ne $script:session.NerusService.Binding);
+  $cancel=New-Object System.Windows.Forms.Button; $cancel.Text='Fechar';$cancel.DialogResult='Cancel';$cancel.AutoSize=$true;
+  $buttons.Controls.AddRange([System.Windows.Forms.Control[]]@($bind,$recover,$cancel));$grid.Controls.Add($buttons,0,4);$dialog.CancelButton=$cancel;
+  $list.add_SelectedIndexChanged({$bind.Enabled=($list.SelectedItems.Count -eq 1);});
+  $bind.add_Click({if($list.SelectedItems.Count -ne 1){return;};$dialog.Tag=@{Mode='Bind';ServiceName=[string]$list.SelectedItems[0].Tag.ServiceName;};$dialog.DialogResult='OK';$dialog.Close();});
+  $recover.add_Click({$dialog.Tag=@{Mode='Check';ServiceName='';};$dialog.DialogResult='OK';$dialog.Close();});
+  try { if($dialog.ShowDialog($form) -eq 'OK'){return $dialog.Tag;} }
+  finally {$dialog.Dispose();}
+  return $null;
+}
+
+function Start-PdvMonitorNerusServiceWorker {
+  param([string]$Mode='Discover',[string]$ProposalId='',[string]$ServiceName='');
+  if(@('Discover','Bind','Check','Apply') -notcontains $Mode){return;}
+  if($null -ne $script:session.PSObject.Properties['RemoteBusy'] -and $script:session.RemoteBusy){return;}
+  if($script:closing -or $null -ne $script:worker -or $null -ne $script:nerusWorker -or $null -ne $script:serviceWorker -or $script:session.TickBusy -or $script:session.NerusRestart.Busy){return;}
+  $state=$script:session.NerusService;
+  if($Mode -ne 'Apply' -and $state.Busy){return;}
+  if($Mode -eq 'Apply' -and ($null -eq $state.Proposal -or [string]$state.Proposal.Id -cne $ProposalId)){return;}
+  $names=@();
+  if($Mode -eq 'Bind'){
+    try{$names=@(Get-PdvMonitorProcessNames $processBox.Text);}
+    catch{Show-PdvMonitorMessage 'Confira os nomes dos processos na tela principal antes de vincular o serviço.';return;}
+  }
+  $state.Busy=$true;$state.Result='';$state.Reason='';$state.Stage=$Mode;
+  $statusLabel.Text='Conferindo o Nerus Service; aguarde antes de iniciar atendimento...';
+  if($Mode -eq 'Apply'){$statusLabel.Text='Recuperação autorizada: aguardando parada e nova execução do Nerus Service. Não inicie venda ou pagamento...';}
+  Set-PdvMonitorControls $false;$script:serviceWorkerMode=$Mode;
+  try{
+    $script:serviceWorker=[System.Management.Automation.PowerShell]::Create();
+    [void]$script:serviceWorker.AddScript('param($runtimePath,$session,$mode,$proposalId,$serviceName,$processNames) $ErrorActionPreference="Stop"; Import-Module $runtimePath -Force; switch($mode){ "Discover"{$session.NerusService.Discovery=Get-PdvMonitorNerusServiceDiscovery -Session $session;} "Bind"{[void](Save-PdvMonitorNerusServiceBinding -Session $session -ServiceName $serviceName -BlockingProcessNames $processNames);} "Check"{[void](Invoke-PdvMonitorNerusServiceProbe -Session $session);} "Apply"{[void](Invoke-PdvMonitorNerusServiceApply -Session $session -ProposalId $proposalId);} }');
+    foreach($argument in @($script:runtimePath,$script:session,$Mode,$ProposalId,$ServiceName)) {[void]$script:serviceWorker.AddArgument($argument);}
+    [void]$script:serviceWorker.AddArgument($names);
+    $script:serviceWorkerResult=$script:serviceWorker.BeginInvoke();
+  }catch{
+    if($null -ne $script:serviceWorker){$script:serviceWorker.Dispose();};$script:serviceWorker=$null;$script:serviceWorkerResult=$null;$script:serviceWorkerMode='';
+    $state.Busy=$false;$state.Stage='Failed';$state.Proposal=$null;$state.Reason='NerusServiceWorkerStartFailed';
+    $state.Result='Não foi possível iniciar a conferência do serviço. Nenhuma nova tentativa será executada automaticamente; consulte o diagnóstico antes de retomar o caixa.';
+    Set-PdvMonitorControls $true;Show-PdvMonitorMessage $state.Result 'Nerus Service';
+  }
+}
+
+function Complete-PdvMonitorNerusServiceWorker {
+  if($null -eq $script:serviceWorker -or -not $script:serviceWorkerResult.IsCompleted){return;}
+  $failed=$false;$mode=$script:serviceWorkerMode;
+  try{[void]$script:serviceWorker.EndInvoke($script:serviceWorkerResult);if($script:serviceWorker.Streams.Error.Count){$failed=$true;}}
+  catch{$failed=$true;}
+  finally{$script:serviceWorker.Dispose();$script:serviceWorker=$null;$script:serviceWorkerResult=$null;$script:serviceWorkerMode='';}
+  $state=$script:session.NerusService;$state.Busy=$false;
+  if($failed){
+    $state.Stage='Failed';$state.Proposal=$null;$state.Reason='NerusServiceWorkerFailed';
+    $state.Result='A operação do Nerus Service foi interrompida. Confira se o serviço está em execução e consulte o diagnóstico antes de retomar venda ou pagamento. O monitor não confirmou a impressão e não repetirá a ação sozinho.';
+  }elseif($mode -eq 'Discover' -and -not $script:closing){
+    $state.Busy=$true;
+    try{$action=Show-PdvMonitorNerusServiceDialog;}finally{$state.Busy=$false;}
+    if($null -ne $action){Start-PdvMonitorNerusServiceWorker -Mode ([string]$action.Mode) -ServiceName ([string]$action.ServiceName);if($null -ne $script:serviceWorker){return;}}
+  }elseif($mode -eq 'Check' -and $null -ne $state.Proposal -and -not $script:closing){
+    $proposal=$state.Proposal;
+    if($proposal.ExpiresAt -gt [DateTimeOffset]::Now){
+      $state.Busy=$true;$state.Stage='AwaitingConfirmation';$confirmed=$false;
+      try{$confirmed=Confirm-PdvMonitorNerusService $proposal;}catch{$state.Reason='NerusServiceInvalidProposal';}
+      if($confirmed){Start-PdvMonitorNerusServiceWorker -Mode 'Apply' -ProposalId ([string]$proposal.Id);return;}
+      $state.Busy=$false;$state.Proposal=$null;$state.Stage='Idle';$state.Reason='NerusServiceOperatorCancelled';$state.Result='Tentativa cancelada. Nenhum pedido de parada ou início foi enviado ao serviço.';
+    }else{$state.Proposal=$null;$state.Stage='Blocked';$state.Reason='NerusServiceProposalExpired';$state.Result='A conferência expirou. Solicite outra tentativa; nenhum pedido de parada foi enviado.';}
+  }
+  $state.Busy=$false;$script:nextTickAt=Get-Date;Set-PdvMonitorControls (-not $script:closing);Update-PdvMonitorView;
+  if($mode -eq 'Bind' -and -not $failed){Show-PdvMonitorMessage 'Vínculo salvo. Nenhum serviço foi reiniciado. Abra Nerus Service novamente para conferir e autorizar uma tentativa.' 'Nerus Service';}
+  elseif($mode -ne 'Discover' -or $failed){$message=[string]$state.Result;if(-not $message){$message='Tentativa encerrada. Consulte o diagnóstico do serviço e valide a impressão no Nerus antes de retomar o atendimento.';};Show-PdvMonitorMessage $message 'Nerus Service';}
+  if($script:closing){$form.Close();}
+}
+
+function Test-PdvMonitorRemoteOperationsIdle {
+  if($script:closing -or $null -ne $script:nerusWorker -or $script:session.NerusRestart.Busy -or (Test-PdvMonitorNerusServiceBusy) -or $script:session.MaintenanceArmed -or $script:session.UpdateStaged){return $false;}
+  if($null -ne $script:session.NerusAutomation -and $null -ne $script:session.NerusAutomation.Pending){return $false;}
+  return $true;
+}
+
+function Complete-PdvMonitorRemoteWorker {
+  if($null -eq $script:remoteWorker -or -not $script:remoteWorkerResult.IsCompleted){return;}
+  $result=@{Success=$false;Reason='RemoteExchangeFailed';Status=0;Value=$null};
+  try{
+    $items=@($script:remoteWorker.EndInvoke($script:remoteWorkerResult));
+    if(-not $script:remoteWorker.Streams.Error.Count -and $items.Count -eq 1){$result=$items[0];}
+  }catch{}finally{$script:remoteWorker.Dispose();$script:remoteWorker=$null;$script:remoteWorkerResult=$null;}
+  try{[void](Complete-PdvMonitorRemoteWork -Controller $script:remoteController -Work $script:remoteWork -Result $result);}
+  catch{$script:remoteController.Reason='RemoteExchangeBlocked';}
+  finally{$script:remoteWork=$null;$result=$null;}
+}
+
+function Update-PdvMonitorRemoteHost {
+  if($null -eq $script:remoteController -or -not $script:remoteController.Enabled -or $script:remoteUiBusy){return;}
+  $script:remoteUiBusy=$true;
+  try{
+    Complete-PdvMonitorRemoteWorker;
+    $idle=Test-PdvMonitorRemoteOperationsIdle;
+    # Não abrir consentimento enquanto uma rodada anterior ainda pode atuar no Nerus.
+    if($null -ne $script:worker -and -not $script:session.RemoteBusy){return;}
+    [void](Update-PdvMonitorRemoteLocal -Controller $script:remoteController -OperationsIdle $idle -Paused $script:remotePaused -HostClosing $script:closing);
+    $remote=Get-PdvMonitorRemoteControllerSnapshot $script:remoteController;$script:session.RemoteBusy=[bool]$remote.Busy;
+    $remoteStopButton.Enabled=$remote.Busy;$remotePauseButton.Enabled=(-not $script:closing);
+    foreach($control in @($nerusRestartButton,$nerusServiceButton,$armButton,$centralButton,$bindButton,$removeButton,$installButton)){
+      $control.Enabled=(-not $remote.Busy -and $null -eq $script:worker -and $null -eq $script:nerusWorker -and -not (Test-PdvMonitorNerusServiceBusy) -and -not $script:closing);
+    }
+    if($null -ne $script:remoteWorker -or $script:closing){return;}
+    $work=Get-PdvMonitorRemoteWork -Controller $script:remoteController -OperationsIdle $idle;
+    if($null -eq $work){return;}
+    $script:remoteWork=$work;$script:remoteWorker=[System.Management.Automation.PowerShell]::Create();
+    [void]$script:remoteWorker.AddScript('param($modulePath,$session,$operation,$payload) $ErrorActionPreference="Stop"; Import-Module $modulePath -Force; Invoke-PdvMonitorRemoteExchange -Session $session -Operation $operation -Payload $payload');
+    foreach($argument in @($script:remoteModulePath,$script:session,$work.Operation,$work.Payload)){[void]$script:remoteWorker.AddArgument($argument);}
+    try{$script:remoteWorkerResult=$script:remoteWorker.BeginInvoke();}
+    catch{
+      $script:remoteWorker.Dispose();$script:remoteWorker=$null;$script:remoteWorkerResult=$null;
+      [void](Complete-PdvMonitorRemoteWork $script:remoteController $script:remoteWork @{Success=$false;Reason='RemoteExchangeFailed';Status=0;Value=$null});$script:remoteWork=$null;
+    }
+  }finally{$script:remoteUiBusy=$false;}
+}
+
 function Export-PdvMonitorFromWindow {
-  if ($null -ne $script:worker) { return; }
+  if ($null -ne $script:worker -or $null -ne $script:nerusWorker -or $script:session.NerusRestart.Busy -or (Test-PdvMonitorNerusServiceBusy)) { return; }
   $dialog = New-Object System.Windows.Forms.FolderBrowserDialog;
   $dialog.Description = 'Escolha uma pasta para receber uma cópia dos logs e do diagnóstico do monitor.';
   try {
@@ -231,25 +526,33 @@ if (-not $createdNew) {
 }
 
 $script:session = $null; $script:worker = $null; $script:workerResult = $null;
+$script:nerusWorker = $null; $script:nerusWorkerResult = $null; $script:nerusWorkerMode = '';
+$script:serviceWorker = $null; $script:serviceWorkerResult = $null; $script:serviceWorkerMode = '';
 $script:closing = $false; $script:nextTickAt = Get-Date;
+$script:remoteController=$null;$script:remoteWorker=$null;$script:remoteWorkerResult=$null;$script:remoteWork=$null;$script:remoteUiBusy=$false;$script:remotePaused=$false;
+$script:remoteModulePath=Join-Path $script:programDirectory 'PdvMonitor.Remoto.Transporte.psm1';
 $tray = $null; $timer = $null; $form = $null;
 $script:wmiSource = 'Feirao.PdvMonitor.DeviceChange.' + [guid]::NewGuid().ToString('N');
 $script:wmiSubscribed = $false; $script:wmiWarning = '';
 try {
-  $script:session = Start-PdvMonitorSession -DataDirectory $script:dataDirectory;
+  $script:session = Start-PdvMonitorSession -DataDirectory $script:dataDirectory -ProgramDirectory $script:programDirectory;
+  if([IO.File]::Exists($script:remoteModulePath)){
+    try{Import-Module $script:remoteModulePath; $script:remoteController=New-PdvMonitorRemoteController -Session $script:session -ProgramDirectory $script:programDirectory;}
+    catch{$script:remoteController=$null;}
+  }
   try {
     Register-WmiEvent -Class Win32_DeviceChangeEvent -SourceIdentifier $script:wmiSource -ErrorAction Stop | Out-Null;
     $script:wmiSubscribed = $true;
   } catch { $script:wmiWarning = 'Notificações imediatas do Windows indisponíveis; a coleta periódica continua. ' + $_.Exception.Message; }
   $form = New-Object System.Windows.Forms.Form;
-  $form.Text = 'Feirão | Monitor contínuo do PDV';
+  $form.Text = 'Feirão | Monitor do PDV ' + $script:session.MonitorVersion;
   $form.Size = New-Object System.Drawing.Size(1120, 790);
   $form.MinimumSize = New-Object System.Drawing.Size(940, 730);
   $form.StartPosition = 'CenterScreen'; $form.Font = New-Object System.Drawing.Font('Segoe UI', 9);
   $layout = New-Object System.Windows.Forms.TableLayoutPanel;
   $layout.Dock = 'Fill'; $layout.Padding = New-Object System.Windows.Forms.Padding(12);
   $layout.ColumnCount = 1; $layout.RowCount = 11;
-  foreach ($height in @(48, 40, 0, 100, 40, 34, 40, 40, 42, 40, 36)) {
+  foreach ($height in @(48, 40, 0, 100, 40, 34, 40, 40, 62, 40, 36)) {
     $style = New-Object System.Windows.Forms.RowStyle;
     if ($height -eq 0) { $style.SizeType = 'Percent'; $style.Height = 100; }
     else { $style.SizeType = 'Absolute'; $style.Height = $height; }
@@ -257,7 +560,7 @@ try {
   }
   $form.Controls.Add($layout);
   $intro = New-Object System.Windows.Forms.Label; $intro.Dock = 'Fill';
-  $intro.Text = "Coleta contínua a cada 15 segundos e histórico local. Fechar esta janela mantém o monitor ao lado do relógio.`r`nA recuperação de dispositivos exige perfil autorizado, manutenção temporária e processos do caixa fechados.";
+  $intro.Text = "COM e falhas graves: três leituras a cada 15 segundos. Inventário da máquina: início e a cada 6 horas. Fechar mantém o monitor na bandeja.`r`nA recuperação de dispositivos exige perfil autorizado, manutenção temporária e processos do caixa fechados.";
   $layout.Controls.Add($intro, 0, 0);
   $toolbar = New-Object System.Windows.Forms.FlowLayoutPanel; $toolbar.Dock = 'Fill';
   $refreshButton = New-Object System.Windows.Forms.Button; $refreshButton.Text = 'Coletar agora'; $refreshButton.AutoSize = $true;
@@ -265,6 +568,9 @@ try {
   $folderButton = New-Object System.Windows.Forms.Button; $folderButton.Text = 'Abrir pasta dos logs'; $folderButton.AutoSize = $true;
   $centralButton = New-Object System.Windows.Forms.Button; $centralButton.Text = 'Configurar envio central...'; $centralButton.AutoSize = $true;
   $toolbar.Controls.AddRange([System.Windows.Forms.Control[]]@($refreshButton, $exportButton, $folderButton, $centralButton));
+  $remoteStopButton=New-Object System.Windows.Forms.Button;$remoteStopButton.Text='Encerrar suporte';$remoteStopButton.AutoSize=$true;$remoteStopButton.Enabled=$false;
+  $remotePauseButton=New-Object System.Windows.Forms.Button;$remotePauseButton.Text='Suspender suporte remoto';$remotePauseButton.AutoSize=$true;
+
   $layout.Controls.Add($toolbar, 0, 1);
   $deviceList = New-PdvMonitorList @('Dispositivo', 'COM', 'Presença', 'Status', 'Código', 'Identificador da instância') @(260, 65, 125, 90, 55, 420);
   $layout.Controls.Add($deviceList, 0, 2);
@@ -288,17 +594,22 @@ try {
   $layout.Controls.Add($processBox, 0, 6);
   $maintenanceBar = New-Object System.Windows.Forms.FlowLayoutPanel; $maintenanceBar.Dock = 'Fill';
   $armButton = New-Object System.Windows.Forms.Button; $armButton.Text = 'Armar recuperação por 15 minutos...'; $armButton.AutoSize = $true;
+  $nerusRestartButton = New-Object System.Windows.Forms.Button; $nerusRestartButton.Text = 'Nerus instalado (atalho)...'; $nerusRestartButton.AutoSize = $true;
+  $nerusServiceButton = New-Object System.Windows.Forms.Button; $nerusServiceButton.Text = 'Nerus Service (Caixa Web)...'; $nerusServiceButton.AutoSize = $true;
   $disarmButton = New-Object System.Windows.Forms.Button; $disarmButton.Text = 'Desarmar recuperação'; $disarmButton.AutoSize = $true;
-  $maintenanceBar.Controls.AddRange([System.Windows.Forms.Control[]]@($armButton, $disarmButton));
+  $maintenanceBar.Controls.AddRange([System.Windows.Forms.Control[]]@($nerusServiceButton, $armButton, $disarmButton, $nerusRestartButton));
   $layout.Controls.Add($maintenanceBar, 0, 7);
   $dataLabel = New-Object System.Windows.Forms.Label; $dataLabel.Dock = 'Fill'; $dataLabel.Text = 'Logs e configuração: ' + $script:dataDirectory;
   $layout.Controls.Add($dataLabel, 0, 8);
   $installBar = New-Object System.Windows.Forms.FlowLayoutPanel; $installBar.Dock = 'Fill';
-  $installButton = New-Object System.Windows.Forms.Button; $installButton.Text = 'Iniciar automaticamente neste usuário...'; $installButton.AutoSize = $true;
+  $installButton = New-Object System.Windows.Forms.Button; $installButton.Text = 'Como instalar o início automático...'; $installButton.AutoSize = $true;
   $exitButton = New-Object System.Windows.Forms.Button; $exitButton.Text = 'Encerrar monitor'; $exitButton.AutoSize = $true;
   $installBar.Controls.AddRange([System.Windows.Forms.Control[]]@($installButton, $exitButton));
+  if($null -ne $script:remoteController -and $script:remoteController.Enabled){$installBar.Controls.AddRange([System.Windows.Forms.Control[]]@($remotePauseButton,$remoteStopButton));}
   $layout.Controls.Add($installBar, 0, 9);
   $warningLabel = New-Object System.Windows.Forms.Label; $warningLabel.Dock = 'Fill';
+  $remoteStopButton.add_Click({if($null -ne $script:remoteController){$script:remotePaused=$true;[void](Update-PdvMonitorRemoteLocal $script:remoteController $false $true $false);$remotePauseButton.Text='Retomar pedidos de suporte';Update-PdvMonitorRemoteHost;}});
+  $remotePauseButton.add_Click({$script:remotePaused=-not $script:remotePaused;if($script:remotePaused){$remotePauseButton.Text='Retomar pedidos de suporte';}else{$remotePauseButton.Text='Suspender suporte remoto';};Update-PdvMonitorRemoteHost;});
   $layout.Controls.Add($warningLabel, 0, 10);
   $statusLabel = New-Object System.Windows.Forms.ToolStripStatusLabel; $statusLabel.Spring = $true; $statusLabel.TextAlign = 'MiddleLeft';
   $statusBar = New-Object System.Windows.Forms.StatusStrip; [void]$statusBar.Items.Add($statusLabel); $form.Controls.Add($statusBar);
@@ -314,6 +625,7 @@ try {
   $openMenu.add_Click($showWindow); $tray.add_DoubleClick($showWindow);
   $script:exportMenu.add_Click({ Export-PdvMonitorFromWindow; });
   $exitMonitor = {
+    if ($null -ne $script:nerusWorker -or $script:session.NerusRestart.Busy -or (Test-PdvMonitorNerusServiceBusy)) { $form.Show(); $statusLabel.Text = 'Aguarde concluir a tentativa de correção do Nerus antes de encerrar o monitor.'; return; }
     $script:closing = $true;
     if ($null -eq $script:worker) { $form.Close(); }
     else { $form.Show(); $statusLabel.Text = 'Concluindo a coleta antes de encerrar...'; Set-PdvMonitorControls $false; }
@@ -321,10 +633,15 @@ try {
   $exitMenu.add_Click($exitMonitor); $exitButton.add_Click($exitMonitor);
   $form.add_FormClosing({
     param($sender, $eventArgs);
+    if ($null -ne $script:nerusWorker -or $script:session.NerusRestart.Busy -or (Test-PdvMonitorNerusServiceBusy)) {
+      $eventArgs.Cancel = $true; $statusLabel.Text = 'Aguarde concluir a tentativa de correção do Nerus antes de fechar.'; return;
+    }
     if ($eventArgs.CloseReason -eq [System.Windows.Forms.CloseReason]::UserClosing -and -not $script:closing) {
       $eventArgs.Cancel = $true; $form.Hide();
     }
   });
+  $nerusRestartButton.add_Click({ Start-PdvMonitorNerusRestartWorker -Mode 'Check'; });
+  $nerusServiceButton.add_Click({ Start-PdvMonitorNerusServiceWorker -Mode 'Discover'; });
   $refreshButton.add_Click({ Start-PdvMonitorTickWorker; });
   $exportButton.add_Click({ Export-PdvMonitorFromWindow; });
   $centralButton.add_Click({ Show-PdvMonitorCentralConfiguration; });
@@ -372,18 +689,18 @@ try {
     catch { Show-PdvMonitorMessage $_.Exception.Message; }
   });
   $installButton.add_Click({
-    try {
-      if ($script:dataDirectory -ne (Join-Path $env:LOCALAPPDATA 'Feirao\PdvMonitor')) { throw 'A instalação automática usa a pasta padrão. Reabra Monitor.cmd sem pasta personalizada para ativá-la.'; }
-      $installedPath = & (Join-Path $script:programDirectory 'InstalarMonitor.ps1');
-      Show-PdvMonitorMessage ('Início automático ativado somente para este usuário. O monitor abrirá ao entrar no Windows, sem administrador e com recuperação desarmada.' + [Environment]::NewLine + [string]$installedPath);
-    } catch { Show-PdvMonitorMessage $_.Exception.Message 'Falha na instalação'; }
+    if($null -ne $script:session -and $script:session.RemoteBusy){return;}
+    Show-PdvMonitorMessage ('Para instalar ou atualizar o início automático, primeiro use Encerrar monitor nesta janela ou no ícone ao lado do relógio. Depois execute Instalar.cmd na pasta do pacote.' + [Environment]::NewLine + 'A instalação precisa do monitor fechado para preservar os arquivos em uso. Os perfis e os logs deste usuário serão mantidos.') 'Instalar o monitor';
   });
   $timer = New-Object System.Windows.Forms.Timer; $timer.Interval = 500;
   $timer.add_Tick({
     try { Receive-PdvMonitorDeviceSignals; }
     catch { $script:wmiWarning = 'Falha ao receber notificação imediata; a coleta periódica continua. ' + $_.Exception.Message; }
+    Complete-PdvMonitorNerusRestartWorker;
+    Complete-PdvMonitorNerusServiceWorker;
     Complete-PdvMonitorTickWorker;
-    if ($null -eq $script:worker -and -not $script:closing -and (Get-Date) -ge $script:nextTickAt) { Start-PdvMonitorTickWorker; }
+    Update-PdvMonitorRemoteHost;
+    if ($null -eq $script:nerusWorker -and -not $script:session.NerusRestart.Busy -and -not (Test-PdvMonitorNerusServiceBusy) -and $null -eq $script:worker -and -not $script:closing -and (Get-Date) -ge $script:nextTickAt) { Start-PdvMonitorTickWorker; }
   });
   $form.add_Shown({
     if ($StartHidden) { $form.Hide(); }
@@ -395,6 +712,13 @@ try {
   Show-PdvMonitorMessage ('O monitor não pôde continuar: ' + $_.Exception.Message) 'Falha no monitor do PDV';
   exit 1;
 } finally {
+  $script:closing=$true;$script:remoteUiBusy=$true;
+  if($null -ne $timer){$timer.Stop();}
+  if($null -ne $script:remoteController){
+    try{[void](Update-PdvMonitorRemoteLocal $script:remoteController $false $true $true);}catch{}
+  }
+  if($null -ne $script:remoteWorker){try{$script:remoteWorker.Stop();}catch{};$script:remoteWorker.Dispose();$script:remoteWorker=$null;}
+  if($null -ne $script:remoteController -and $null -ne $script:session){try{Close-PdvMonitorRemoteController $script:remoteController $script:session;}catch{}}
   if ($null -ne $timer) { $timer.Stop(); $timer.Dispose(); }
   if ($script:wmiSubscribed) {
     Unregister-Event -SourceIdentifier $script:wmiSource -ErrorAction SilentlyContinue;
@@ -404,6 +728,14 @@ try {
     # No encerramento do Windows, não esperar indefinidamente por uma consulta WMI.
     try { $script:worker.Stop(); } catch { }
     $script:worker.Dispose();
+  }
+  if ($null -ne $script:nerusWorker) {
+    try { $script:nerusWorker.Stop(); } catch { }
+    $script:nerusWorker.Dispose();
+  }
+  if ($null -ne $script:serviceWorker) {
+    try { $script:serviceWorker.Stop(); } catch { }
+    $script:serviceWorker.Dispose();
   }
   if ($null -ne $script:session) { try { Stop-PdvMonitorSession -Session $script:session; } catch { } }
   if ($null -ne $tray) { $tray.Visible = $false; $tray.Dispose(); }

@@ -1,0 +1,53 @@
+; MODELO INATIVO PARA REVISAO. NAO E UM LAUNCHER NEM UM INSTALADOR.
+; Nao renomear/copiar para configuracao ativa antes da homologacao do supervisor.
+; Nao instalar servico, tarefa agendada ou entrada de inicializacao automatica.
+;
+; O listener 127.0.0.1 abaixo so pode existir temporariamente DEPOIS de:
+; 1. decisao explicita do operador desta console, com pagamento encerrado;
+; 2. consentimento autenticado/assinado pelo Conecta, valido para esta sessao;
+; 3. lease ativo no gateway, vinculado a esta maquina/certificado/ID Repeater.
+; Este arquivo NAO valida consentimento/lease e NAO aplica duracao maxima.
+; O supervisor futuro deve validar esses requisitos antes de iniciar stunnel
+; e encerrar processo, sockets e listener na revogacao, pausa, crash ou prazo.
+; Um timeout de inatividade NAO substitui o prazo absoluto do lease.
+;
+; Preencher somente fora do repositorio, depois de conferir as versoes exatas.
+; DNS .invalid e caminhos abaixo sao placeholders, nao endpoints/credenciais reais.
+; A porta 8443 e ilustrativa: usar o listener mTLS DE DISPOSITIVOS do gateway,
+; nunca a porta de controle administrativo ou o servidor HTTP do Conecta.
+;
+; Fontes: https://www.stunnel.org/auth.html
+;         https://www.stunnel.org/manual.html
+;         https://www.stunnel.org/config_windows.html
+
+debug = err
+taskbar = yes
+
+[pdv-reverse-vnc-mtls-temporario]
+client = yes
+
+; Somente IPv4 loopback. Nao trocar por 0.0.0.0, :: ou IP da rede da loja.
+; A porta local e ilustrativa e precisa estar livre antes de cada tentativa.
+accept = 127.0.0.1:5500
+connect = gateway-piloto.example.invalid:8443
+
+; Certificado/chave EXCLUSIVOS desta instalacao, emitidos pela CA de dispositivos.
+; Nunca reutilizar o certificado administrativo de controle do gateway.
+; Chave privada e config real em diretorio local com ACL restrita.
+cert = C:\ProgramData\ConectaRemotePilot\identity\client-fullchain.pem
+key = C:\ProgramData\ConectaRemotePilot\identity\client-private.key
+
+; CA do SERVIDOR; nao confundir com a CA que emite os certificados dos caixas.
+CAfile = C:\ProgramData\ConectaRemotePilot\trust\gateway-server-ca.pem
+verifyChain = yes
+checkHost = gateway-piloto.example.invalid
+sni = gateway-piloto.example.invalid
+sslVersionMin = TLSv1.2
+
+; Cada nova conexao exige handshake; isto nao concede nem renova lease VNC.
+sessionResume = no
+TIMEOUTconnect = 5
+
+; Sem exec/execArgs, senhas VNC, nonce, token de API, dumps ou logs de trafego.
+; O gateway tambem deve exigir mTLS e conferir certificado -> instalacao -> ID.
+; Nao reduzir validacao TLS nem adicionar exclusoes de antivirus para testar.

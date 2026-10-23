@@ -1,0 +1,8 @@
+{
+  "name": "conecta-pdv-remote-pilot-gateway",
+  "version": "0.0.0-private-pilot",
+  "private": true,
+  "description": "Piloto local: autorização temporária e retransmissão UltraVNC Mode II com TLS mútuo.",
+  "engines": { "node": ">=22" },
+  "scripts": { "test": "node --test test/*.test.js", "start": "node server.js" }
+}

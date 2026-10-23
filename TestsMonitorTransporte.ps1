@@ -14,7 +14,9 @@ $testRoot = Join-Path ([IO.Path]::GetTempPath()) ('pdv-transporte-testes-' + [Gu
   $script:TestNow = [DateTimeOffset]::Parse('2026-10-15T12:00:00-03:00')
   $script:TestStatus = 204
   $script:TestTimeout = $false
+  $script:TestHardwareUnsupported = $false
   $script:TestCredentialFailure = $false
+  $script:TestAfterPost=$null
   $script:TestPosts = New-Object 'Collections.Generic.List[object]'
   function script:Get-PdvMonitorTransportNow { return $script:TestNow }
   function script:Protect-PdvMonitorToken { param($Token, $Central); return ,[byte[]]@(7, 18, 29, 40) }
@@ -24,7 +26,9 @@ $testRoot = Join-Path ([IO.Path]::GetTempPath()) ('pdv-transporte-testes-' + [Gu
     $expected = 'Bearer ' + ($script:TestExpectedAgentId) + '.' + $script:TestToken
     if ($Authorization -cne $expected) { throw 'Cabeçalho de autenticação incorreto.' }
     $script:TestPosts.Add((New-Object PSObject -Property @{Endpoint=$Endpoint; Json=[Text.Encoding]::UTF8.GetString($Body); Bytes=$Body.Length}))
+    if ($null -ne $script:TestAfterPost) { $hook=$script:TestAfterPost; $script:TestAfterPost=$null; & $hook }
     if ($script:TestTimeout) { throw 'Tempo de conexão simulado excedido' }
+    if($script:TestHardwareUnsupported -and ([Text.Encoding]::UTF8.GetString($Body)).Contains('"hardware":')){return 400}
     return $script:TestStatus
   }
 }
@@ -52,7 +56,7 @@ function New-TestSession {
   $agentId = [Guid]::NewGuid().ToString('D')
   $configured = Set-PdvMonitorCentralConfig -Session $session -Endpoint 'https://conecta.example/api/pdv-monitor/ingest' -StoreId '49' -Terminal 'CX4901' -AgentId $agentId -Token ('a' * 64)
   Assert-Transport $configured.Success ('Configura sessão offline: ' + $configured.Reason)
-  & $module { param($ExpectedAgentId); $script:TestExpectedAgentId=$ExpectedAgentId; $script:TestStatus=204; $script:TestTimeout=$false; $script:TestCredentialFailure=$false; $script:TestPosts.Clear() } $agentId
+  & $module { param($ExpectedAgentId); $script:TestExpectedAgentId=$ExpectedAgentId; $script:TestStatus=204; $script:TestTimeout=$false; $script:TestHardwareUnsupported=$false; $script:TestCredentialFailure=$false; $script:TestPosts.Clear(); $script:TestAfterPost=$null } $agentId
   return $session
 }
 
@@ -71,6 +75,10 @@ function New-TestRecord {
   $record.Port = 'COM4'
   $record.Detail = "Linha 1`r`nLinha 2`tçã"
   return $record
+}
+
+function New-TestHardware {
+  return @{schemaVersion=1;collectedAt='2026-10-19T12:00:00-03:00';machineId='5bf944a7-d15b-454f-b42b-43d36a98f439';hostname='CX4901';manufacturer='Ação';model='Caixa';serialNumber='SN1';os=@{caption='Windows 10';version='10.0';build='19045';architecture='64-bit';lastBootAt=''};cpu=@{name='CPU';cores='4';logicalProcessors='8'};memory=@{totalBytes='8589934592';modules=@()};disks=@(@{id='0';model='SSD';serialNumber='';sizeBytes='18446744073709551615';interfaceType='SATA';status='OK'});systemVolume=@{name='C:';totalBytes='';freeBytes=''};networkAdapters=@(@{name='Ethernet';macAddress='AA:BB:CC:DD:EE:FF';adapterType='Ethernet'});warnings=@()};
 }
 
 function Get-TestQueueCount {
@@ -223,6 +231,53 @@ try {
   $result = Invoke-PdvMonitorUpload $session
   $postCount = & $module { return $script:TestPosts.Count }
   Assert-Transport (-not $result.Success -and $postCount -eq 0 -and (Get-TestQueueCount $session) -eq 1) 'DTD/entidades externas são rejeitados sem rede nem apagar arquivo'
+
+  # Inventário e eventos são confirmados juntos; somente o 204 remove ambos.
+  $session=New-TestSession; $hardware=New-TestHardware;
+  $queued=Set-PdvMonitorHardwarePending -Session $session -Hardware $hardware;
+  $hardwarePath=Join-Path $session.DataDirectory 'hardware-pendente.xml';
+  Assert-Transport ($queued.Queued -and [IO.File]::Exists($hardwarePath)) 'Inventário tem arquivo durável separado da fila histórica';
+  $record=New-TestRecord $session; [void](Add-PdvMonitorOutboxRecord $session $record);
+  & $module { $script:TestStatus=503 }; $result=Invoke-PdvMonitorUpload $session;
+  Assert-Transport (-not $result.Success -and [IO.File]::Exists($hardwarePath) -and (Get-TestQueueCount $session) -eq 1) 'HTTP503 preserva inventário e evento sem ACK parcial';
+  Reset-TestBackoff $session; & $module { $script:TestStatus=204 }; $result=Invoke-PdvMonitorUpload $session;
+  $posts=& $module {return ,$script:TestPosts.ToArray()}; $first=ConvertFrom-TestJson $posts[0].Json; $last=ConvertFrom-TestJson $posts[1].Json;
+  Assert-Transport ($result.Success -and -not [IO.File]::Exists($hardwarePath) -and (Get-TestQueueCount $session) -eq 0 -and $last.schemaVersion -eq 2 -and $last.events[0].EventId -ceq $record.EventId) 'ACK204 remove o par e v2 preserva EventId';
+  Assert-Transport ($first.hardware.collectedAt -ceq $last.hardware.collectedAt -and $last.hardware.manufacturer -ceq 'Ação' -and $last.hardware.disks[0].sizeBytes -ceq '18446744073709551615' -and $posts[1].Bytes -le 262144) 'Reenvio preserva inventário, Unicode e UInt64 em string dentro dos limites';
+  $session=New-TestSession; [void](Set-PdvMonitorHardwarePending $session (New-TestHardware));
+  $changed=Set-PdvMonitorCentralConfig $session 'https://conecta.example/api/pdv-monitor/ingest' '50' 'CX5001' ([guid]::NewGuid().ToString()) ('a'*64);
+  Assert-Transport ($changed.Reason -eq 'PendingIdentityChange') 'Inventário pendente também bloqueia troca da instalação';
+  $result=Invoke-PdvMonitorUpload $session; $posts=& $module {return ,$script:TestPosts.ToArray()}; $body=ConvertFrom-TestJson $posts[0].Json;
+  Assert-Transport ($result.Success -and $result.Sent -eq 0 -and $body.schemaVersion -eq 2 -and @($body.events).Count -eq 0 -and $body.hardware.hostname -ceq 'CX4901') 'Inventário sozinho usa v2 com array de eventos vazio sem heartbeat falso';
+  $session=New-TestSession; $hardware=New-TestHardware; [void](Set-PdvMonitorHardwarePending $session $hardware);
+  $path=Join-Path $session.DataDirectory 'hardware-pendente.xml'; $before=[IO.File]::ReadAllText($path);
+  $hardware.model='x'*40000; $queued=Set-PdvMonitorHardwarePending $session $hardware;
+  Assert-Transport (-not $queued.Queued -and [IO.File]::ReadAllText($path) -ceq $before) 'Inventário excessivo não trunca JSON nem destrói pendência anterior';
+  $session=New-TestSession; $hardware=New-TestHardware; [void](Set-PdvMonitorHardwarePending $session $hardware);
+  & $module {
+    param($Session,$Hardware)
+    $script:TestReplaceSession=$Session; $script:TestReplaceHardware=$Hardware;
+    $script:TestAfterPost={ $script:TestReplaceHardware.collectedAt='2026-10-20T12:00:00-03:00'; [void](Set-PdvMonitorHardwarePending $script:TestReplaceSession $script:TestReplaceHardware) };
+  } $session $hardware;
+  $result=Invoke-PdvMonitorUpload $session;
+  Assert-Transport ($result.Success -and [IO.File]::Exists((Join-Path $session.DataDirectory 'hardware-pendente.xml'))) 'ACK antigo não remove snapshot renovado durante a chamada, mesmo com o mesmo hash estático';
+  Reset-TestBackoff $session; $result=Invoke-PdvMonitorUpload $session;
+  Assert-Transport ($result.Success -and -not [IO.File]::Exists((Join-Path $session.DataDirectory 'hardware-pendente.xml'))) 'ACK do conteúdo exato conclui a nova pendência';
+  $session=New-TestSession;$hardware=New-TestHardware;$hardware.schemaVersion=2;
+  [void](Set-PdvMonitorHardwarePending $session $hardware);$hardwarePath=Join-Path $session.DataDirectory 'hardware-pendente.xml';$hardwareBytes=[IO.File]::ReadAllText($hardwarePath);
+  [void](Add-PdvMonitorOutboxRecord $session (New-TestRecord $session));
+  & $module {$script:TestHardwareUnsupported=$true};$result=Invoke-PdvMonitorUpload $session;
+  $posts=& $module {return ,$script:TestPosts.ToArray()};
+  Assert-Transport ($result.Success -and $result.Sent -eq 1 -and $posts.Count -eq 2 -and (Get-TestQueueCount $session) -eq 0) 'API antiga rejeita hardware e confirma somente os eventos em segundo envio';
+  $first=ConvertFrom-TestJson $posts[0].Json;$fallback=ConvertFrom-TestJson $posts[1].Json;
+  Assert-Transport ($first.schemaVersion -eq 2 -and $fallback.schemaVersion -eq 1 -and -not $fallback.PSObject.Properties['hardware'] -and $first.events[0].EventId -ceq $fallback.events[0].EventId) 'Fallback mantém EventId e remove apenas o documento incompatível';
+  Assert-Transport ([IO.File]::ReadAllText($hardwarePath) -ceq $hardwareBytes) 'ACK só dos eventos conserva bytes do hardware sem confirmação falsa';
+  Reset-TestBackoff $session;$result=Invoke-PdvMonitorUpload $session;
+  Assert-Transport ($result.Reason -eq 'OutboxEmpty' -and (& $module {$script:TestPosts.Count}) -eq 2 -and [IO.File]::Exists($hardwarePath)) 'Espera compatibilidade por quinze minutos sem novas chamadas de hardware';
+  [void](Add-PdvMonitorOutboxRecord $session (New-TestRecord $session 2));Reset-TestBackoff $session;$result=Invoke-PdvMonitorUpload $session;
+  Assert-Transport ($result.Success -and $result.Sent -eq 1 -and [IO.File]::Exists($hardwarePath)) 'Eventos novos continuam durante a espera de integração';
+  & $module {$script:TestHardwareUnsupported=$false;$script:TestNow=$script:TestNow.AddMinutes(16)};Reset-TestBackoff $session;$result=Invoke-PdvMonitorUpload $session;
+  Assert-Transport ($result.Success -and -not [IO.File]::Exists($hardwarePath)) 'API atualizada confirma hardware na próxima tentativa elegível';
 
   # Configuração persiste sem segredo e reabre com mesma identificação.
   $session = New-TestSession
