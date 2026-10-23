@@ -106,7 +106,7 @@ try {
       $script:SoftwareDefender.Threats=@(@{ThreatID=9;ThreatName='Teste';SeverityID=1;IsActive=$false});
       $script:SoftwareDefender.Detections=@(@{ThreatID=9;ActionSuccess=$false;LastThreatStatusChangeTime=[DateTimeOffset]::Parse('2026-10-21T12:00:00-03:00')},@{ThreatID=9;ActionSuccess=$true;LastThreatStatusChangeTime=[DateTimeOffset]::Parse('2026-10-21T14:00:00+00:00')});
     };$r=Get-SoftwareDocument;
-    Assert-Software ($r.Software.security.threats[0].lastSeenAt -ceq '2026-10-21T15:00:00.0000000+00:00' -and -not $r.Software.security.threats[0].actionSuccess) 'Comparou horarios lexicos sem fuso';
+    Assert-Software ($r.Software.security.threats[0].lastSeenAt -ceq '2026-10-21T15:00:00.0000000+00:00' -and -not $r.Software.security.threats[0].actionSuccess) ('UTC/resultado divergente na fixture: '+(ConvertTo-PdvHardwareJson $r.Software.security));
   };
   Test-Software 'sucesso nulo ou verdadeiro empatado nao depende da ordem e falha prevalece' {
     Reset-Software;& $module {
