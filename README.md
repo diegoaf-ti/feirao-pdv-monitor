@@ -1,8 +1,12 @@
-# Monitor contínuo do PDV 0.6.0 — Windows 7/10/11
+# Monitor contínuo do PDV 0.7.1 — Windows 7/10/11
+
+A versão 0.7.1 inclui o instalador único com certificados públicos embutidos e a ativação de uma identidade exclusiva por computador. A chave privada é gerada no próprio Windows; não existe chave compartilhada entre lojas. A primeira instalação sobre 0.6 ou anterior é manual. Consulte [GUIA-INSTALACAO-0.7.md](GUIA-INSTALACAO-0.7.md) e [CERTIFICADO-EMBUTIDO.md](CERTIFICADO-EMBUTIDO.md).
 
 Monitor local do pinpad TEF, da impressora e do componente Nerus para registrar mudanças de porta COM, desconexões observáveis, falhas dos dispositivos vinculados e tentativas de recuperação. Mantém histórico local e pode enviar os registros para a central do Conecta.
 
-**Piloto em validação.** Os testes com dados simulados passaram no macOS com PowerShell 7.5.4 e no Windows com PowerShell 5.1 pelo [GitHub Actions](https://github.com/diegoaf-ti/feirao-pdv-monitor/actions). A interface, a coleta nativa e os equipamentos reais ainda precisam ser validados no caixa. Comece acompanhado pelo suporte, mantendo a recuperação desarmada.
+**Piloto em validação.** Testes isolados verificam a inscrição, a cadeia de certificados, o pacote e as rotinas do monitor; o [GitHub Actions](https://github.com/diegoaf-ti/feirao-pdv-monitor/actions) separa Windows PowerShell 5.1 e os ensaios que exigem PowerShell 7. Interface, CSP, ACLs, TLS, Defender, Windows 7 e equipamentos reais ainda precisam de validação no caixa. Comece acompanhado pelo suporte, mantendo a recuperação desarmada.
+
+O ZIP inclui scripts legíveis e somente as autoridades públicas. Não inclui os executáveis UltraVNC/stunnel nem perfil remoto aprovado. Emitir o certificado depende da API/painel e do emissor publicados no ambiente correspondente; a instalação, sozinha, não habilita acesso remoto. A renovação automática do certificado ainda não integra esta versão.
 
 A versão 0.6.0 acrescenta inventário de aplicativos, detecções disponíveis do Microsoft Defender e identificação de placa-mãe/slots de RAM para o histórico central de componentes. Consulte o [guia do inventário empresarial](GUIA-INVENTARIO-EMPRESA.md). A integração da API/banco/painel continua pendente de publicação, por orientação do usuário.
 

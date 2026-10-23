@@ -13,6 +13,7 @@ try {
   $rsa=& $module { $rsa=New-PdvUpdateRsa 2048; return ,$rsa; };
   $public=Join-Path $temporary 'public.xml'; [IO.File]::WriteAllText($public,$rsa.ToXmlString($false));
   $names=& $module { return ,$script:PdvUpdateProgramFiles; };
+  Assert-Update ($names.Count -eq 22 -and $names -ccontains 'PdvMonitor.Remoto.psm1' -and $names -ccontains 'PdvMonitor.Remoto.Transporte.psm1' -and $names -cnotcontains 'PdvMonitor.Remoto.Windows.psm1') 'Core possui exatamente 22 arquivos; extensao administrativa fica separada';
   Add-Type -AssemblyName System.IO.Compression;
   function New-TestArchive([string]$Path,[string[]]$Entries=$names,[string]$Version='2.0.0',[string]$OversizeName='',[string]$LinkName='') {
     $stream=[IO.File]::Create($Path); $zip=New-Object IO.Compression.ZipArchive($stream,[IO.Compression.ZipArchiveMode]::Create,$true);
@@ -65,7 +66,12 @@ try {
   $validOutput=Join-Path $temporary 'expanded';
   & $module { param($z,$o,$p); Expand-PdvApprovedUpdate $z $o '2.0.0' $p; } $zipPath $validOutput $public;
   Assert-Update ([IO.Directory]::GetFiles($validOutput).Length -eq $names.Length) 'ZIP aprovado é expandido por allowlist';
-  foreach ($case in @('traversal','duplicate','symlink','bomb','config','missing')) {
+  Assert-Update ([IO.File]::Exists((Join-Path $validOutput 'PdvMonitor.Remoto.psm1')) -and [IO.File]::Exists((Join-Path $validOutput 'PdvMonitor.Remoto.Transporte.psm1'))) 'Os dois modulos remotos do core sao extraidos';
+  $legacyNames=@($names | Where-Object { @('PdvMonitor.Remoto.psm1','PdvMonitor.Remoto.Transporte.psm1') -cnotcontains $_; });
+  $legacyOutput=Join-Path $temporary 'legacy-20';
+  Assert-Rejected { [Feirao.PdvApprovedZip]::Extract($zipPath,$legacyOutput,$legacyNames); } 'Leitor legado de 20 arquivos recusa core 22: primeira migracao deve ser manual';
+  Assert-Update (-not [IO.Directory]::Exists($legacyOutput)) 'Recusa legada ocorre antes de extrair qualquer arquivo';
+  foreach ($case in @('traversal','duplicate','symlink','bomb','config','missing','native-extension','nested-extension')) {
     $entries=@($names); $oversize=''; $link='';
     switch ($case) {
       'traversal' { $entries[0]='../monitor.xml'; }
@@ -74,6 +80,8 @@ try {
       'bomb' { $oversize=$entries[0]; }
       'config' { $entries[0]='central-credencial.bin'; }
       'missing' { $entries=@($entries | Select-Object -Skip 1); }
+      'native-extension' { $entries[0]='PdvMonitor.Remoto.Windows.psm1'; }
+      'nested-extension' { $entries[0]='piloto-remoto/windows/RemoteWindowsNative.cs'; }
     }
     $archive=Join-Path $temporary ($case+'.zip'); New-TestArchive $archive $entries -OversizeName $oversize -LinkName $link;
     $destination=Join-Path $temporary ('out-'+$case);
@@ -160,6 +168,7 @@ try {
   Assert-Update ($result.Success -and $result.Reason -ceq 'UpdateInstalled' -and ([IO.File]::ReadAllText((Join-Path $program 'monitor-version.txt'))) -ceq '2.0.0') 'Versão aprovada substitui só programa e confirma saúde';
   Assert-Update (([IO.File]::ReadAllText((Join-Path $session.DataDirectory 'central-credencial.bin'))) -ceq 'DPAPI-DEMO-NAO-SECRETO') 'Credencial fora do programa é preservada';
   Assert-Update ([IO.File]::Exists((Join-Path $session.DataDirectory 'atualizacoes/backup/MonitorPdv.ps1'))) 'Backup da versão anterior é preservado';
+  Assert-Update ([IO.Directory]::GetFiles((Join-Path $session.DataDirectory 'atualizacoes/backup')).Length -eq 22 -and [IO.File]::Exists((Join-Path $program 'PdvMonitor.Remoto.Transporte.psm1'))) 'Backup e candidata mantem o core completo de 22 arquivos';
   Assert-Update (([IO.File]::ReadAllText((Join-Path $session.DataDirectory 'IniciarMonitorInstalado.ps1'))) -ceq '# arquivo aprovado de teste') 'Bootstrap recebe versão aprovada somente após saúde confirmada';
 
   $session=New-TestSession 'rollback'; $program=Join-Path $session.DataDirectory 'programa';
@@ -208,12 +217,15 @@ try {
   Assert-Update ($status -ceq 'Recovered' -and [IO.File]::Exists((Join-Path $s.DataDirectory 'programa/MonitorPdv.ps1'))) 'Bootstrap estável restaura backup íntegro após queda entre renomeações';
   Assert-Update (-not [IO.File]::Exists((Join-Path $s.DataDirectory 'atualizacoes/saude-pendente.xml')) -and [IO.File]::ReadAllText((Join-Path $s.DataDirectory 'atualizacoes/versao-rejeitada.txt')).Trim() -ceq '2.0.0') 'Recuperação limpa saúde pendente e quarentena versão interrompida';
   Assert-Update ($script:BootstrapStarts -eq 1) 'Só inicia o monitor depois de validar e restaurar';
+  Assert-Update ([IO.Directory]::GetFiles((Join-Path $s.DataDirectory 'programa')).Length -eq 22 -and [IO.File]::Exists((Join-Path $s.DataDirectory 'programa/PdvMonitor.Remoto.psm1'))) 'Recuperacao apos interrupcao inclui ambos os modulos remotos';
   $s=New-PowerGapFixture 'powergap-lock';
   $lock=New-Object IO.FileStream((Join-Path $s.DataDirectory 'atualizacoes/aplicando.lock'),[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None);
   try { Assert-Rejected { Invoke-PdvStableMonitorBootstrap $s.DataDirectory; } 'Bootstrap não concorre com executor ainda ativo'; } finally { $lock.Close(); }
   Assert-Update (-not [IO.Directory]::Exists((Join-Path $s.DataDirectory 'programa')) -and $script:BootstrapStarts -eq 1) 'Lock preserva backup sem executar scripts';
   $s=New-PowerGapFixture 'powergap-corrupt'; [IO.File]::WriteAllText((Join-Path $s.DataDirectory 'atualizacoes/backup/MonitorPdv.ps1'),'# CORROMPIDO');
   Assert-Rejected { Invoke-PdvStableMonitorBootstrap $s.DataDirectory; } 'Backup alterado não pode ser executado';
+  $s=New-PowerGapFixture 'powergap-remote-corrupt'; [IO.File]::WriteAllText((Join-Path $s.DataDirectory 'atualizacoes/backup/PdvMonitor.Remoto.Transporte.psm1'),'# CORROMPIDO');
+  Assert-Rejected { Invoke-PdvStableMonitorBootstrap $s.DataDirectory; } 'Transporte remoto corrompido impede restauracao e execucao';
   $s=New-PowerGapFixture 'powergap-extra'; [IO.File]::WriteAllText((Join-Path $s.DataDirectory 'atualizacoes/backup/arquivo-extra.ps1'),'# desconhecido');
   Assert-Rejected { Invoke-PdvStableMonitorBootstrap $s.DataDirectory; } 'Arquivo extra no backup invalida recuperação';
   $s=New-PowerGapFixture 'powergap-metadata'; [IO.File]::Delete((Join-Path $s.DataDirectory 'atualizacoes/backup-manifest.xml'));

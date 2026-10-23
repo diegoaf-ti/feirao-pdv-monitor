@@ -88,7 +88,7 @@ function Invoke-PdvNerusHttp {
   $transport=Get-Module PdvMonitor.Transporte;
   if ($null -eq $transport) { Import-Module (Join-Path $script:nerusRoot 'PdvMonitor.Transporte.psm1'); $transport=Get-Module PdvMonitor.Transporte; }
   $authorization=$null; $response=$null; $stream=$null; $memory=$null; $request=$null;
-  $oldProtocol=[Net.ServicePointManager]::SecurityProtocol;
+  $oldProtocol=[Net.ServicePointManager]::SecurityProtocol;$tlsLock=[Net.ServicePointManager];$ownsTls=$false;
   try {
     $authorization=& $transport { param($s)
       $c=Get-PdvCentralConfig $s;
@@ -100,6 +100,7 @@ function Invoke-PdvNerusHttp {
     } $Session;
     $base=[string]$Session.Config.Central.Endpoint;
     if (-not $base.EndsWith('/ingest',[StringComparison]::Ordinal)) { throw 'CentralUnavailable'; }
+    $ownsTls=[Threading.Monitor]::TryEnter($tlsLock,2000);if(-not $ownsTls){throw 'NerusTransportUnavailable';};$oldProtocol=[Net.ServicePointManager]::SecurityProtocol;
     [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]3072;
     $request=[Net.WebRequest]::Create($base.Substring(0,$base.Length-7)+$Path);
     $request.Method=$Method; $request.Accept='application/xml'; $request.ContentType='application/json; charset=utf-8';
@@ -125,11 +126,12 @@ function Invoke-PdvNerusHttp {
     throw 'NerusTransportUnavailable';
   } finally {
     $authorization=$null;
-    if ($null -ne $request) { $request.Headers.Remove('Authorization'); }
-    if ($null -ne $stream) { $stream.Dispose(); }
-    if ($null -ne $memory) { $memory.Dispose(); }
-    if ($null -ne $response) { $response.Close(); }
-    [Net.ServicePointManager]::SecurityProtocol=$oldProtocol;
+    try {
+      if ($null -ne $request) { $request.Headers.Remove('Authorization'); }
+      if ($null -ne $stream) { $stream.Dispose(); }
+      if ($null -ne $memory) { $memory.Dispose(); }
+      if ($null -ne $response) { $response.Close(); }
+    } finally {if($ownsTls){try{[Net.ServicePointManager]::SecurityProtocol=$oldProtocol;}finally{[Threading.Monitor]::Exit($tlsLock);}}}
   }
 }
 function ConvertFrom-PdvNerusPolicy {
@@ -320,7 +322,7 @@ function Invoke-PdvMonitorNerusAutomation {
       Add-PdvNerusNotice $state $diagnosis.Reason 'NerusRecoveryBlocked' $diagnosis.Detail;
       return;
     }
-    if ($state.Samples.Count -ne 3 -or $now -lt $state.NextAttemptAt -or -not $Session.LoggingHealthy -or $Session.MaintenanceArmed) { return; }
+    if ([bool](Get-PdvNerusValue $Session 'RemoteBusy' $false) -or $state.Samples.Count -ne 3 -or $now -lt $state.NextAttemptAt -or -not $Session.LoggingHealthy -or $Session.MaintenanceArmed) { return; }
     $evidence=Get-PdvNerusEvidence $Session $state;
     if ($null -eq $evidence) {
       Add-PdvNerusNotice $state 'CashierNotConfirmedIdle' 'NerusRecoveryBlocked' 'Correção aguardando equipamento vinculado, identidade da máquina e ausência confirmada de processos PDV/TEF e impressão.';
@@ -612,7 +614,7 @@ function Test-PdvNerusRestartLimit {
 }
 function Get-PdvNerusRestartPolicy {
   param($Session);
-  if ([bool](Get-PdvNerusValue $Session 'Stopped' $false) -or [bool](Get-PdvNerusValue $Session 'TickBusy' $false) -or [bool](Get-PdvNerusValue $Session 'UpdateStaged' $false) -or -not $Session.Config.Central.Enabled -or -not $Session.LoggingHealthy -or $Session.MaintenanceArmed -or -not $Session.NerusAutomation.Healthy -or $null -ne $Session.NerusAutomation.Pending) { throw 'NerusRestartNotReady'; }
+  if ([bool](Get-PdvNerusValue $Session 'RemoteBusy' $false) -or [bool](Get-PdvNerusValue $Session 'Stopped' $false) -or [bool](Get-PdvNerusValue $Session 'TickBusy' $false) -or [bool](Get-PdvNerusValue $Session 'UpdateStaged' $false) -or -not $Session.Config.Central.Enabled -or -not $Session.LoggingHealthy -or $Session.MaintenanceArmed -or -not $Session.NerusAutomation.Healthy -or $null -ne $Session.NerusAutomation.Pending) { throw 'NerusRestartNotReady'; }
   $p=ConvertFrom-PdvNerusPolicy (Invoke-PdvNerusHttp $Session '/agent/policy');
   if (-not $p.Enabled -or -not $p.WindowOpen) { throw 'NerusRestartWindowClosed'; }
   if (-not $Session.HardwareMachineId -or [string]$Session.HardwareMachineId -cne $p.HardwareId) { throw 'NerusRestartMachineMismatch'; }
@@ -1003,7 +1005,7 @@ function Test-PdvNerusServiceLimit {
 }
 function Test-PdvNerusServiceSession {
   param($Session);
-  if(-not $Session.NerusService.Healthy -or -not $Session.LoggingHealthy -or [bool](Get-PdvNerusValue $Session 'Stopped' $false) -or [bool](Get-PdvNerusValue $Session 'TickBusy' $false) -or [bool](Get-PdvNerusValue $Session 'UpdateStaged' $false) -or [bool]$Session.MaintenanceArmed){throw 'NerusServiceNotReady';}
+  if([bool](Get-PdvNerusValue $Session 'RemoteBusy' $false) -or -not $Session.NerusService.Healthy -or -not $Session.LoggingHealthy -or [bool](Get-PdvNerusValue $Session 'Stopped' $false) -or [bool](Get-PdvNerusValue $Session 'TickBusy' $false) -or [bool](Get-PdvNerusValue $Session 'UpdateStaged' $false) -or [bool]$Session.MaintenanceArmed){throw 'NerusServiceNotReady';}
   $restart=Get-PdvNerusValue $Session 'NerusRestart';if($null -ne $restart -and [bool](Get-PdvNerusValue $restart 'Busy' $false)){throw 'NerusServiceNotReady';}
   $automation=Get-PdvNerusValue $Session 'NerusAutomation';if($null -ne $automation -and ($null -ne (Get-PdvNerusValue $automation 'Pending') -or -not [bool](Get-PdvNerusValue $automation 'Healthy' $false))){throw 'NerusServiceNotReady';}
   if($null -eq $Session.NerusService.Binding){throw 'NerusServiceBindingMissing';}

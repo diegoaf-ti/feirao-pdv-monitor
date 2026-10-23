@@ -24,7 +24,8 @@ PROGRAM_FILES = (
     'PdvLegado.Core.psm1', 'PdvDispositivos.Core.psm1', 'PdvMonitor.Transporte.psm1',
     'PdvMonitor.Atualizacao.psm1', 'AplicarAtualizacao.ps1', 'monitor-version.txt',
     'PdvMonitor.Nerus.psm1', 'PdvMonitor.Version.psm1', 'atualizacoes-chave-publica.xml',
-    'IniciarMonitorInstalado.ps1',
+    'IniciarMonitorInstalado.ps1', 'PdvMonitor.Remoto.psm1',
+    'PdvMonitor.Remoto.Transporte.psm1',
 )
 VERSION = re.compile(r'^(0|[1-9][0-9]{0,3})\.(0|[1-9][0-9]{0,3})\.(0|[1-9][0-9]{0,3})$')
 

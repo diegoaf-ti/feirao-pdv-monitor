@@ -250,7 +250,7 @@ function Start-PdvMonitorSession {
     LastTickAt = $null; LastHeartbeatAt = $null; LastSnapshotAt = $null; LastEventsAt = $null;
     StatusText = 'Iniciando monitoramento'; UploadStatusText = 'Envio central não configurado';
     MaintenanceArmed = $false; MaintenanceExpiresAt = $null; Signals = [Collections.Queue]::Synchronized((New-Object Collections.Queue));
-    Stopped = $false; TickBusy = $false; HasBaseline = $false; RecoveryHistoryHealthy = $true;
+    Stopped = $false; TickBusy = $false; RemoteBusy = $false; HasBaseline = $false; RecoveryHistoryHealthy = $true;
     SignalDropCount = 0L; LastLoggedSignalDropCount = 0L;
     PreviousUploadFailureReason = ''; LastLoggedOutboxGapCount = 0L;
     ComAlertStates = @{}; WindowsAlertStates = @{}; LastHardwareAt = $null; HardwareStatus = '';
@@ -384,6 +384,7 @@ function Set-PdvMonitorMaintenance {
     $Session.MaintenanceArmed = $false; $Session.MaintenanceExpiresAt = $null; $Session.Config.AutoRecoveryEnabled = $false;
     Write-PdvMonitorRecord $Session 'MaintenanceDisarmed' 'Recuperação automática desarmada.'; return;
   }
+  if ([bool](Get-PdvRuntimeValue $Session 'RemoteBusy' $false)) { throw 'Encerre o suporte remoto antes de armar uma recuperação.'; }
   if ($Minutes -lt 1 -or $Minutes -gt 15) { throw 'A janela de manutenção deve durar de 1 a 15 minutos.'; }
   if (-not $Session.RecoveryHistoryHealthy) { throw 'O histórico de recuperações precisa ser analisado pelo suporte antes de permitir novas tentativas.'; }
   $names = @();
@@ -415,7 +416,7 @@ function Get-PdvMonitorRecoveryContext {
     try { $jobs = @(Get-WmiObject -Class Win32_PrintJob -ErrorAction Stop).Count; $printOk = $true; } catch { }
   }
   return (New-Object PSObject -Property @{
-    AutoRecoveryEnabled = $Session.Config.AutoRecoveryEnabled; MaintenanceArmed = $Session.MaintenanceArmed;
+    AutoRecoveryEnabled = ($Session.Config.AutoRecoveryEnabled -and -not [bool](Get-PdvRuntimeValue $Session 'RemoteBusy' $false)); MaintenanceArmed = $Session.MaintenanceArmed;
     MaintenanceExpiresAt = $Session.MaintenanceExpiresAt;
     WindowsBuild = [int](Get-PdvRuntimeValue $Snapshot.Windows 'Build' 0); IsAdministrator = [bool](Get-PdvRuntimeValue $Snapshot.Windows 'IsAdministrator' $false);
     ProcessCheckSucceeded = $processOk; BlockingProcessNames = @($blocked);
@@ -737,7 +738,7 @@ function Invoke-PdvMonitorTick {
       Update-PdvMonitorNerusServiceDiagnostic -Session $Session -Now $now;
     }
     if($Session.ProgramDirectory -and ($null -eq $Session.LastSoftwareAt -or ($now-$Session.LastSoftwareAt).TotalMinutes -ge 15)){Update-PdvMonitorSoftware $Session $now;}
-    if ($Session.ProgramDirectory) {
+    if ($Session.ProgramDirectory -and -not [bool](Get-PdvRuntimeValue $Session 'RemoteBusy' $false)) {
       Invoke-PdvMonitorNerusAutomation -Session $Session -Snapshot $snapshot -ObservedAt $snapshotAt;
       if ($null -ne $Session.NerusAutomation) {
         while ($Session.NerusAutomation.Events.Count) {
@@ -788,7 +789,7 @@ function Invoke-PdvMonitorTick {
         Write-PdvMonitorRecord $Session 'RecoveryDecision' $decision.Detail $device $profile.Role $decision.Reason;
         $Session.PreviousDecisions[$id] = $decision.Reason;
       }
-      if ($decision.Allowed -and $Session.LoggingHealthy) {
+      if ($decision.Allowed -and $Session.LoggingHealthy -and -not [bool](Get-PdvRuntimeValue $Session 'RemoteBusy' $false)) {
         # Reconsultar imediatamente antes de agir. Nenhuma decisão usa o estado
         # de uma rodada anterior para inferir que o caixa continua fechado.
         $fresh = Get-PdvMonitorSnapshot;
@@ -807,7 +808,7 @@ function Invoke-PdvMonitorTick {
           continue;
         }
         $final = Get-PdvRecoveryDecision -Profile $profile -Device $freshDevice -Context $freshContext -State $state -Now (Get-PdvRuntimeNow);
-        if ($final.Allowed) {
+        if ($final.Allowed -and -not [bool](Get-PdvRuntimeValue $Session 'RemoteBusy' $false)) {
           Write-PdvMonitorRecord $Session 'RecoveryAttempt' 'Solicitando ao Windows o reinício da instância exata; caixa em manutenção autorizada.' $freshDevice $profile.Role $final.Reason;
           $state.LastAttemptAt = Get-PdvRuntimeNow; $state.Attempts += $state.LastAttemptAt; $state.SessionAttempts++;
           Save-PdvMonitorRecoveryHistory $Session;
@@ -825,7 +826,7 @@ function Invoke-PdvMonitorTick {
     }
     if ($Session.ProgramDirectory) {
       Publish-PdvMonitorUpdateResult $Session;
-      if ($Session.AutoUpdateEnabled -and $now -ge $Session.NextUpdateCheckAt -and ($null -eq $Session.NerusAutomation -or $null -eq $Session.NerusAutomation.Pending) -and -not $Session.MaintenanceArmed) {
+      if (-not [bool](Get-PdvRuntimeValue $Session 'RemoteBusy' $false) -and $Session.AutoUpdateEnabled -and $now -ge $Session.NextUpdateCheckAt -and ($null -eq $Session.NerusAutomation -or $null -eq $Session.NerusAutomation.Pending) -and -not $Session.MaintenanceArmed) {
         $Session.NextUpdateCheckAt=$now.AddHours(6);
         $update=Invoke-PdvMonitorUpdateCheck -Session $Session -ProgramDirectory $Session.ProgramDirectory -CurrentVersion $Session.MonitorVersion -Enabled $true;
         $Session.UpdateStatus=[string]$update.Reason; $Session.UpdateStaged=[bool]$update.Staged;
@@ -992,12 +993,14 @@ function Save-PdvMonitorNerusServiceBinding {
 
 function Invoke-PdvMonitorNerusServiceProbe {
   [CmdletBinding()]param($Session);
+  if ([bool](Get-PdvRuntimeValue $Session 'RemoteBusy' $false)) { throw 'RemoteSupportBusy'; }
   try { & $script:nerusModule {param($CurrentSession); Invoke-PdvMonitorNerusServiceProbe -Session $CurrentSession;} $Session; }
   finally { Publish-PdvMonitorNerusServiceNotices $Session; }
 }
 
 function Invoke-PdvMonitorNerusServiceApply {
   [CmdletBinding()]param($Session,[string]$ProposalId);
+  if ([bool](Get-PdvRuntimeValue $Session 'RemoteBusy' $false)) { throw 'RemoteSupportBusy'; }
   try { & $script:nerusModule {param($CurrentSession,$Id); Invoke-PdvMonitorNerusServiceApply -Session $CurrentSession -ProposalId $Id;} $Session $ProposalId; }
   finally { Publish-PdvMonitorNerusServiceNotices $Session; }
 }
@@ -1020,6 +1023,7 @@ function Export-PdvMonitorLogs {
 function Invoke-PdvMonitorNerusRestartProbe {
   [CmdletBinding()]
   param($Session);
+  if ([bool](Get-PdvRuntimeValue $Session 'RemoteBusy' $false)) { return; }
   if ([bool](Get-PdvRuntimeValue (Get-PdvRuntimeValue $Session 'NerusService' $null) 'Busy' $false)) { return; }
   & $script:nerusModule { param($CurrentSession); Invoke-PdvMonitorNerusRestartProbe -Session $CurrentSession; } $Session;
 }
@@ -1027,6 +1031,7 @@ function Invoke-PdvMonitorNerusRestartProbe {
 function Invoke-PdvMonitorNerusRestartApply {
   [CmdletBinding()]
   param($Session, [string]$ProposalId);
+  if ([bool](Get-PdvRuntimeValue $Session 'RemoteBusy' $false)) { return; }
   if ([bool](Get-PdvRuntimeValue (Get-PdvRuntimeValue $Session 'NerusService' $null) 'Busy' $false)) { return; }
   & $script:nerusModule { param($CurrentSession, $Id); Invoke-PdvMonitorNerusRestartApply -Session $CurrentSession -ProposalId $Id; } $Session $ProposalId;
 }

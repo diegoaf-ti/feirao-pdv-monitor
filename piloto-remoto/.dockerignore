@@ -1,0 +1,11 @@
+**
+!gateway/
+!gateway/package.json
+!gateway/relay.js
+!gateway/server.js
+!gateway/init-state.js
+!gateway/web-viewer.js
+!gateway/viewer-client.js
+!gateway/viewer-open.js
+!gateway/viewer.html
+!gateway/viewer.css

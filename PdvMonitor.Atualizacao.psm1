@@ -1,7 +1,7 @@
 ﻿#requires -Version 2.0
 # Atualizações aprovadas: HTTPS + assinatura RSA/SHA256 + chave pública fixada.
 Set-StrictMode -Version 2.0;
-$script:PdvUpdateProgramFiles = @('MonitorPdv.ps1','InicializarMonitor.ps1','Monitor.cmd','IniciarMonitor.vbs','InstalarMonitor.ps1','DesinstalarMonitor.ps1','PdvMonitor.Runtime.psm1','PdvMonitor.Inventario.psm1','PdvMonitor.Coleta.psm1','PdvMonitor.Politica.psm1','PdvLegado.Core.psm1','PdvDispositivos.Core.psm1','PdvMonitor.Transporte.psm1','PdvMonitor.Atualizacao.psm1','AplicarAtualizacao.ps1','monitor-version.txt','PdvMonitor.Nerus.psm1','PdvMonitor.Version.psm1','atualizacoes-chave-publica.xml','IniciarMonitorInstalado.ps1');
+$script:PdvUpdateProgramFiles = @('MonitorPdv.ps1','InicializarMonitor.ps1','Monitor.cmd','IniciarMonitor.vbs','InstalarMonitor.ps1','DesinstalarMonitor.ps1','PdvMonitor.Runtime.psm1','PdvMonitor.Inventario.psm1','PdvMonitor.Coleta.psm1','PdvMonitor.Politica.psm1','PdvLegado.Core.psm1','PdvDispositivos.Core.psm1','PdvMonitor.Transporte.psm1','PdvMonitor.Atualizacao.psm1','AplicarAtualizacao.ps1','monitor-version.txt','PdvMonitor.Nerus.psm1','PdvMonitor.Version.psm1','atualizacoes-chave-publica.xml','IniciarMonitorInstalado.ps1','PdvMonitor.Remoto.psm1','PdvMonitor.Remoto.Transporte.psm1');
 
 function Get-PdvUpdateValue {
   param($Object,[string]$Name,$Default=$null);
@@ -130,8 +130,9 @@ function Get-PdvUpdateAuthorization {
 function New-PdvUpdateWebRequest { param([string]$Uri); return [Net.WebRequest]::Create($Uri); }
 function Invoke-PdvUpdateHttpGet {
   param([string]$Uri,[string]$Authorization,[int]$MaximumBytes,[string]$Destination='');
-  $previous=[Net.ServicePointManager]::SecurityProtocol; $response=$null; $stream=$null; $output=$null; $memory=$null;
+  $previous=[Net.ServicePointManager]::SecurityProtocol;$tlsLock=[Net.ServicePointManager];$ownsTls=$false; $response=$null; $stream=$null; $output=$null; $memory=$null;
   try {
+    $ownsTls=[Threading.Monitor]::TryEnter($tlsLock,2000);if(-not $ownsTls){throw 'UpdateTransportUnavailable';};$previous=[Net.ServicePointManager]::SecurityProtocol;
     [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]3072;
     $request=New-PdvUpdateWebRequest $Uri; $request.Method='GET'; $request.AllowAutoRedirect=$false; $request.Timeout=10000; $request.ReadWriteTimeout=10000; $request.UseDefaultCredentials=$false; $request.Headers['Authorization']=$Authorization;
     $response=$request.GetResponse(); $code=[int]$response.StatusCode;
@@ -146,7 +147,7 @@ function Invoke-PdvUpdateHttpGet {
     $bytes=New-Object byte[] 0; if ($null -ne $memory) { $bytes=$memory.ToArray(); }
     return (New-Object PSObject -Property @{StatusCode=200;Bytes=$bytes;});
   } catch { if ($Destination -and [IO.File]::Exists($Destination)) { if ($null -ne $output) { $output.Close(); $output=$null; }; [IO.File]::Delete($Destination); }; throw 'UpdateDownloadUnavailable'; }
-  finally { if ($null -ne $output) { $output.Close(); }; if ($null -ne $stream) { $stream.Close(); }; if ($null -ne $response) { $response.Close(); }; [Net.ServicePointManager]::SecurityProtocol=$previous; $Authorization=$null; }
+  finally { try{if ($null -ne $output) { $output.Close(); }; if ($null -ne $stream) { $stream.Close(); }; if ($null -ne $response) { $response.Close(); }}finally{if($ownsTls){try{[Net.ServicePointManager]::SecurityProtocol=$previous;}finally{[Threading.Monitor]::Exit($tlsLock);}} $Authorization=$null;} }
 }
 
 function Initialize-PdvUpdateZipReader {
@@ -268,7 +269,7 @@ function Start-PdvMonitorUpdateApply {
   [CmdletBinding()]
   param([Parameter(Mandatory=$true)]$Session,[Parameter(Mandatory=$true)][string]$ProgramDirectory,[bool]$Enabled=$false,[bool]$OperationsIdle=$false);
   if (-not $Enabled) { return (New-PdvUpdateResult $false 'UpdateDisabled'); }
-  if (-not $OperationsIdle -or [bool](Get-PdvUpdateValue $Session 'TickBusy' $false)) { return (New-PdvUpdateResult $false 'UpdateWaitingMonitorIdle'); }
+  if ([bool](Get-PdvUpdateValue $Session 'RemoteBusy' $false) -or -not $OperationsIdle -or [bool](Get-PdvUpdateValue $Session 'TickBusy' $false)) { return (New-PdvUpdateResult $false 'UpdateWaitingMonitorIdle'); }
   try {
     $paths=Get-PdvUpdatePaths ([string](Get-PdvUpdateValue $Session 'DataDirectory'));
     if (-not [IO.Directory]::Exists($paths.Stage)) { return (New-PdvUpdateResult $false 'UpdateNotStaged'); }

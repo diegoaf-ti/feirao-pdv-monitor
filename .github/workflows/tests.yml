@@ -22,7 +22,35 @@ jobs:
             [void][System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errors)
             if ($errors.Count) { throw ($_.Name + ': ' + ($errors | Out-String)) }
           }
-          Get-ChildItem -Filter 'Tests*.ps1' -File | Sort-Object Name | ForEach-Object {
+          Get-ChildItem -Filter 'Tests*.ps1' -File | Where-Object { (Get-Content -LiteralPath $_.FullName -TotalCount 1) -notmatch '#requires -Version 7\.0' } | Sort-Object Name | ForEach-Object {
             & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $_.FullName
             if ($LASTEXITCODE -ne 0) { throw ('Falha em ' + $_.Name) }
           }
+      - name: Inscrição e bootstrap com PowerShell 7 e autoridades efêmeras
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & pwsh -NoLogo -NoProfile -File ./TestsMonitorInscricaoRemota.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'Falha na inscrição isolada' }
+          & pwsh -NoLogo -NoProfile -File ./TestsMonitorInscricaoBootstrap.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'Falha no bootstrap isolado' }
+
+  package-and-gateway:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Pacote, certificados públicos e atualização isolada
+        run: python3 -m unittest discover -s tools -p 'test_*.py' -v
+      - name: Gateway, emissor e autorização com dados sintéticos
+        working-directory: piloto-remoto/gateway
+        run: node --test test/*.test.js
+      - name: Gerar instalador para conferência
+        run: python3 tools/criar-pacote-instalacao.py --source . --output /tmp/pdv-package --version "$(tr -d '\r\n' < monitor-version.txt)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: monitor-windows-piloto
+          path: /tmp/pdv-package/*
+          if-no-files-found: error

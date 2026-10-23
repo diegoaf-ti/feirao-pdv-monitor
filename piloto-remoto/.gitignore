@@ -1,0 +1,19 @@
+infra/.env
+infra/.env.*
+!infra/.env.example
+private/
+state/
+*.key
+*.pem
+*.crt
+*.cer
+*.der
+*.pfx
+*.p12
+windows/remoto-piloto.xml
+device-passwords.json
+gateway.json
+
+# Somente autoridades publicas embutidas; identidades e chaves continuam fora.
+!windows/identity-server-ca.crt
+!windows/identity-device-ca.crt

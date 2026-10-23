@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- MODELO INATIVO. Valores .invalid/zeros sao rejeitados. Nao contem segredos. -->
+<!-- Provisionar fora do repositorio. Nao copiar/ativar na loja antes da homologacao. -->
+<PdvRemoteWindowsPilot>
+  <SchemaVersion>2</SchemaVersion>
+  <Enabled>false</Enabled>
+  <ProfileApproved>false</ProfileApproved>
+  <!-- Aprovar separadamente cada SO/arquitetura e bundle; nao copiar perfil de outro SO. -->
+  <!-- Valores: win7-sp1-x86 | win7-sp1-x64 | win10plus-x86 | win10plus-x64 -->
+  <PlatformProfile>win7-sp1-x64</PlatformProfile>
+  <!-- UUID do agente cadastrado, nunca inferir pelo hostname ou numero do caixa. -->
+  <AgentId>11111111-1111-4111-8111-111111111111</AgentId>
+  <RepeaterId>4901</RepeaterId>
+  <GatewayHost>gateway-piloto.example.invalid</GatewayHost>
+  <GatewayPort>8443</GatewayPort>
+  <CertificateFile>C:\ProgramData\ConectaRemotePilot\identity\client-fullchain.pem</CertificateFile>
+  <CertificateSha256>0000000000000000000000000000000000000000000000000000000000000000</CertificateSha256>
+  <PrivateKeyFile>C:\ProgramData\ConectaRemotePilot\identity\client-private.key</PrivateKeyFile>
+  <ServerCaFile>C:\ProgramData\ConectaRemotePilot\trust\gateway-server-ca.pem</ServerCaFile>
+  <StunnelExe>C:\ProgramData\ConectaRemotePilot\bin\stunnel\stunnel.exe</StunnelExe>
+  <StunnelSha256>0000000000000000000000000000000000000000000000000000000000000000</StunnelSha256>
+  <StunnelSignerThumbprint>0000000000000000000000000000000000000000</StunnelSignerThumbprint>
+  <UltraVncExe>C:\ProgramData\ConectaRemotePilot\bin\ultravnc\winvnc.exe</UltraVncExe>
+  <UltraVncSha256>0000000000000000000000000000000000000000000000000000000000000000</UltraVncSha256>
+  <UltraVncSignerThumbprint>0000000000000000000000000000000000000000</UltraVncSignerThumbprint>
+  <UltraVncIniFile>C:\ProgramData\ConectaRemotePilot\bin\ultravnc\ultravnc.ini</UltraVncIniFile>
+  <UltraVncIniSha256>0000000000000000000000000000000000000000000000000000000000000000</UltraVncIniSha256>
+  <PortableMarkerFile>C:\ProgramData\ConectaRemotePilot\bin\ultravnc\ultravnc.portable</PortableMarkerFile>
+</PdvRemoteWindowsPilot>

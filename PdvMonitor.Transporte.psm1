@@ -430,9 +430,12 @@ function Add-PdvMonitorOutboxRecord {
 function Invoke-PdvMonitorHttpPost {
   param([string]$Endpoint, [string]$Authorization, [byte[]]$Body)
   $previousProtocol = [Net.ServicePointManager]::SecurityProtocol
+  $tlsLock=[Net.ServicePointManager];$ownsTls=$false
   $response = $null
   $stream = $null
   try {
+    $ownsTls=[Threading.Monitor]::TryEnter($tlsLock,2000);if(-not $ownsTls){throw 'TransportUnavailable'}
+    $previousProtocol=[Net.ServicePointManager]::SecurityProtocol
     # Em .NET antigo a atribuição pode falhar. Isso bloqueia apenas o envio;
     # nunca habilitar TLS obsoleto ou ignorar validação do certificado.
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]3072
@@ -454,10 +457,13 @@ function Invoke-PdvMonitorHttpPost {
     if ($null -ne $_.Exception.Response) { $response = $_.Exception.Response; return [int]$response.StatusCode }
     throw 'TransportUnavailable'
   } finally {
-    if ($null -ne $stream) { $stream.Close() }
-    if ($null -ne $response) { $response.Close() }
-    [Net.ServicePointManager]::SecurityProtocol = $previousProtocol
-    $Authorization = $null
+    try {
+      if ($null -ne $stream) { $stream.Close() }
+      if ($null -ne $response) { $response.Close() }
+    } finally {
+      if($ownsTls){try{[Net.ServicePointManager]::SecurityProtocol = $previousProtocol}finally{[Threading.Monitor]::Exit($tlsLock)}}
+      $Authorization = $null
+    }
   }
 }
 

@@ -1,0 +1,183 @@
+{
+  "protocol": "conecta-pdv-remote-gateway-v1",
+  "status": "local-pilot-not-published",
+  "control": {
+    "transport": "HTTPS with mutual TLS; dedicated self-signed control CA and exact API client certificate pin",
+    "create": {
+      "method": "POST",
+      "path": "/v1/leases",
+      "bodyKeysExactly": [
+        "sessionId",
+        "agentId",
+        "repeaterId",
+        "expiresAt",
+        "certificateSha256"
+      ],
+      "sessionId": "UUID; also leaseId",
+      "agentId": "UUID from installation; never inferred from Windows hostname",
+      "repeaterId": "string of 1-9 decimal digits; no leading zero",
+      "certificateSha256": "exact device certificate SHA256; lowercase 64 hex; must match gateway binding",
+      "expiresAt": "absolute RFC3339 timestamp; at most 900 seconds in future for a new lease",
+      "idempotency": "same sessionId and canonical body returns original state; never renews or reopens; different body returns 409"
+    },
+    "get": {
+      "method": "GET",
+      "path": "/v1/leases/:sessionId",
+      "credential": "password only for existing open lease, only internal mTLS API; no-store"
+    },
+    "revoke": {
+      "method": "DELETE",
+      "path": "/v1/leases/:sessionId",
+      "unknownId": "closed tombstone; connectedAt=null"
+    },
+    "responseKeys": [
+      "leaseId",
+      "agentId",
+      "repeaterId",
+      "state",
+      "hostname",
+      "port",
+      "expiresAt",
+      "createdAt",
+      "connectedAt",
+      "closedAt",
+      "closeReason"
+    ],
+    "states": {
+      "pending": "listener allocated; no device",
+      "ready": "device mTLS certificate plus 250-byte Mode II ID accepted",
+      "connected": "one private viewer TCP connection; does not prove VNC login or desktop rendering",
+      "closed": "streams destroyed and new peers rejected"
+    },
+    "errors": {
+      "400": "invalid contract",
+      "403": "binding/certificate unauthorized",
+      "404": "unknown lease",
+      "409": "busy, conflicting or consumed lease",
+      "413": "body exceeds 4096 bytes",
+      "503": "unavailable, capacity or persistence failure"
+    },
+    "viewer": {
+      "method": "POST",
+      "path": "/v1/leases/:sessionId/viewer",
+      "bodyKeysExactly": [
+        "sessionId"
+      ],
+      "authorization": "same mTLS CA and exact API client certificate pin; only ready lease; one viewer",
+      "responseKeysExactly": [
+        "sessionId",
+        "state",
+        "viewerUrl",
+        "ticket",
+        "expiresAt",
+        "ticketExpiresAt"
+      ],
+      "state": "viewer_ready",
+      "ticket": "32 random bytes, base64url; SHA256 only retained; one use; at most 30 seconds",
+      "viewerUrl": "fixed configured public HTTPS origin + /pdv-remote/open; no query or fragment",
+      "expiresAt": "exact original lease deadline, never extended"
+    },
+    "enrollment": {
+      "method": "POST",
+      "path": "/v1/devices/enrollments",
+      "enabledByDefault": false,
+      "authorization": "same internal mTLS CA and exact API client certificate pin; backend authorizes installation/admin activation; never reachable on device port",
+      "bodyKeysExactly": [
+        "requestId",
+        "agentId",
+        "repeaterId",
+        "csrPem",
+        "previousCertificateSha256"
+      ],
+      "csr": "one public CSR <=4096 bytes; proof of private-key possession; CN=pdv-<agentId>; no requested extensions copied",
+      "responseKeysExactly": [
+        "requestId",
+        "agentId",
+        "repeaterId",
+        "certificatePem",
+        "certificateSha256",
+        "expiresAt"
+      ],
+      "certificatePem": "leaf plus one device-root-signed intermediate; no private key or VNC password",
+      "idempotency": "stable requestId and exact body; persists restart; conflicting/superseded generation 409",
+      "issuer": "opt-in server-local intermediate key only; root CA private key stays offline",
+      "validityDays": "1..90; default90; renewal requires current fingerprint and no active lease"
+    },
+    "deviceRevoke": {
+      "method": "DELETE",
+      "path": "/v1/devices/:agentId",
+      "responseKeysExactly": [
+        "agentId",
+        "revoked"
+      ],
+      "behavior": "durable tombstone; closes active leases; removes accepted fingerprint; repeat idempotent; unknown device404; no automatic re-enrollment"
+    }
+  },
+  "device": {
+    "transport": "TLS 1.2+ mutual authentication; distinct self-signed device CA; exact certificate-agent-ID binding",
+    "modeII": "250-byte ASCII ID:<repeaterId> padded with NUL; opaque RFB afterward",
+    "consent": "backend must receive valid local operator decision before creating any lease",
+    "unattended": false
+  },
+  "isolation": {
+    "viewer": "private TCP listener; only guacd IP allowlist; no publicly published VNC ports",
+    "ports": "never reused automatically, including restart; usedPorts durable journal persists beyond closed-session retention; capacity fails closed",
+    "expiry": "gateway own timer destroys both streams; JSON authentication expiry is not session timeout",
+    "restart": "no resume; all open leases become closed; stale lock requires operator review",
+    "secrets": "no VNC password, key, nonce, screen or keyboard data in journal",
+    "enrollmentState": "separate private enrollment journal contains VNC device passwords and durable bindings; no client private keys; atomic fsync and single-writer lock; failure closes leases"
+  },
+  "browser": {
+    "open": {
+      "method": "POST",
+      "path": "/pdv-remote/open",
+      "contentType": "application/x-www-form-urlencoded",
+      "bodyKeysExactly": [
+        "sessionId",
+        "ticket"
+      ],
+      "origin": "exact configured Conecta HTTPS origin",
+      "response": "200 document on viewer origin; script then navigates to session URL, preserving Strict cookie behavior"
+    },
+    "sessionPath": "/pdv-remote/s/:sessionId/",
+    "cookie": "__Secure-pdv_remote; Secure; HttpOnly; SameSite=Strict; path exclusive to session; random credential; never available to JavaScript",
+    "state": {
+      "method": "GET",
+      "path": "/pdv-remote/s/:sessionId/state",
+      "output": "state, absolute expiry and CSRF; no Guacamole credentials"
+    },
+    "end": {
+      "method": "POST",
+      "path": "/pdv-remote/s/:sessionId/end",
+      "authorization": "session cookie + exact Origin + CSRF",
+      "response": "closed only after gateway close; clears cookie"
+    },
+    "tunnel": "Guacamole HTTP tunnel proxy; cookie + CSRF + independent browser token; no query authToken; fixed internal upstream",
+    "secrets": "VNC password, JSON key, Guacamole authToken and internal tunnel token stay server-side; no query/fragment/storage credentials",
+    "timeouts": "lease absolute timer plus 20-second inactivity reaper; no automatic reconnect",
+    "closedConfirmation": "60-second bounded tombstone grants only end confirmation with same cookie/CSRF; never reconnects",
+    "disabledCapabilities": [
+      "clipboard",
+      "file transfer",
+      "audio",
+      "screen recording",
+      "keyboard logging"
+    ],
+    "caveat": "transport connected does not prove VNC authentication or rendered desktop"
+  },
+  "agentApi": {
+    "request": "authenticated GET /api/pdv-monitor/agent/remote/request; closed XML schema",
+    "consent": "authenticated POST /api/pdv-monitor/agent/remote/consent; local operator decision required",
+    "lease": "authenticated GET /api/pdv-monitor/agent/remote/lease; closed XML root PdvRemoteLease schemaVersion=1",
+    "leaseFieldsExactly": [
+      "SessionId",
+      "AgentId",
+      "RepeaterId",
+      "CertificateSha256",
+      "ExpiresAt",
+      "State"
+    ],
+    "heartbeat": "only a new authenticated valid lease response renews native authorization; at most 15 seconds without confirmation",
+    "status": "authenticated POST /api/pdv-monitor/agent/remote/status; local process shutdown must be proven before closed"
+  }
+}

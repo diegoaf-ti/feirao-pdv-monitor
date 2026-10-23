@@ -2,6 +2,7 @@
 """Testes offline do empacotamento; usa RSA temporária sem qualquer credencial real."""
 import base64
 import importlib.util
+import re
 from pathlib import Path
 import subprocess
 import tempfile
@@ -30,7 +31,9 @@ class ReleaseTests(unittest.TestCase):
         (self.source / 'PdvMonitor.Version.psm1').write_text("function Get-PdvMonitorVersion { return '0.3.0'; }", encoding='utf-8')
         (self.source / 'atualizacoes-chave-publica.xml').write_text('<RSAKeyValue><Modulus>'+modulus+'</Modulus><Exponent>AQAB</Exponent></RSAKeyValue>')
         # Nunca devem vazar mesmo quando presentes no diretório de entrada.
-        for name in ('central-credencial.bin', 'monitor.xml', 'central.xml', 'segredo.sql'):
+        for name in ('central-credencial.bin', 'monitor.xml', 'central.xml', 'segredo.sql',
+                     'PdvMonitor.Remoto.Windows.psm1', 'RemoteWindowsNative.cs',
+                     'remoto-piloto.xml', 'client-private.key', 'winvnc.exe', 'stunnel.exe'):
             (self.source / name).write_text('NUNCA-INCLUIR')
 
     def tearDown(self):
@@ -54,6 +57,33 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(fields.findtext('Version'), '0.3.0')
         self.assertRegex(fields.findtext('IssuedAt'), r'T[0-9:]+Z$')
         self.assertNotIn(b'PRIVATE KEY', archive.read_bytes())
+
+    def test_remote_core_files_are_required(self):
+        self.assertEqual(len(release.PROGRAM_FILES), 22)
+        for name in ('PdvMonitor.Remoto.psm1', 'PdvMonitor.Remoto.Transporte.psm1'):
+            path = self.source / name
+            saved = path.read_bytes()
+            path.unlink()
+            with self.assertRaises(ValueError):
+                release.create_package(self.source, self.root / ('missing-' + name), '0.3.0', self.key, 30)
+            path.write_bytes(saved)
+
+    def test_all_install_update_and_recovery_lists_match(self):
+        root = MODULE.parent.parent
+        patterns = {
+            'InstalarMonitor.ps1': r'function Get-PdvMonitorInstallFiles\s*\{.*?return @\((.*?)\);',
+            'PdvMonitor.Atualizacao.psm1': r'\$script:PdvUpdateProgramFiles\s*=\s*@\((.*?)\);',
+            'IniciarMonitorInstalado.ps1': r'\$allowed\s*=\s*@\((.*?)\);',
+        }
+        for name, pattern in patterns.items():
+            text = (root / name).read_text(encoding='utf-8-sig')
+            match = re.search(pattern, text, re.S)
+            self.assertIsNotNone(match, name)
+            names = re.findall(r"'([^']+)'", match.group(1))
+            self.assertEqual(tuple(names), release.PROGRAM_FILES, name)
+        module = (root / 'PdvMonitor.Version.psm1').read_text(encoding='utf-8-sig')
+        version = re.search(r"return '([0-9]+\.[0-9]+\.[0-9]+)'", module).group(1)
+        self.assertEqual((root / 'monitor-version.txt').read_text().strip(), version)
 
     def test_no_private_key_inside_source(self):
         inside=self.source/'private.pem'; inside.write_bytes(self.key.read_bytes())
