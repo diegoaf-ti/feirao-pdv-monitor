@@ -170,7 +170,7 @@ try{
     foreach($right in @([Security.AccessControl.FileSystemRights]::WriteData,[Security.AccessControl.FileSystemRights]::AppendData,[Security.AccessControl.FileSystemRights]::Delete,[Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles,[Security.AccessControl.FileSystemRights]::ChangePermissions,[Security.AccessControl.FileSystemRights]::TakeOwnership)){Assert-Win (($mask -band $right) -ne 0) 'Mascara deixou mutacao';}
   }
   Test-Win 'caminhos nao permitem UNC, escape de config e unicode convertido para ASCII' {
-    $case=New-WinCase;foreach($path in @('\\server\private.key',($case.Path+'/a;exec=x'),($case.Path+"/a`nexec=x"),($case.Path+'/nao-é-ascii'),($case.Path+"/a`0b"),($case.Path+'/a"b'),'relative/path',''))){Assert-WinThrows {& $module {param($Path);Test-PdvRemoteWindowsLocalPath $Path;} $path;} 'RemoteWindowsUnsafePath';}
+    $case=New-WinCase;foreach($path in @('\\server\private.key',($case.Path+'/a;exec=x'),($case.Path+"/a`nexec=x"),($case.Path+'/nao-é-ascii'),($case.Path+"/a`0b"),($case.Path+'/a"b'),'relative/path','')){Assert-WinThrows {& $module {param($Path);Test-PdvRemoteWindowsLocalPath $Path;} $path;} 'RemoteWindowsUnsafePath';}
   }
   Test-Win 'config portable impede fallback e entradas HTTP/LAN, DSM, arquivos ou sem autenticacao' {
     foreach($change in @(@{From='SocketConnect=0';To='SocketConnect=1'},@{From='ReverseAuthRequired=1';To='ReverseAuthRequired=0'},@{From='FileTransferEnabled=0';To='FileTransferEnabled=1'},@{From='UseDSMPlugin=0';To='UseDSMPlugin=1'},@{From='EnableTLS=0';To='EnableTLS=1'},@{From='cloudEnabled=0';To='cloudEnabled=1'},@{From='UseBridge=0';To='UseBridge=1'})){
