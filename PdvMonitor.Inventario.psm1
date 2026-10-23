@@ -283,7 +283,7 @@ function ConvertTo-PdvSoftwareThreats {
     if($id -cnotmatch '^[0-9]{1,20}$' -or $name -isnot [string] -or -not $name.Trim() -or $active -isnot [bool]){$complete=$false;continue;}
     $safeName=ConvertTo-PdvHardwareText $name 160;if($safeName -cne $name.Trim()){$complete=$false;}
     $severity='unknown';switch([string](Get-PdvSoftwareValue $t 'SeverityID' '')){'1'{$severity='low';}'2'{$severity='moderate';}'3'{$severity='high';}'4'{$severity='severe';}}
-    $seen='';$success=$null;$matches=@($latest | Where-Object {$_.Id -ceq $id} | Sort-Object -Property Time -Descending);
+    $seen='';$success=$null;$matches=@($latest | Where-Object {$_.Id -ceq $id} | Sort-Object -Property @{Expression={[string]($_['Time'])}} -Descending);
     if($matches.Count){$seen=[string]$matches[0].Time;foreach($m in $matches){if($m.Time -ceq $seen -and $m.Success -is [bool]){if(-not $m.Success){$success=$false;break;};if($null -eq $success){$success=$true;}}}}
     $record=@{id=$id;name=$safeName;severity=$severity;active=$active;actionSuccess=$success;lastSeenAt=$seen;source='MicrosoftDefender'};
     if($unique.ContainsKey($id)){
