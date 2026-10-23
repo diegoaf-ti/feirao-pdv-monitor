@@ -23,8 +23,10 @@ function Get-PdvRemoteWindowsHash {
 }
 function Test-PdvRemoteWindowsLocalPath {
   param([string]$Path,[bool]$Directory=$false);
-  if(-not $Path -or $Path.StartsWith('\\') -or -not [IO.Path]::IsPathRooted($Path) -or $Path -match '[^\x20-\x7e]|["%=;#]' -or $Path.Length -gt 240){throw 'RemoteWindowsUnsafePath';}
-  $full=[IO.Path]::GetFullPath($Path);$probe=$full;
+  # Validate literal input before .NET Framework path APIs, which throw on controls.
+  if(-not $Path -or $Path.StartsWith('\\') -or $Path -match '[^\x20-\x7e]|["%=;#]' -or $Path.Length -gt 240){throw 'RemoteWindowsUnsafePath';}
+  try{if(-not [IO.Path]::IsPathRooted($Path)){throw 'RemoteWindowsUnsafePath';};$full=[IO.Path]::GetFullPath($Path);}catch{throw 'RemoteWindowsUnsafePath';}
+  $probe=$full;
   while($probe){
     if([IO.File]::Exists($probe) -or [IO.Directory]::Exists($probe)){
       if(([IO.File]::GetAttributes($probe) -band [IO.FileAttributes]::ReparsePoint) -ne 0){throw 'RemoteWindowsUnsafePath';}
