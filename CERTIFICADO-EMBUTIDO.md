@@ -27,12 +27,11 @@ emitida. Arquivos privados parciais não são apagados automaticamente.
 ## Limites de ativação
 
 Este fluxo instala a identidade, sem habilitar uma sessão, aprovar executáveis ou
-criar autorização para técnicos. Os componentes UltraVNC/stunnel, seu perfil
-administrativo e o consentimento do operador continuam necessários. A senha VNC
+criar autorização para técnicos. O pacote com remoto inclui componentes x64 conferidos e gera o perfil administrativo individual. O pacote leve continua sem esses componentes. O consentimento do operador continua necessário. A senha VNC
 permanece fora deste cadastro; o vínculo do perfil portable requer provisionamento
 administrativo próprio. Ações existentes de encerramento no Conecta encerram
 sessões; revogação definitiva de certificado só existe no controle interno do
-gateway nesta etapa. Renovação de identidade não é automática nesta versão.
+gateway nesta etapa. Na versão 0.8, o instalador com remoto registra uma tarefa SYSTEM protegida para conferir validade localmente e renovar nos últimos 30 dias, com prova da chave atual e confirmação da chave nova. A instalação inicial usa um código; atendimentos mantêm consentimento. Consulte GUIA-REMOTO-0.8.md.
 
 O Windows 7 exige SP1, CLR4/.NET4.6.2 ou superior e os demais pré-requisitos já
 documentados. Sintaxe PowerShell2 não significa execução sob CLR2. A arquitetura

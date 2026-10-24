@@ -39,6 +39,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Falha na inscrição isolada' }
           & pwsh -NoLogo -NoProfile -File ./TestsMonitorInscricaoBootstrap.ps1
           if ($LASTEXITCODE -ne 0) { throw 'Falha no bootstrap isolado' }
+          & pwsh -NoLogo -NoProfile -File ./TestsMonitorIdentidadeRemota.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'Falha na renovacao isolada da identidade remota' }
 
   package-and-gateway:
     runs-on: ubuntu-latest

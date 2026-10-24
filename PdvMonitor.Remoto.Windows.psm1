@@ -210,6 +210,20 @@ function Get-PdvRemoteWindowsCertificateHash {
   $match=[regex]::Match($text,'-----BEGIN CERTIFICATE-----\s*([A-Za-z0-9+/=\s]+?)\s*-----END CERTIFICATE-----');if(-not $match.Success){throw 'RemoteWindowsCertificateInvalid';}
   try{$bytes=[Convert]::FromBase64String($match.Groups[1].Value);$certificate=New-Object Security.Cryptography.X509Certificates.X509Certificate2(,$bytes);if($certificate.NotAfter.ToUniversalTime() -le (Get-PdvRemoteWindowsNow).UtcDateTime -or $certificate.NotBefore.ToUniversalTime() -gt (Get-PdvRemoteWindowsNow).UtcDateTime){throw 'Invalid';};return (Get-PdvRemoteWindowsHash $certificate.RawData);}catch{throw 'RemoteWindowsCertificateInvalid';}finally{if($null -ne $certificate){$certificate.Reset();}}
 }
+function Get-PdvRemoteWindowsBundleFiles {
+  param($Configuration);
+  $bundle=Join-Path $script:RemoteWindowsModuleDirectory 'piloto-remoto/windows/bundle';
+  if(-not [IO.Directory]::Exists($bundle)){return @();} # Existing reviewed manual profiles remain supported.
+  $helper=Join-Path $script:RemoteWindowsModuleDirectory 'tools/ValidarBundleRemoto.ps1';$lock=Join-Path $script:RemoteWindowsModuleDirectory 'tools/remoto-bundle-lock.xml';
+  [void](Test-PdvRemoteWindowsAdministrativeFile $helper);[void](Test-PdvRemoteWindowsAdministrativeFile $lock);
+  . $helper;
+  $approved=Assert-PdvRemoteBundle -BundleDirectory $bundle -TrustedManifestPath $lock -ProfileId $Configuration.PlatformProfile -AllowRuntimeConfiguration;
+  $paths=@($helper,$lock,(Join-Path $bundle 'remoto-bundle.xml'));
+  foreach($entry in $approved.Files){[void](Test-PdvRemoteWindowsAdministrativeFile $entry.Path);$paths+=$entry.Path;}
+  if($Configuration.StunnelExe -cne (Join-Path $bundle 'bin/stunnel/stunnel.exe') -or $Configuration.UltraVncExe -cne (Join-Path $bundle 'bin/ultravnc/winvnc.exe') -or $Configuration.UltraVncIniFile -cne (Join-Path $bundle 'bin/ultravnc/ultravnc.ini')){throw 'RemoteWindowsBundlePathMismatch';}
+  return $paths;
+}
+
 function Test-PdvMonitorRemoteWindowsConfiguration {
   param($Configuration);
   [void](Test-PdvRemoteWindowsConfigurationShape $Configuration);
@@ -373,6 +387,25 @@ function Get-PdvRemoteWindowsStartFailureReason {
 }
 function Start-PdvMonitorRemoteWindowsTransport {
   param($Transport,$BrokerContext,$Lease);
+  $identityLock=$null;
+  try{
+    $bundle=Join-Path $script:RemoteWindowsModuleDirectory 'piloto-remoto/windows/bundle';
+    if([IO.Directory]::Exists($bundle)){
+      # File sharing is cross-session: SYSTEM renewal and the interactive host coordinate.
+      $path=Join-Path ([IO.Path]::GetDirectoryName($script:RemoteWindowsModuleDirectory)) 'enrollment.lock';[void](Test-PdvRemoteWindowsAdministrativeFile $path);
+      $identityLock=[IO.File]::Open($path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::None);
+      $latest=Read-PdvMonitorRemoteWindowsConfiguration $Transport.DataDirectory;
+      foreach($key in $Transport.Configuration.Keys){if(@('CertificateFile','CertificateSha256','PrivateKeyFile','ServerCaFile') -cnotcontains $key -and $latest[$key] -cne $Transport.Configuration[$key]){throw 'RemoteWindowsIdentityUnexpectedChange';}}
+      $Transport.Configuration=$latest;
+    }
+    $result=Start-PdvMonitorRemoteWindowsTransportInternal $Transport $BrokerContext $Lease;
+    if($null -ne $identityLock){$Transport.Locks+=,$identityLock;$identityLock=$null;}
+    return $result;
+  }finally{if($null -ne $identityLock){$identityLock.Dispose();}}
+}
+
+function Start-PdvMonitorRemoteWindowsTransportInternal {
+  param($Transport,$BrokerContext,$Lease);
   if(-not $Transport.Enabled){throw 'RemoteWindowsDisabled';};if(@('idle','closed') -cnotcontains $Transport.Stage){throw 'RemoteWindowsTransportBusy';}
   if(-not (Test-PdvRemoteWindowsUiThread)){throw 'RemoteWindowsStaRequired';}
   [void](Test-PdvMonitorRemoteWindowsConfiguration $Transport.Configuration);Initialize-PdvRemoteWindowsNative;
@@ -385,7 +418,8 @@ function Start-PdvMonitorRemoteWindowsTransport {
     if([IO.File]::Exists($Transport.JournalPath)){throw 'RemoteWindowsInterruptedTransport';}
     Test-PdvRemoteWindowsNoExistingVnc;
     # Travas impedem troca/escrita dos executaveis/configuracao entre verificacao e CreateProcess.
-    foreach($path in @($Transport.Configuration.StunnelExe,$Transport.Configuration.UltraVncExe,$Transport.Configuration.UltraVncIniFile,$Transport.Configuration.PortableMarkerFile,$Transport.Configuration.CertificateFile,$Transport.Configuration.PrivateKeyFile,$Transport.Configuration.ServerCaFile)){$Transport.Locks+=,[IO.File]::Open($path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read);}
+    $bundleFiles=@(Get-PdvRemoteWindowsBundleFiles $Transport.Configuration);
+    foreach($path in @($Transport.Configuration.StunnelExe,$Transport.Configuration.UltraVncExe,$Transport.Configuration.UltraVncIniFile,$Transport.Configuration.PortableMarkerFile,$Transport.Configuration.CertificateFile,$Transport.Configuration.PrivateKeyFile,$Transport.Configuration.ServerCaFile)+$bundleFiles){$Transport.Locks+=,[IO.File]::Open($path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read);}
     [void](Test-PdvMonitorRemoteWindowsConfiguration $Transport.Configuration);
     $Transport.JournalOwned=$true;Write-PdvRemoteWindowsTransportJournal $Transport 'prepared';
     $seconds=[int][math]::Floor(($expires-(Get-PdvRemoteWindowsNow)).TotalSeconds);if($seconds -lt 1){throw 'RemoteWindowsLeaseExpired';}

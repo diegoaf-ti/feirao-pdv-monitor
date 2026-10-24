@@ -220,12 +220,69 @@ namespace Conecta.PdvRemotePilot {
     public bool ProcessesStopped { get { lock(gate) { return ProcessesStoppedLocked(); } } }
     public ChildIdentity[] Children { get { lock(gate) { return children.ToArray(); } } }
     public void SetTunnelPort(int port) { lock(gate) { if(closed || children.Count != 0 || tunnelPort != 0 || port < 1024 || port > 65535) throw new InvalidOperationException("RemoteInvalidTunnelPort"); tunnelPort = port; } }
+    private static string ChildEnvironmentDirectory(string value) {
+      // Pure Windows-path validation, independent of the machine running tests.
+      // Never expand inherited variables or accept a PATH-list as one directory.
+      if (String.IsNullOrEmpty(value) || value.Length > 32760 || value.Length < 3
+        || !((value[0] >= 'A' && value[0] <= 'Z') || (value[0] >= 'a' && value[0] <= 'z'))
+        || value[1] != ':' || value[2] != '\\') throw new InvalidOperationException("RemoteChildEnvironmentPath");
+      for (int i=0; i<value.Length; i++) {
+        char character = value[i];
+        if (Char.IsControl(character) || character == '"' || character == '%' || character == ';'
+          || character == '=' || character == '/' || character == '<' || character == '>' || character == '|'
+          || character == '?' || character == '*' || (character == ':' && i != 1)) throw new InvalidOperationException("RemoteChildEnvironmentPath");
+      }
+      string normalized = value.TrimEnd('\\');
+      if (normalized.Length < 3) throw new InvalidOperationException("RemoteChildEnvironmentPath");
+      foreach (string segment in normalized.Substring(3).Split('\\')) {
+        if (segment.Length == 0 || segment == "." || segment == ".." || segment.EndsWith(".", StringComparison.Ordinal)
+          || segment.EndsWith(" ", StringComparison.Ordinal)) throw new InvalidOperationException("RemoteChildEnvironmentPath");
+      }
+      return normalized;
+    }
+    public static string BuildChildEnvironmentBlock(string windowsDirectory, string systemDirectory, string executableDirectory,
+      string userProfile, string applicationData, string localApplicationData) {
+      // Only explicit OS/known-folder paths enter this block. No GetEnvironmentVariables,
+      // inherited PATH, OpenSSL settings, profiler, COM or compatibility-hook variables.
+      string windows = ChildEnvironmentDirectory(windowsDirectory);
+      string system = ChildEnvironmentDirectory(systemDirectory);
+      string executable = ChildEnvironmentDirectory(executableDirectory);
+      string profile = ChildEnvironmentDirectory(userProfile);
+      string roaming = ChildEnvironmentDirectory(applicationData);
+      string local = ChildEnvironmentDirectory(localApplicationData);
+      if (!String.Equals(system, windows+"\\System32", StringComparison.OrdinalIgnoreCase)
+        && !String.Equals(system, windows+"\\SysWOW64", StringComparison.OrdinalIgnoreCase)) throw new InvalidOperationException("RemoteChildEnvironmentSystemPath");
+      SortedDictionary<string,string> values = new SortedDictionary<string,string>(StringComparer.OrdinalIgnoreCase);
+      values.Add("APPDATA", roaming); values.Add("LOCALAPPDATA", local);
+      // NUL disables external configuration; engine/provider lookup is confined to
+      // the dedicated, administratively protected executable directory.
+      values.Add("OPENSSL_CONF", "NUL"); values.Add("OPENSSL_ENGINES", executable); values.Add("OPENSSL_MODULES", executable);
+      values.Add("PATH", system+";"+windows); values.Add("SystemDrive", windows.Substring(0,2));
+      values.Add("SystemRoot", windows); values.Add("TEMP", local+"\\Temp"); values.Add("TMP", local+"\\Temp");
+      values.Add("USERPROFILE", profile); values.Add("WINDIR", windows);
+      StringBuilder result = new StringBuilder();
+      foreach (KeyValuePair<string,string> pair in values) result.Append(pair.Key).Append('=').Append(pair.Value).Append('\0');
+      result.Append('\0');
+      if (result.Length > 32760) throw new InvalidOperationException("RemoteChildEnvironmentTooLarge");
+      return result.ToString();
+    }
     public ChildIdentity StartChild(string executable, string arguments, string directory) {
       lock(gate) {
         if (closed || clock.Elapsed.TotalSeconds >= maximumSeconds || children.Count >= 2 || uncontainedChildren.Count != 0 || tunnelPort == 0) throw new InvalidOperationException("RemoteSupervisorClosed");
         StartupInfo startup = new StartupInfo(); startup.Size = (uint)Marshal.SizeOf(typeof(StartupInfo));
-        ProcessInformation process;
-        if (executable.IndexOf('"') >= 0 || !CreateProcess(executable, new StringBuilder("\""+executable+"\" "+arguments), IntPtr.Zero, IntPtr.Zero, false, 0x4 | 0x08000000, IntPtr.Zero, directory, ref startup, out process)) throw new InvalidOperationException("RemoteChildStartFailed");
+        ProcessInformation process = new ProcessInformation();
+        IntPtr environment = IntPtr.Zero;
+        try {
+          string environmentBlock = BuildChildEnvironmentBlock(
+            Environment.GetFolderPath(Environment.SpecialFolder.Windows), Environment.SystemDirectory, directory,
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData));
+          environment = Marshal.StringToHGlobalUni(environmentBlock);
+          // CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED | CREATE_NO_WINDOW.
+          // The owned child is still checked and assigned to our Job before resume.
+          if (executable.IndexOf('"') >= 0 || !CreateProcess(executable, new StringBuilder("\""+executable+"\" "+arguments), IntPtr.Zero, IntPtr.Zero, false, 0x4 | 0x08000000 | 0x400, environment, directory, ref startup, out process)) throw new InvalidOperationException("RemoteChildStartFailed");
+        } finally { if (environment != IntPtr.Zero) Marshal.FreeHGlobal(environment); }
         uncontainedChildren.Add(process.Process);
         bool owned = false;
         try {

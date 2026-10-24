@@ -8,6 +8,7 @@ using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Runtime.InteropServices;
 
 namespace Conecta.PdvRemoteEnrollment {
   public sealed class PublicRequest {
@@ -98,6 +99,51 @@ namespace Conecta.PdvRemoteEnrollment {
       RSA rsa=RSA.Create(); rsa.ImportParameters(new RSAParameters { Modulus=modulus,Exponent=exponent }); return rsa;
     }
     private static byte[] Unsigned(byte[] integer) { if(integer.Length==0 || (integer[0]&128)!=0 || (integer.Length>1 && integer[0]==0 && (integer[1]&128)==0)) throw new InvalidOperationException("RemoteEnrollmentInvalidDer"); if(integer[0]!=0) return integer; byte[] value=new byte[integer.Length-1]; Buffer.BlockCopy(integer,1,value,0,value.Length); return value; }
+    // Bounded, canonical PKCS#1 reader. Private bytes never cross into PowerShell.
+    private static byte[] PrivateInteger(Der key, int size) {
+      byte[] value=Unsigned(key.Read(2,false));
+      if(value.Length>size) { Clear(value); throw new InvalidOperationException("RemoteIdentityInvalidPrivateKey"); }
+      byte[] padded=new byte[size]; Buffer.BlockCopy(value,0,padded,size-value.Length,value.Length); Clear(value); return padded;
+    }
+    public static string SignIdentityPayload(string privateKeyPath, string payload, string expectedPublicKeySha256) {
+      if(payload==null || payload.Length>4096 || !Regex.IsMatch(expectedPublicKeySha256??String.Empty,"\\A[a-f0-9]{64}\\z")) throw new InvalidOperationException("RemoteIdentityInvalidProof");
+      byte[] pem=null,der=null; RSAParameters secret=new RSAParameters();
+      try {
+        using(FileStream file=new FileStream(privateKeyPath,FileMode.Open,FileAccess.Read,FileShare.Read)) {
+          if(file.Length<256 || file.Length>8192) throw new InvalidOperationException("RemoteIdentityInvalidPrivateKey");
+          pem=new byte[(int)file.Length]; int offset=0; while(offset<pem.Length) { int read=file.Read(pem,offset,pem.Length-offset); if(read<=0) throw new InvalidOperationException("RemoteIdentityInvalidPrivateKey"); offset+=read; }
+        }
+        der=ReadPem(Encoding.ASCII.GetString(pem),"RSA PRIVATE KEY",8192); Der outer=new Der(der); Der key=outer.Sequence(); outer.End();
+        if(!Equal(key.Read(2,false),new byte[]{0})) throw new InvalidOperationException("RemoteIdentityInvalidPrivateKey");
+        secret.Modulus=PrivateInteger(key,256); secret.Exponent=PrivateInteger(key,3);
+        if((secret.Modulus[0]&128)==0 || !Equal(secret.Exponent,new byte[]{1,0,1})) throw new InvalidOperationException("RemoteEnrollmentRsa2048Required");
+        secret.D=PrivateInteger(key,256); secret.P=PrivateInteger(key,128); secret.Q=PrivateInteger(key,128); secret.DP=PrivateInteger(key,128); secret.DQ=PrivateInteger(key,128); secret.InverseQ=PrivateInteger(key,128); key.End();
+        if(Sha256(Spki(secret))!=expectedPublicKeySha256) throw new InvalidOperationException("RemoteIdentityPrivateKeyMismatch");
+        // Provider 24 supports SHA256 on Windows 7; production requires CLR4/.NET4.6.2.
+        RSA rsa;
+        if(Environment.OSVersion.Platform==PlatformID.Win32NT) { CspParameters parameters=new CspParameters(24,"Microsoft Enhanced RSA and AES Cryptographic Provider"); parameters.Flags=CspProviderFlags.CreateEphemeralKey; RSACryptoServiceProvider provider=new RSACryptoServiceProvider(2048,parameters); provider.PersistKeyInCsp=false; rsa=provider; }
+        else rsa=RSA.Create();
+        using(rsa) using(SHA256 hash=SHA256.Create()) {
+          rsa.ImportParameters(secret); RSAPKCS1SignatureFormatter formatter=new RSAPKCS1SignatureFormatter(rsa); formatter.SetHashAlgorithm("SHA256"); return Convert.ToBase64String(formatter.CreateSignature(hash.ComputeHash(Encoding.UTF8.GetBytes(payload))));
+        }
+      } finally { Clear(pem); Clear(der); Clear(secret.Modulus); Clear(secret.Exponent); Clear(secret.D); Clear(secret.P); Clear(secret.Q); Clear(secret.DP); Clear(secret.DQ); Clear(secret.InverseQ); }
+    }
+    // UltraVNC's legacy INI format, inside the authenticated TLS tunnel only.
+    // This is encoding for interoperability, not encryption suitable for storage.
+    public static byte[] EncodeVncPassword(string password) {
+      if(password==null || !Regex.IsMatch(password,"\\A[\\x21-\\x7e]{8}\\z")) throw new InvalidOperationException("RemoteIdentityInvalidVncCredential");
+      byte[] plain=Encoding.ASCII.GetBytes(password);
+      try { using(DES des=DES.Create()) { des.Mode=CipherMode.ECB; des.Padding=PaddingMode.None; des.Key=new byte[]{0xe8,0x4a,0xd6,0x60,0xc4,0x72,0x1a,0xe0}; using(ICryptoTransform encoder=des.CreateEncryptor()) return encoder.TransformFinalBlock(plain,0,8); } }
+      finally { Clear(plain); }
+    }
+    [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true,EntryPoint="WritePrivateProfileStructW")]
+    private static extern bool WritePrivateProfileStruct(string section,string key,byte[] data,uint size,string file);
+    public static void WriteVncPassword(string iniPath,string password) {
+      if(Environment.OSVersion.Platform!=PlatformID.Win32NT) throw new InvalidOperationException("RemoteEnrollmentWindowsRequired");
+      byte[] encoded=EncodeVncPassword(password);
+      try { if(!WritePrivateProfileStruct("UltraVNC","passwd",encoded,8,iniPath)) throw new InvalidOperationException("RemoteIdentityVncProfileWriteFailed"); }
+      finally { Clear(encoded); }
+    }
     public static string ValidateRequest(string csrPem,string agentId) {
       byte[] bytes=ReadPem(csrPem,"CERTIFICATE REQUEST",8192); Der outer=new Der(bytes); Der request=outer.Sequence(); outer.End(); byte[] infoBytes=request.Read(0x30,true); if(!Equal(request.Read(0x30,true),Sha256Algorithm)) throw new InvalidOperationException("RemoteEnrollmentInvalidCsr"); byte[] signature=request.Read(3,false); request.End();
       Der infoOuter=new Der(infoBytes); Der info=infoOuter.Sequence(); infoOuter.End(); if(!Equal(info.Read(2,false),new byte[] {0}) || !Equal(info.Read(0x30,true),Subject(agentId))) throw new InvalidOperationException("RemoteEnrollmentInvalidCsr"); byte[] spki=info.Read(0x30,true); if(info.Read(0xa0,false).Length!=0) throw new InvalidOperationException("RemoteEnrollmentInvalidCsr"); info.End();

@@ -2,7 +2,8 @@
 """Gera o aplicativo para instalacao manual, sem publicar nem ler credenciais.
 
 O ZIP completo e diferente do ZIP plano usado pelo atualizador. Os executaveis
-de terceiros, configuracao ativa, PKI, dados do usuario e servidor ficam fora.
+de terceiros exigem --remote-bundle validado no Windows. Configuracao ativa,
+PKI, dados do usuario e servidor ficam fora.
 """
 import argparse
 import hashlib
@@ -32,9 +33,15 @@ REMOTE_SOURCES = (
     'piloto-remoto/windows/inscricao-confianca.xml',
     'piloto-remoto/windows/identity-server-ca.crt',
     'piloto-remoto/windows/identity-device-ca.crt',
+    'PdvMonitor.Remoto.Identidade.psm1',
+    'piloto-remoto/windows/ManterIdentidadeRemota.ps1',
+    'piloto-remoto/windows/InstalarRemotoCompleto.ps1',
+    'piloto-remoto/windows/InstalarRemotoCompleto.cmd',
+    'tools/ValidarBundleRemoto.ps1',
+    'tools/remoto-bundle-lock.xml',
 )
 INSTALL_EXTRAS = (
-    'Instalar.cmd', 'GUIA-INSTALACAO-0.7.md', 'README.md', 'CERTIFICADO-EMBUTIDO.md',
+    'Instalar.cmd', 'InstalarPacote.ps1', 'GUIA-REMOTO-0.8.md', 'REMOTO-BUNDLE.md', 'GUIA-INSTALACAO-0.7.md', 'README.md', 'CERTIFICADO-EMBUTIDO.md',
     'GUIA-REMOTO-INTEGRACAO.md', 'GUIA-INVENTARIO-EMPRESA.md',
     'GUIA-NERUS-SERVICE.md', 'GUIA-PILOTO-V3.md',
     'piloto-remoto/windows/InstalarComponenteRemoto.ps1',
@@ -104,7 +111,7 @@ def validate_embedded_trust(source, content):
         raise ValueError('Autoridades de servidor e dispositivo devem ser distintas')
 
 
-def create_install_package(source, output, version):
+def create_install_package(source, output, version, remote_bundle=None):
     source = Path(source).resolve()
     output = Path(output).resolve()
     if not VERSION.fullmatch(version):
@@ -125,6 +132,13 @@ def create_install_package(source, output, version):
     if example.findtext('Enabled') != 'false' or example.findtext('ProfileApproved') != 'false':
         raise ValueError('Modelo remoto deve permanecer inativo')
     validate_embedded_trust(source, content)
+    remote_content = {}
+    if remote_bundle is not None:
+        spec = importlib.util.spec_from_file_location('pdv_remote_bundle', source / 'tools/remote_bundle.py')
+        bundle_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(bundle_module)
+        remote_content = bundle_module.validated_content(remote_bundle, source / 'tools/remoto-bundle-lock.xml', source / 'tools/ValidarBundleRemoto.ps1')
+        content.update({'piloto-remoto/windows/bundle/' + name: data for name, data in remote_content.items()})
     manifest = ET.Element('PdvRemoteInstallManifest', {'schemaVersion': '1'})
     for name in REMOTE_SOURCES:
         data = content[name]
@@ -148,7 +162,10 @@ def create_install_package(source, output, version):
             'version': version, 'kind': 'manual-install-pilot', 'package': package.name,
             'sha256': hashlib.sha256(package.read_bytes()).hexdigest(), 'bytes': package.stat().st_size,
             'coreFiles': 22, 'archiveEntries': len(content), 'remoteConfigured': False,
-            'thirdPartyExecutablesIncluded': False, 'privateKeysOrUserDataIncluded': False,
+            'thirdPartyExecutablesIncluded': bool(remote_content), 'privateKeysOrUserDataIncluded': False,
+            'remoteBundleAuthenticodeValidatedOnBuildWindows': bool(remote_content),
+            'remoteBundleArchitectures': ['x64'] if remote_content else [],
+            'remoteIdentityOrConsentPreauthorized': False,
             'publicTrustCertificatesEmbedded': True, 'perComputerIdentity': 'created-locally-with-one-time-activation',
             'published': False, 'nativeWindowsOrAntivirusValidated': False, 'filesSha256': hashes,
         }
@@ -165,6 +182,7 @@ if __name__ == '__main__':
     parser.add_argument('--source', required=True, type=Path)
     parser.add_argument('--output', required=True, type=Path)
     parser.add_argument('--version', required=True)
+    parser.add_argument('--remote-bundle', type=Path, help='Bundle exato aprovado; exige Authenticode valido no Windows')
     args = parser.parse_args()
-    for path in create_install_package(args.source, args.output, args.version):
+    for path in create_install_package(args.source, args.output, args.version, args.remote_bundle):
         print(path)

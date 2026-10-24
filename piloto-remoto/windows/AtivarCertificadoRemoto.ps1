@@ -1,4 +1,5 @@
 ﻿#requires -Version 2.0
+param([string]$MonitorUserSid='', [switch]$ProvisionarRemoto);
 # Nenhum segredo e aceito por argumento. Executar somente a copia administrativa.
 $ErrorActionPreference='Stop';
 $activation=$null;$pointer=[IntPtr]::Zero;$agentId='';$lock=$null;
@@ -24,12 +25,13 @@ try{
   $activation=Read-Host 'Codigo de ativacao' -AsSecureString;
   $pointer=[Runtime.InteropServices.Marshal]::SecureStringToBSTR($activation);$plain=[Runtime.InteropServices.Marshal]::PtrToStringBSTR($pointer);
   try{if($plain -cnotmatch '^([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.[A-Za-z0-9_-]{43}$'){throw 'InvalidActivationCode';};$agentId=$matches[1];}finally{$plain=$null;[Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer);$pointer=[IntPtr]::Zero;}
-  $accountName=Read-Host 'Conta Windows que executa o monitor (exemplo LOJA\Caixa; confirme com a manutencao)';$account=New-Object Security.Principal.NTAccount($accountName);$sid=$account.Translate([Security.Principal.SecurityIdentifier]).Value;if($sid -cnotmatch '^S-1-5-21-[0-9]+-[0-9]+-[0-9]+-[0-9]+$'){throw 'InvalidMonitorUserSid';}
+  $accountName='';if(-not $MonitorUserSid){$accountName=Read-Host 'Conta Windows que executa o monitor (exemplo LOJA\Caixa; confirme com a manutencao)';$account=New-Object Security.Principal.NTAccount($accountName);$sid=$account.Translate([Security.Principal.SecurityIdentifier]).Value;}else{$sid=$MonitorUserSid;};if($sid -cnotmatch '^S-1-5-21-[0-9]+-[0-9]+-[0-9]+-[0-9]+$'){throw 'InvalidMonitorUserSid';}
   $identities=Join-Path $remote 'identities';if(-not [IO.Directory]::Exists($identities)){[Conecta.PdvRemoteEnrollment.StorageV1]::CreateDirectoryForUser($identities,$sid);}
   # Exclusao mutua da ativacao; diretorio administrativo protege o arquivo de lock.
   $lockPath=Join-Path $remote 'enrollment.lock';$lock=New-Object IO.FileStream($lockPath,[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None);[Conecta.PdvRemoteEnrollment.StorageV1]::AssertSingleLink($lock.SafeFileHandle);
   $request=New-PdvMonitorRemoteEnrollmentRequest (Join-Path $identities $agentId) $agentId ([Guid]::NewGuid().ToString('D')) $sid;
   $result=Invoke-PdvMonitorRemoteEnrollment $request $trust $activation;
+  if($ProvisionarRemoto){Import-Module (Join-Path $app 'PdvMonitor.Remoto.Identidade.psm1') -Force;[void](Complete-PdvRemoteProvisioning $result $sid $trust);}
   Write-Host ('Certificado instalado para a instalacao '+$result.AgentId+'.');Write-Host 'A chave foi gerada neste computador e permanece aqui. O acesso remoto aguarda perfil e componentes aprovados.';
 }catch{
   # Nao imprime excecao HTTP, corpo recebido, CSR, codigo ou chave.

@@ -269,7 +269,7 @@ function Get-PdvRemotePreparationReason {
 
 function New-PdvMonitorRemoteController {
   param($Session,[string]$ProgramDirectory);
-  $controller=@{Enabled=$false;Reason='RemoteExtensionNotInstalled';Broker=$null;Windows=$null;WindowsModule=$null;NextPollAt=[DateTimeOffset]::MinValue;Lease=$null;LeaseVerifiedAt=$null;CentralExpiresAt='';PromptBusy=$false;Paused=$false;Busy=$false;Stopping=$false;IdleFailures=0;};
+  $controller=@{Enabled=$false;Reason='RemoteExtensionNotInstalled';Broker=$null;Windows=$null;WindowsModule=$null;NextPollAt=[DateTimeOffset]::MinValue;Lease=$null;LeaseVerifiedAt=$null;CentralExpiresAt='';PromptBusy=$false;Paused=$false;Busy=$false;Stopping=$false;IdleFailures=0;DataDirectory=$Session.DataDirectory;};
   try{
     $path=Get-PdvRemoteAdministrativeModulePath;
     if(-not [IO.File]::Exists($path)){return $controller;}
@@ -374,9 +374,21 @@ function Update-PdvMonitorRemoteLocal {
   $Controller.Busy=Test-PdvRemoteControllerBusy $Controller;
 }
 
+function Sync-PdvRemoteControllerIdentity {
+  param($Controller);
+  if(-not $Controller.Contains('DataDirectory') -or $null -eq $Controller.WindowsModule -or $null -eq $Controller.Windows -or $null -eq $Controller.Broker -or @('idle','closed','denied') -cnotcontains $Controller.Broker.Stage -or (Test-PdvRemoteControllerBusy $Controller)){return;}
+  $configuration=& $Controller.WindowsModule {param($Directory);Read-PdvMonitorRemoteWindowsConfiguration $Directory;} $Controller.DataDirectory;
+  if($configuration.CertificateSha256 -ceq $Controller.Windows.Configuration.CertificateSha256){return;}
+  foreach($key in $Controller.Windows.Configuration.Keys){if(@('CertificateFile','CertificateSha256','PrivateKeyFile','ServerCaFile') -cnotcontains $key -and $configuration[$key] -cne $Controller.Windows.Configuration[$key]){throw 'RemoteIdentityUnexpectedProfileChange';}}
+  [void](& $Controller.WindowsModule {param($Config);Test-PdvMonitorRemoteWindowsConfiguration $Config;} $configuration);
+  $Controller.Windows.Configuration=$configuration;
+  & $script:remoteBrokerModule {param($Config);$script:RemoteWindowsConfiguration=$Config;} $configuration;
+}
+
 function Get-PdvMonitorRemoteWork {
   param($Controller,[bool]$OperationsIdle=$true);
   if($null -eq $Controller -or -not $Controller.Enabled -or $null -eq $Controller.Broker -or $Controller.PromptBusy -or (Get-PdvRemoteControllerNow) -lt $Controller.NextPollAt){return $null;}
+  try{Sync-PdvRemoteControllerIdentity $Controller;}catch{$Controller.Reason='RemoteIdentityReloadBlocked';return $null;}
   $broker=$Controller.Broker;$local=Get-PdvRemoteControllerWindowsSnapshot $Controller;
   if([string](Get-PdvRemoteControllerField $local 'Stage' '') -ceq 'blocked'){return $null;}
   if([string](Get-PdvRemoteControllerField $local 'Stage' '') -ceq 'interrupted'){

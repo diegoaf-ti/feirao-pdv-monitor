@@ -59,6 +59,20 @@ const createGateway = (options) => {
         if (!enrollment) throw new RelayError('EnrollmentDisabled', 503);
         send(response, 200, enrollment.enroll(await readBody(request, 8192))); return;
       }
+      if (request.url === '/v1/devices/renewals' && request.method === 'POST') {
+        if (!enrollment) throw new RelayError('EnrollmentDisabled', 503);
+        send(response, 200, enrollment.prepareRenewal(await readBody(request, 8192))); return;
+      }
+      const renewalMatch = /^\/v1\/devices\/renewals\/([0-9a-f-]{36})\/(commit|abort|status)$/.exec(request.url || '');
+      if (renewalMatch && request.method === 'POST') {
+        if (!enrollment) throw new RelayError('EnrollmentDisabled', 503);
+        const operation = { commit: 'commitRenewal', abort: 'abortRenewal', status: 'renewalStatus' }[renewalMatch[2]];
+        send(response, 200, enrollment[operation](renewalMatch[1], await readBody(request))); return;
+      }
+      if (request.url === '/v1/devices/profiles' && request.method === 'POST') {
+        if (!enrollment) throw new RelayError('EnrollmentDisabled', 503);
+        send(response, 200, enrollment.provisionProfile(await readBody(request))); return;
+      }
       const deviceMatch = /^\/v1\/devices\/([0-9a-f-]{36})$/.exec(request.url || '');
       if (deviceMatch && request.method === 'DELETE') {
         if (!enrollment) throw new RelayError('EnrollmentDisabled', 503);

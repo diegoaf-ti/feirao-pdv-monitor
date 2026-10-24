@@ -7,7 +7,7 @@
 $script:PdvRemoteInstallScriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path;
 
 function Get-PdvRemoteInstallFiles {
-  return @('PdvMonitor.Remoto.Windows.psm1', 'piloto-remoto/windows/RemoteWindowsNative.cs', 'piloto-remoto/windows/remoto-piloto.xml.example', 'piloto-remoto/windows/COMPATIBILIDADE-WINDOWS7.md', 'PdvMonitor.Remoto.Inscricao.psm1', 'piloto-remoto/windows/RemoteEnrollmentCrypto.cs', 'piloto-remoto/windows/RemoteEnrollmentStorage.cs', 'piloto-remoto/windows/AtivarCertificadoRemoto.ps1', 'piloto-remoto/windows/AtivarCertificadoRemotoBootstrap.ps1', 'piloto-remoto/windows/AtivarCertificadoRemoto.cmd', 'piloto-remoto/windows/inscricao-confianca.xml', 'piloto-remoto/windows/identity-server-ca.crt', 'piloto-remoto/windows/identity-device-ca.crt');
+  return @('PdvMonitor.Remoto.Windows.psm1', 'PdvMonitor.Remoto.Identidade.psm1', 'piloto-remoto/windows/ManterIdentidadeRemota.ps1', 'piloto-remoto/windows/InstalarRemotoCompleto.ps1', 'piloto-remoto/windows/InstalarRemotoCompleto.cmd', 'tools/ValidarBundleRemoto.ps1', 'tools/remoto-bundle-lock.xml', 'piloto-remoto/windows/RemoteWindowsNative.cs', 'piloto-remoto/windows/remoto-piloto.xml.example', 'piloto-remoto/windows/COMPATIBILIDADE-WINDOWS7.md', 'PdvMonitor.Remoto.Inscricao.psm1', 'piloto-remoto/windows/RemoteEnrollmentCrypto.cs', 'piloto-remoto/windows/RemoteEnrollmentStorage.cs', 'piloto-remoto/windows/AtivarCertificadoRemoto.ps1', 'piloto-remoto/windows/AtivarCertificadoRemotoBootstrap.ps1', 'piloto-remoto/windows/AtivarCertificadoRemoto.cmd', 'piloto-remoto/windows/inscricao-confianca.xml', 'piloto-remoto/windows/identity-server-ca.crt', 'piloto-remoto/windows/identity-device-ca.crt');
 }
 
 function Initialize-PdvRemoteInstallNative {
@@ -210,7 +210,7 @@ function Remove-PdvRemoteInstallStaging {
   if (-not $Root -or -not [IO.Directory]::Exists($Root)) { return; }
   [void](Assert-PdvRemoteInstallPath $Root); Assert-PdvRemoteInstallAcl $Root;
   foreach ($entry in $Files) { $path = Join-Path $Root $entry.RelativePath; if ([IO.File]::Exists($path)) { [void](Assert-PdvRemoteInstallPath $path); [IO.File]::Delete($path); } }
-  foreach ($relative in @('piloto-remoto/windows', 'piloto-remoto', '')) {
+  foreach ($relative in @('piloto-remoto/windows', 'piloto-remoto', 'tools', '')) {
     $path = $Root; if ($relative) { $path = Join-Path $Root $relative; }
     if ([IO.Directory]::Exists($path)) { [void](Assert-PdvRemoteInstallPath $path); [IO.Directory]::Delete($path, $false); }
   }
@@ -230,6 +230,7 @@ function Invoke-PdvRemoteAdministrativeInstall {
     New-PdvRemoteInstallDirectory $target.Remote; $remoteCreated = $true;
     $staging = Join-Path $target.Remote ('app.preparando-' + [Guid]::NewGuid().ToString('N'));
     New-PdvRemoteInstallDirectory $staging;
+    New-PdvRemoteInstallDirectory (Join-Path $staging 'tools');
     New-PdvRemoteInstallDirectory (Join-Path $staging 'piloto-remoto');
     New-PdvRemoteInstallDirectory (Join-Path $staging 'piloto-remoto/windows');
     foreach ($entry in $files) {
