@@ -370,9 +370,19 @@ function Save-PdvMonitorProfiles {
 
 function Set-PdvMonitorCentral {
   [CmdletBinding()]
-  param($Session, [string]$Endpoint, [string]$StoreId, [string]$Terminal, [string]$AgentId, [string]$Token);
-  $result = Set-PdvMonitorCentralConfig -Session $Session -Endpoint $Endpoint -StoreId $StoreId -Terminal $Terminal -AgentId $AgentId -Token $Token;
+  param($Session, [string]$Endpoint, [string]$StoreId, [string]$Terminal, [string]$AgentId, [string]$Token, [switch]$ArchivePreviousIdentity);
+  if([bool](Get-PdvRuntimeValue $Session 'TickBusy' $false) -or [bool](Get-PdvRuntimeValue $Session 'RemoteBusy' $false)){throw 'Aguarde a coleta/envio terminar e encerre o atendimento remoto antes de reconfigurar.';}
+  $oldCentral=Get-PdvRuntimeValue $Session.Config 'Central' @{};$changed=[bool]$ArchivePreviousIdentity;
+  foreach($pair in @(@('AgentId',$AgentId),@('StoreId',$StoreId),@('Terminal',$Terminal),@('Endpoint',$Endpoint))){if([string](Get-PdvRuntimeValue $oldCentral $pair[0] '') -cne [string]$pair[1]){$changed=$true;}}
+  $nerus=Get-PdvRuntimeValue $Session 'NerusAutomation' $null;
+  if($changed -and $null -ne (Get-PdvRuntimeValue $nerus 'Pending' $null)){throw 'Existe uma tentativa de correção do Nerus pendente de confirmação. Aguarde sua conciliação antes de trocar o cadastro; o histórico foi preservado.';}
+  $result = Set-PdvMonitorCentralConfig -Session $Session -Endpoint $Endpoint -StoreId $StoreId -Terminal $Terminal -AgentId $AgentId -Token $Token -ArchivePreviousIdentity:$ArchivePreviousIdentity;
   if (-not $result.Success) { throw ('Não foi possível configurar o envio: ' + $result.Reason + '. ' + $Session.UploadStatusText); }
+  if($changed){
+    $Session.MaintenanceArmed=$false;$Session.MaintenanceExpiresAt=$null;$Session.Config.AutoRecoveryEnabled=$false;$Session.AutoUpdateEnabled=$false;
+    if($null -ne $nerus){$nerus.Policy=$null;$nerus.PolicyFetchedAt=[DateTimeOffset]::MinValue;$nerus.NextPolicyAt=[DateTimeOffset]::MinValue;$nerus.Samples=@();}
+    foreach($name in @('NerusRestart','NerusService')){$context=Get-PdvRuntimeValue $Session $name $null;if($null -ne $context){$context.Proposal=$null;}}
+  }
   $Session.LastSnapshotAt = $null; $Session.LastHardwareAt=$null; $Session.HardwareLastQueuedAt=$null;
   $Session.LastSoftwareAt=$null; $Session.SoftwareLastQueuedAt=$null;
   $Session.HardwareQueueChecked=$false; $Session.SoftwareQueueChecked=$false;
