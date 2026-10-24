@@ -37,8 +37,18 @@ function Write-PdvBundleSignatureDiagnostic {
 function Assert-PdvBundleAuthenticode {
   param([string]$Path,[string]$ExpectedThumbprint,[string]$FailureCode);
   $signature=$null;
-  try{$signature=Get-AuthenticodeSignature -LiteralPath $Path -ErrorAction Stop;}
-  catch{Write-PdvBundleSignatureDiagnostic ([IO.Path]::GetFileName($Path)) $null ([string]$_.Exception.Message);throw $FailureCode;}
+  try{
+    if([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT){
+      # Python pode herdar PSModulePath do pwsh 7 antes de iniciar powershell.exe
+      # 5.1. Carregar o modulo inbox do proprio runtime evita escolher a DLL
+      # CoreCLR de outro PowerShell. Nao altera store, cadeia nem revogacao.
+      $securityModule=Join-Path $PSHOME 'Modules/Microsoft.PowerShell.Security/Microsoft.PowerShell.Security.psd1';
+      if(-not [IO.File]::Exists($securityModule)){throw 'WindowsInboxSecurityModuleMissing';}
+      Import-Module $securityModule -ErrorAction Stop -Scope Local;
+    }
+    $signature=Get-AuthenticodeSignature -LiteralPath $Path -ErrorAction Stop;
+  }
+  catch{$details=[string]$_.Exception.Message;$inner=$_.Exception.InnerException;$depth=0;while($null -ne $inner -and $depth -lt 3){$details+=' | '+[string]$inner.Message;$inner=$inner.InnerException;$depth++;};Write-PdvBundleSignatureDiagnostic ([IO.Path]::GetFileName($Path)) $null $details;throw $FailureCode;}
   $thumbprint='';if($null -ne $signature.SignerCertificate){$thumbprint=([string]$signature.SignerCertificate.Thumbprint).ToUpperInvariant();}
   if($signature.Status -ne [Management.Automation.SignatureStatus]::Valid -or $null -eq $signature.SignerCertificate -or $thumbprint -cne $ExpectedThumbprint){Write-PdvBundleSignatureDiagnostic ([IO.Path]::GetFileName($Path)) $signature;throw $FailureCode;}
 }
