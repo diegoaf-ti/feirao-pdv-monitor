@@ -153,6 +153,7 @@ function Set-PdvMonitorControls {
 
 
 function Show-PdvMonitorCentralConfiguration {
+  if($null -ne $script:worker -or $null -ne $script:remoteWorker -or $null -ne $script:nerusWorker -or $null -ne $script:serviceWorker -or $script:session.TickBusy -or $script:session.RemoteBusy){Show-PdvMonitorMessage 'Aguarde o envio terminar e encerre o atendimento remoto antes de configurar.' 'Configuração em uso';return;}
   $dialog = New-Object System.Windows.Forms.Form;
   $dialog.Text = 'Envio para a central de diagnóstico'; $dialog.Size = New-Object System.Drawing.Size(670, 360);
   $dialog.StartPosition = 'CenterParent'; $dialog.FormBorderStyle = 'FixedDialog';
@@ -186,14 +187,25 @@ function Show-PdvMonitorCentralConfiguration {
   $grid.Controls.Add($buttons, 1, 6); $dialog.CancelButton = $cancel;
   $save.add_Click({
     try {
-      Set-PdvMonitorCentral -Session $script:session -Endpoint $fields['Endpoint'].Text.Trim() -StoreId $fields['StoreId'].Text.Trim() -Terminal $fields['Terminal'].Text.Trim() -AgentId $fields['AgentId'].Text.Trim() -Token $fields['Token'].Text;
+      try{
+        Set-PdvMonitorCentral -Session $script:session -Endpoint $fields['Endpoint'].Text.Trim() -StoreId $fields['StoreId'].Text.Trim() -Terminal $fields['Terminal'].Text.Trim() -AgentId $fields['AgentId'].Text.Trim() -Token $fields['Token'].Text;
+      }catch{
+        if($_.Exception.Message -notmatch 'PendingIdentityChange'){throw;}
+        $previous=$script:session.Config.Central;
+        $message=('Cadastro anterior: loja '+[string]$previous.StoreId+', caixa '+[string]$previous.Terminal+'. Novo cadastro: loja '+$fields['StoreId'].Text.Trim()+', caixa '+$fields['Terminal'].Text.Trim()+'.'+[Environment]::NewLine+[Environment]::NewLine)+'Existem registros pendentes de outra instalação. Deseja preservar essa fila separadamente e usar o novo cadastro? Os registros anteriores não serão apagados nem enviados como se fossem deste novo caixa. A recuperação ficará desarmada até nova conferência.';
+        $answer=[Windows.Forms.MessageBox]::Show($dialog,$message,'Preservar fila anterior e reconfigurar',[Windows.Forms.MessageBoxButtons]::YesNo,[Windows.Forms.MessageBoxIcon]::Warning,[Windows.Forms.MessageBoxDefaultButton]::Button2);
+        if($answer -ne [Windows.Forms.DialogResult]::Yes){return;}
+        Set-PdvMonitorCentral -Session $script:session -Endpoint $fields['Endpoint'].Text.Trim() -StoreId $fields['StoreId'].Text.Trim() -Terminal $fields['Terminal'].Text.Trim() -AgentId $fields['AgentId'].Text.Trim() -Token $fields['Token'].Text -ArchivePreviousIdentity;
+      }
+      if($null -ne $script:remoteController){$script:remoteController=New-PdvMonitorRemoteController -Session $script:session -ProgramDirectory $script:programDirectory;}
       $fields['Token'].Text = '';
       $dialog.DialogResult = 'OK'; $dialog.Close();
     } catch { Show-PdvMonitorMessage $_.Exception.Message 'Envio central não configurado'; }
   });
+  $script:centralConfigurationOpen=$true;
   try {
     if ($dialog.ShowDialog($form) -eq 'OK') { Update-PdvMonitorView; }
-  } finally { $fields['Token'].Text = ''; $dialog.Dispose(); }
+  } finally { $script:centralConfigurationOpen=$false;$fields['Token'].Text = ''; $dialog.Dispose(); }
 }
 
 function Receive-PdvMonitorDeviceSignals {
@@ -220,7 +232,7 @@ function Receive-PdvMonitorDeviceSignals {
 }
 
 function Start-PdvMonitorTickWorker {
-  if ($null -ne $script:worker -or $null -ne $script:nerusWorker -or $script:closing -or $script:session.NerusRestart.Busy -or (Test-PdvMonitorNerusServiceBusy)) { return; }
+  if ($script:centralConfigurationOpen -or $null -ne $script:worker -or $null -ne $script:nerusWorker -or $script:closing -or $script:session.NerusRestart.Busy -or (Test-PdvMonitorNerusServiceBusy)) { return; }
   Set-PdvMonitorControls $false;
   $statusLabel.Text = 'Consultando dispositivos e gravando o diagnóstico...';
   $script:worker = [System.Management.Automation.PowerShell]::Create();
@@ -475,6 +487,7 @@ function Complete-PdvMonitorRemoteWorker {
 }
 
 function Update-PdvMonitorRemoteHost {
+  if($script:centralConfigurationOpen){return;}
   if($null -eq $script:remoteController -or -not $script:remoteController.Enabled -or $script:remoteUiBusy){return;}
   $script:remoteUiBusy=$true;
   try{
@@ -525,6 +538,7 @@ if (-not $createdNew) {
   $mutex.Dispose(); exit 0;
 }
 
+$script:centralConfigurationOpen=$false;
 $script:session = $null; $script:worker = $null; $script:workerResult = $null;
 $script:nerusWorker = $null; $script:nerusWorkerResult = $null; $script:nerusWorkerMode = '';
 $script:serviceWorker = $null; $script:serviceWorkerResult = $null; $script:serviceWorkerMode = '';

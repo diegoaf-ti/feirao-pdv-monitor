@@ -42,7 +42,7 @@ class InstallPackageTest(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b'fixture')
         tool = self.source / 'tools/criar-pacote-atualizacao.py'
-        tool.parent.mkdir()
+        tool.parent.mkdir(exist_ok=True)
         tool.write_text('PROGRAM_FILES = ' + repr(core))
         (self.source / 'monitor-version.txt').write_text('0.7.0\r\n')
         (self.source / 'PdvMonitor.Version.psm1').write_text("function Get-PdvMonitorVersion { return '0.7.0'; }")

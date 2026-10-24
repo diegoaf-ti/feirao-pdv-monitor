@@ -1,0 +1,52 @@
+{
+  "schemaVersion": 1,
+  "checkedAt": "2026-10-24",
+  "status": "pilot-candidate-needs-windows-authenticode-and-native-test",
+  "manifestSha256": "f90acc254838c5715ca411c8e30e9cdf356bde92fda246d81f75f6dae6e44537",
+  "artifacts": [
+    {
+      "name": "UltraVNC_1830.zip",
+      "url": "https://uvnc.eu/download/1800/UltraVNC_1830.zip",
+      "sha256": "11163a0b9b86321bf6403eb0cf84b81f7230ce32e6291377e1fe5beb987f7e4f",
+      "publisherPage": "https://uvnc.com/downloads/ultravnc/172-ultravnc-1-8-3-0.html",
+      "sourceRevision": "36c2389f681c9c939d5276323cf6242d26bb00fb",
+      "sourceUrl": "https://github.com/ultravnc/UltraVNC/archive/36c2389f681c9c939d5276323cf6242d26bb00fb.tar.gz"
+    },
+    {
+      "name": "stunnel-5.82-win64-installer.exe",
+      "url": "https://www.stunnel.org/downloads/stunnel-5.82-win64-installer.exe",
+      "sha256": "722c1ad626919af2b0034666b4d19cc4795e925c32f60e8f3c59af4fb3ad2dfc",
+      "publisherPage": "https://www.stunnel.org/downloads.html",
+      "publisherThumbprint": "52080A81F4A29130C44554D0264CC1E2786DEE85"
+    }
+  ],
+  "buildSources": [
+    {
+      "name": "stunnel-5.82.tar.gz",
+      "url": "https://www.stunnel.org/downloads/stunnel-5.82.tar.gz",
+      "sha256": "8e7438ccd6b3a2ab05182d0846e112a56a7f557ecdee40de07bf67820008bef7"
+    },
+    {
+      "name": "openssl-3.5.9.tar.gz",
+      "url": "https://www.openssl.org/source/openssl-3.5.9.tar.gz",
+      "sha256": "603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a"
+    }
+  ],
+  "architectures": {
+    "x64": "official-current-stunnel-container-with-one-fixed-runtime-dll-exception",
+    "x86": "blocked-no-current-official-stunnel-binary"
+  },
+  "proofLimitations": [
+    "PKCS7 certificates and PE imports inspected on macOS; Windows trust/CRL validation required before packaging.",
+    "No Windows7, Defender, actual interactive session or hardware validation performed.",
+    "libssp-0.dll is unsigned; exactly this hash is accepted only with exact original signed stunnel container present and verified."
+  ],
+  "security": {
+    "embeddedOpenSsl": "3.5.8",
+    "maintainedTarget": "3.5.9",
+    "advisory": "https://openssl-library.org/news/secadv/20260929.txt",
+    "disposition": "pilot-only-TCP-TLS-client-RSA; residual-low-DoS-CRLDP; prefer-rebuild-3.5.9",
+    "highCve": "CVE-2026-84782-DTLS-not-used",
+    "tlsClientResidual": "CVE-2026-35189 may exhaust memory when parsing hostile peer CRLDP before trust verification; pinned CA is not a complete mitigation."
+  }
+}

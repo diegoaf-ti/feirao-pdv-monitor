@@ -423,6 +423,52 @@ test('TLS real: cadastro por CSR gera vínculo individual; revogação encerra s
   assert.equal((await request(ports, 'POST', '/v1/leases', { ...lease, sessionId: crypto.randomUUID() })).status, 403);
 });
 
+test('TLS real: renovação em duas fases mantém fingerprint antigo até commit, perfil secreto interno e consentimento intacto', async (t) => {
+  const folder = fs.mkdtempSync(path.join(directory, 'renewal-')); fs.chmodSync(folder, 0o700);
+  const journal = path.join(folder, 'devices.json'); initializeEnrollmentState(journal, '--gateway-stopped');
+  const opensslPath = process.env.OPENSSL || (process.platform === 'darwin' ? execFileSync('/usr/bin/which', ['openssl'], { encoding: 'utf8' }).trim() : '/usr/bin/openssl');
+  const { gateway, ports } = await fixture(t, { bindings: [], passwords: {}, enrollment: { enabled: true, journal, issuer: { enabled: true, openssl: opensslPath, caCertificateFile: path.join(directory, 'issuing-ca.crt'), caPrivateKeyFile: path.join(directory, 'issuing-ca.key'), validityDays: 1 } } });
+  const created = await request(ports, 'POST', '/v1/devices/enrollments', { requestId: crypto.randomUUID(), agentId, repeaterId, csrPem: read('enrolling.csr').toString(), previousCertificateSha256: null });
+  const currentHash = created.data.certificateSha256;
+  const profileInput = { agentId, repeaterId, certificateSha256: currentHash };
+  const profile = await request(ports, 'POST', '/v1/devices/profiles', profileInput);
+  assert.equal(profile.status, 200); assert.equal(profile.headers['cache-control'], 'no-store'); assert.equal(profile.data.vncPassword.length, 8);
+  assert.equal((await request(ports, 'POST', '/v1/devices/profiles', profileInput, certificates.control2)).status, 403);
+  await assert.rejects(request(ports, 'POST', '/v1/devices/profiles', profileInput, certificates.device));
+  const input = { requestId: crypto.randomUUID(), agentId, repeaterId, csrPem: read('enrolling.csr').toString(), previousCertificateSha256: currentHash, requestedAt: new Date().toISOString() };
+  const prepare = await request(ports, 'POST', '/v1/devices/renewals', input);
+  assert.equal(prepare.status, 200); assert.equal(prepare.data.state, 'prepared'); assert.equal(prepare.data.password, undefined);
+  const nextHash = prepare.data.certificateSha256;
+  assert.equal(gateway.relay.bindings.get(agentId).certificateSha256, currentHash);
+  const confirmation = { agentId, repeaterId, previousCertificateSha256: currentHash, certificateSha256: nextHash };
+  const status = await request(ports, 'POST', `/v1/devices/renewals/${input.requestId}/status`, { ...confirmation, certificateSha256: null });
+  assert.equal(status.status, 200); assert.equal(status.data.state, 'prepared');
+  const lease = { ...body(), certificateSha256: currentHash };
+  assert.equal((await request(ports, 'POST', '/v1/leases', lease)).status, 200);
+  assert.equal((await request(ports, 'POST', `/v1/devices/renewals/${input.requestId}/commit`, confirmation)).status, 409);
+  assert.equal(gateway.relay.bindings.get(agentId).certificateSha256, currentHash);
+  await request(ports, 'DELETE', `/v1/leases/${lease.sessionId}`);
+  const committed = await request(ports, 'POST', `/v1/devices/renewals/${input.requestId}/commit`, confirmation);
+  assert.equal(committed.status, 200); assert.equal(committed.data.state, 'committed'); assert.equal(gateway.relay.bindings.get(agentId).certificateSha256, nextHash);
+  assert.equal((await request(ports, 'POST', `/v1/devices/renewals/${input.requestId}/commit`, confirmation)).data.state, 'committed');
+  assert.equal((await request(ports, 'POST', `/v1/devices/renewals/${input.requestId}/abort`, confirmation)).status, 409);
+  assert.equal((await request(ports, 'POST', '/v1/devices/profiles', profileInput)).status, 409);
+  const newProfile = await request(ports, 'POST', '/v1/devices/profiles', { ...profileInput, certificateSha256: nextHash });
+  assert.equal(newProfile.data.vncPassword, profile.data.vncPassword);
+  assert.equal((await request(ports, 'POST', '/v1/leases', { ...lease, sessionId: crypto.randomUUID() })).status, 403);
+  assert.equal(gateway.relay.live.size, 0);
+  const freshLease = { ...lease, sessionId: crypto.randomUUID(), certificateSha256: nextHash };
+  assert.equal((await request(ports, 'POST', '/v1/leases', freshLease)).status, 200);
+  const oldDevice = await connectDevice(ports, { key: read('enrolling.key'), cert: created.data.certificatePem });
+  const oldClosed = once(oldDevice, 'close'); oldDevice.write(frame()); await oldClosed;
+  assert.equal(gateway.relay.get(freshLease.sessionId).state, 'pending');
+  const newDevice = await connectDevice(ports, { key: read('enrolling.key'), cert: prepare.data.certificatePem }); newDevice.write(frame());
+  await until(() => gateway.relay.get(freshLease.sessionId).state === 'ready');
+  const closed = once(newDevice, 'close'); await request(ports, 'DELETE', `/v1/devices/${agentId}`); await closed;
+  assert.equal((await request(ports, 'POST', '/v1/devices/renewals', input)).status, 403);
+  assert.equal((await request(ports, 'POST', '/v1/devices/profiles', { ...profileInput, certificateSha256: nextHash })).status, 403);
+});
+
 test('adapter real da API: enrollment mTLS, validação de cadeia, replay e erros definitivos sem app/banco', { skip: !process.env.PDV_REMOTE_BACKEND_SOURCE }, async (t) => {
   const backend = process.env.PDV_REMOTE_BACKEND_SOURCE;
   const { createRemoteGateway } = require(path.join(backend, 'src/services/pdvMonitorRemoteGateway.js'));

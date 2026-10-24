@@ -1,0 +1,28 @@
+name: Candidato stunnel MSVC e OpenSSL LTS
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unsigned-build:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        architecture: [x86, x64]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compilar fontes pinadas com toolchain fixa e conferir imports
+        shell: powershell
+        run: |
+          & ./tools/CompilarStunnelMsvc.ps1 -Architecture '${{ matrix.architecture }}' -OutputDirectory '${{ runner.temp }}/stunnel-candidate-${{ matrix.architecture }}'
+          if ($LASTEXITCODE -ne 0) { throw 'Build MSVC recusada' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NAO-DISTRIBUIR-stunnel-sem-assinatura-${{ matrix.architecture }}
+          path: ${{ runner.temp }}/stunnel-candidate-${{ matrix.architecture }}/*
+          if-no-files-found: error

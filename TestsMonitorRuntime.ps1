@@ -437,5 +437,25 @@ try {
   Assert-Runtime ($null -eq $session.HardwareLastQueuedAt -and $session.HardwareQueueFailed -and $session.HardwareStatus -like '*envio patrimonial pendente*') 'Falha de fila preserva inventário válido e invalida somente a referência de inclusão anterior';
   & $module {$script:TestHardwareQueueFailure=$false;$script:TestNow=$script:TestNow.AddMinutes(15)};Invoke-PdvMonitorTick $session;
   Assert-Runtime ((Get-TestMetric 'TestHardwareQueued') -eq ($attempts+1) -and -not $session.HardwareQueueFailed -and $null -ne $session.HardwareLastQueuedAt) 'Inventário alterado é reenfileirado em 15 minutos após falha, sem esperar renovação de 24h';
+  # Troca de cadastro nunca reutiliza politica, proposta ou operacao do caixa anterior.
+  & $module {
+    $script:TestCentralWrites=0;$script:TestCentralFailure=$false;
+    function script:Set-PdvMonitorCentralConfig {
+      param($Session,$Endpoint,$StoreId,$Terminal,$AgentId,$Token,[switch]$ArchivePreviousIdentity);
+      $script:TestCentralWrites++;if($script:TestCentralFailure){return @{Success=$false;Reason='PendingIdentityChange'};}
+      $Session.Config.Central=@{Enabled=$true;Endpoint=$Endpoint;StoreId=$StoreId;Terminal=$Terminal;AgentId=$AgentId};return @{Success=$true;Reason='Configured'};
+    }
+  }
+  $session=New-TestSession;$session.Config.Central=@{Enabled=$true;Endpoint='https://example.invalid/api/pdv-monitor/ingest';StoreId='49';Terminal='CX4901';AgentId='11111111-1111-4111-8111-111111111111'};
+  $session.NerusAutomation=@{Pending=@{TicketId='original-ticket'};Policy=@{Enabled=$true};PolicyFetchedAt=[DateTimeOffset]::UtcNow;NextPolicyAt=[DateTimeOffset]::UtcNow.AddMinutes(15);Samples=@('old-sample')};
+  $blocked=$false;try{Set-PdvMonitorCentral $session 'https://example.invalid/api/pdv-monitor/ingest' '49' 'CX4902' '22222222-2222-4222-8222-222222222222' ('a'*64) -ArchivePreviousIdentity;}catch{$blocked=$true;}
+  Assert-Runtime ($blocked -and (Get-TestMetric 'TestCentralWrites') -eq 0 -and $session.NerusAutomation.Pending.TicketId -ceq 'original-ticket' -and $session.Config.Central.Terminal -ceq 'CX4901') 'Tentativa Nerus pendente impede troca sem apagar ticket nem escrever nova identidade';
+  $session.NerusAutomation.Pending=$null;$session.MaintenanceArmed=$true;$session.MaintenanceExpiresAt=[DateTimeOffset]::UtcNow.AddMinutes(10);$session.Config.AutoRecoveryEnabled=$true;$session.AutoUpdateEnabled=$true;
+  $session.NerusRestart.Proposal=@{Id='old-restart'};$session.NerusService.Proposal=@{Id='old-service'};
+  Set-PdvMonitorCentral $session 'https://example.invalid/api/pdv-monitor/ingest' '49' 'CX4902' '22222222-2222-4222-8222-222222222222' ('a'*64) -ArchivePreviousIdentity;
+  Assert-Runtime (-not $session.MaintenanceArmed -and $null -eq $session.MaintenanceExpiresAt -and -not $session.Config.AutoRecoveryEnabled -and -not $session.AutoUpdateEnabled) 'Troca de cadastro desarma janela e atualizacao herdadas';
+  Assert-Runtime ($null -eq $session.NerusAutomation.Policy -and $session.NerusAutomation.Samples.Count -eq 0 -and $session.NerusAutomation.NextPolicyAt -eq [DateTimeOffset]::MinValue -and $null -eq $session.NerusRestart.Proposal -and $null -eq $session.NerusService.Proposal) 'Novo cadastro exige politica nova e invalida propostas anteriores';
+  $session.TickBusy=$true;$blocked=$false;try{Set-PdvMonitorCentral $session 'https://example.invalid/api/pdv-monitor/ingest' '49' 'CX4901' '11111111-1111-4111-8111-111111111111' ('a'*64);}catch{$blocked=$true;}
+  Assert-Runtime ($blocked -and (Get-TestMetric 'TestCentralWrites') -eq 1) 'Coleta em andamento impede reconfiguracao antes de escrever';
   Write-Host ('PASS: ' + $script:assertions + ' verificações offline do runtime; sessão única, logs/rotação, perfis, manutenção, três leituras iguais, revalidação, histórico antes da ação e exportação sem credencial/fila. Nenhum hardware, WMI, processo ou HTTP real foi acessado. PowerShell ' + $PSVersionTable.PSVersion + '.')
 } finally { if ([IO.Directory]::Exists($testRoot)) { [IO.Directory]::Delete($testRoot,$true) } }

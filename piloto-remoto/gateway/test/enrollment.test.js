@@ -146,3 +146,141 @@ test('segundo escritor e estado inseguro são rejeitados; inicialização nunca 
   enrollment.stop(); fs.chmodSync(journal, 0o644);
   assert.throws(() => new DeviceEnrollment(options), /ProtectedEnrollmentFileRequired/);
 });
+
+const renewalRequest = (first, overrides = {}) => request({ previousCertificateSha256: first.certificateSha256, requestedAt: new Date().toISOString(), ...overrides });
+const confirmation = (value, overrides = {}) => ({ agentId: value.agentId, repeaterId: value.repeaterId, previousCertificateSha256: value.previousCertificateSha256, certificateSha256: value.certificateSha256, ...overrides });
+
+test('preparação é durável, mantém identidade antiga, recupera resposta perdida e commit é idempotente', (t) => {
+  const { enrollment, journal, options, installed } = fixture(t);
+  const first = enrollment.enroll(request()); const oldPassword = installed.get(agentId).password;
+  const input = renewalRequest(first); const prepared = enrollment.prepareRenewal(input);
+  assert.equal(prepared.state, 'prepared'); assert.equal(prepared.previousCertificateSha256, first.certificateSha256);
+  assert.notEqual(prepared.certificateSha256, first.certificateSha256);
+  assert.equal(installed.get(agentId).certificateSha256, first.certificateSha256);
+  assert.equal(enrollment.document.devices[0].certificateSha256, first.certificateSha256);
+  assert.equal(prepared.password, undefined); assert.equal(prepared.privateKey, undefined);
+  assert.ok(!fs.readFileSync(journal, 'utf8').includes('PRIVATE KEY'));
+  assert.deepEqual(enrollment.prepareRenewal({ ...input }), prepared);
+  enrollment.stop(); installed.clear(); const restored = new DeviceEnrollment(options); t.after(() => restored.stop());
+  assert.deepEqual(restored.prepareRenewal(input), prepared);
+  assert.deepEqual(restored.renewalStatus(input.requestId, confirmation(prepared, { certificateSha256: null })), prepared);
+  assert.throws(() => restored.commitRenewal(input.requestId, confirmation(prepared, { certificateSha256: null })), /InvalidRenewal/);
+  assert.equal(installed.get(agentId).certificateSha256, first.certificateSha256);
+  const committed = restored.commitRenewal(input.requestId, confirmation(prepared));
+  assert.equal(committed.state, 'committed'); assert.equal(installed.get(agentId).certificateSha256, prepared.certificateSha256);
+  assert.equal(installed.get(agentId).password, oldPassword);
+  assert.deepEqual(restored.commitRenewal(input.requestId, confirmation(prepared)), committed);
+  assert.deepEqual(restored.prepareRenewal(input), committed);
+  assert.deepEqual(restored.renewalStatus(input.requestId, confirmation(prepared)), committed);
+  restored.stop(); const afterLostReply = new DeviceEnrollment(options); t.after(() => afterLostReply.stop());
+  assert.deepEqual(afterLostReply.commitRenewal(input.requestId, confirmation(prepared)), committed);
+  assert.equal(afterLostReply.document.schemaVersion, 2);
+});
+
+test('renovação exige forma exata, vínculo atual, timestamp curto, CAS e uma proposta por computador', (t) => {
+  const { enrollment } = fixture(t); const first = enrollment.enroll(request());
+  assert.throws(() => enrollment.prepareRenewal({ ...renewalRequest(first), extra: true }), /InvalidEnrollmentShape/);
+  assert.throws(() => enrollment.prepareRenewal(renewalRequest(first, { previousCertificateSha256: null })), /InvalidRenewal/);
+  assert.throws(() => enrollment.prepareRenewal(renewalRequest(first, { previousCertificateSha256: '0'.repeat(64) })), /DeviceEnrollmentConflict/);
+  assert.throws(() => enrollment.prepareRenewal(renewalRequest(first, { requestedAt: new Date(Date.now() - 301000).toISOString() })), /RenewalRequestExpired/);
+  assert.throws(() => enrollment.prepareRenewal(renewalRequest(first, { requestedAt: new Date(Date.now() + 31000).toISOString() })), /RenewalRequestExpired/);
+  assert.throws(() => enrollment.prepareRenewal(renewalRequest(first, { requestedAt: '2026-01-01' })), /InvalidRenewal/);
+  const input = renewalRequest(first); const prepared = enrollment.prepareRenewal(input);
+  assert.throws(() => enrollment.prepareRenewal({ ...input, csrPem: `${csr}\n` }), /RenewalConflict/);
+  assert.throws(() => enrollment.prepareRenewal(renewalRequest(first)), /RenewalAlreadyPending/);
+  assert.throws(() => enrollment.commitRenewal(input.requestId, confirmation(prepared, { certificateSha256: 'f'.repeat(64) })), /RenewalConflict/);
+  assert.throws(() => enrollment.commitRenewal(input.requestId, { ...confirmation(prepared), extra: true }), /InvalidEnrollmentShape/);
+  assert.throws(() => enrollment.enroll(request({ requestId: input.requestId, previousCertificateSha256: first.certificateSha256 })), /EnrollmentConflict/);
+});
+
+test('lease ativa bloqueia preparação e commit sem escrita ou troca de identidade', (t) => {
+  let busy = false; let signed = 0;
+  const { enrollment, journal, installed } = fixture(t, { issuer: { sign: (...args) => { signed += 1; return issuer.sign(...args); } }, canInstall: () => { if (busy) throw new Error('DeviceBusy'); } });
+  const first = enrollment.enroll(request()); const before = fs.readFileSync(journal, 'utf8'); const initialSigned = signed;
+  busy = true; assert.throws(() => enrollment.prepareRenewal(renewalRequest(first)), /DeviceBusy/);
+  assert.equal(signed, initialSigned); assert.equal(fs.readFileSync(journal, 'utf8'), before);
+  busy = false; const prepared = enrollment.prepareRenewal(renewalRequest(first)); const staged = fs.readFileSync(journal, 'utf8');
+  busy = true; assert.throws(() => enrollment.commitRenewal(prepared.requestId, confirmation(prepared)), /DeviceBusy/);
+  assert.equal(fs.readFileSync(journal, 'utf8'), staged); assert.equal(installed.get(agentId).certificateSha256, first.certificateSha256);
+  busy = false; enrollment.commitRenewal(prepared.requestId, confirmation(prepared));
+  assert.equal(installed.get(agentId).certificateSha256, prepared.certificateSha256);
+});
+
+test('proposta expira sem trocar vínculo, cancelamento mantém identidade e timestamp impede replay compactado', (t) => {
+  let now = Date.now() - 12 * 3600000;
+  const { enrollment, installed } = fixture(t, { now: () => now }); const first = enrollment.enroll(request());
+  const input = renewalRequest(first, { requestedAt: new Date(now).toISOString() }); const prepared = enrollment.prepareRenewal(input);
+  now += 6 * 60000; assert.deepEqual(enrollment.prepareRenewal(input), prepared); // Retry de resposta perdida não usa o prazo inicial de cinco minutos.
+  now += 24 * 3600000;
+  assert.throws(() => enrollment.commitRenewal(input.requestId, confirmation(prepared)), /RenewalExpired/);
+  assert.throws(() => enrollment.prepareRenewal(input), /RenewalExpired/);
+  assert.equal(installed.get(agentId).certificateSha256, first.certificateSha256);
+  assert.deepEqual(enrollment.abortRenewal(input.requestId, confirmation(prepared)), { requestId: input.requestId, agentId, state: 'aborted' });
+  assert.equal(enrollment.document.renewals.length, 0); // Expirados já podem ser compactados.
+  assert.throws(() => enrollment.prepareRenewal(input), /RenewalRequestExpired/);
+  const fresh = enrollment.prepareRenewal(renewalRequest(first, { requestedAt: new Date(now).toISOString() }));
+  assert.equal(fresh.state, 'prepared'); assert.equal(installed.get(agentId).certificateSha256, first.certificateSha256);
+});
+
+test('cancelamento é idempotente, não confirma e commit confirmado nunca pode ser desfeito', (t) => {
+  const { enrollment } = fixture(t); const first = enrollment.enroll(request()); const prepared = enrollment.prepareRenewal(renewalRequest(first));
+  const expected = { requestId: prepared.requestId, agentId, state: 'aborted' };
+  assert.deepEqual(enrollment.abortRenewal(prepared.requestId, confirmation(prepared, { certificateSha256: null })), expected);
+  assert.deepEqual(enrollment.abortRenewal(prepared.requestId, confirmation(prepared)), expected);
+  assert.throws(() => enrollment.commitRenewal(prepared.requestId, confirmation(prepared)), /RenewalAborted/);
+  assert.throws(() => enrollment.prepareRenewal(renewalRequest(first, { requestId: prepared.requestId })), /RenewalConflict|RenewalAborted/);
+  const next = enrollment.prepareRenewal(renewalRequest(first)); enrollment.commitRenewal(next.requestId, confirmation(next));
+  assert.throws(() => enrollment.abortRenewal(next.requestId, confirmation(next)), /RenewalAlreadyCommitted/);
+});
+
+test('perfil interno requer fingerprint atual, preserva senha após renovação e revogação invalida toda proposta', (t) => {
+  const { enrollment, options } = fixture(t); const first = enrollment.enroll(request());
+  const profileInput = { agentId, repeaterId: first.repeaterId, certificateSha256: first.certificateSha256 };
+  const profile = enrollment.provisionProfile(profileInput); assert.equal(profile.vncPassword.length, 8);
+  const prepared = enrollment.prepareRenewal(renewalRequest(first));
+  assert.throws(() => enrollment.provisionProfile({ ...profileInput, certificateSha256: prepared.certificateSha256 }), /DeviceEnrollmentConflict/);
+  enrollment.commitRenewal(prepared.requestId, confirmation(prepared));
+  const renewedProfile = enrollment.provisionProfile({ ...profileInput, certificateSha256: prepared.certificateSha256 });
+  assert.equal(renewedProfile.vncPassword, profile.vncPassword);
+  assert.throws(() => enrollment.provisionProfile(profileInput), /DeviceEnrollmentConflict/);
+  const nextInput = renewalRequest(prepared); const next = enrollment.prepareRenewal(nextInput); enrollment.revoke(agentId);
+  assert.throws(() => enrollment.prepareRenewal(nextInput), /DeviceRevoked/);
+  assert.throws(() => enrollment.commitRenewal(next.requestId, confirmation(next)), /DeviceRevoked/);
+  assert.throws(() => enrollment.provisionProfile({ ...profileInput, certificateSha256: prepared.certificateSha256 }), /DeviceRevoked/);
+  assert.equal(enrollment.document.renewals.length, 0); assert.ok(enrollment.document.devices[0].revokedAt);
+  enrollment.stop(); const restored = new DeviceEnrollment(options); t.after(() => restored.stop());
+  assert.throws(() => restored.commitRenewal(next.requestId, confirmation(next)), /DeviceRevoked/);
+});
+
+test('certificado vencido não renova nem fornece perfil e falha de instalação no commit fecha o gateway', (t) => {
+  let now = Date.now(); let fail = false;
+  const { enrollment, installed, failed, journal } = fixture(t, { now: () => now, install: (value) => { if (fail) throw new Error('Unavailable'); installed.set(value.agentId, value); } });
+  const first = enrollment.enroll(request()); const prepared = enrollment.prepareRenewal(renewalRequest(first));
+  now = Date.parse(first.expiresAt) + 1;
+  assert.throws(() => enrollment.provisionProfile({ agentId, repeaterId: first.repeaterId, certificateSha256: first.certificateSha256 }), /DeviceCertificateExpired/);
+  assert.throws(() => enrollment.prepareRenewal(renewalRequest(first, { requestedAt: new Date(now).toISOString() })), /DeviceCertificateExpired/);
+  now = Date.now(); fail = true;
+  assert.throws(() => enrollment.commitRenewal(prepared.requestId, confirmation(prepared)), /DeviceBindingUnavailable/);
+  assert.equal(failed(), true); assert.equal(JSON.parse(fs.readFileSync(journal)).devices[0].certificateSha256, prepared.certificateSha256);
+  assert.throws(() => enrollment.provisionProfile({ agentId, repeaterId: first.repeaterId, certificateSha256: first.certificateSha256 }), /EnrollmentUnavailable/);
+  assert.ok(fs.existsSync(`${journal}.lock`));
+});
+
+test('compactação conserva mil identidades e tombstones, propostas vivas e resultados atuais sem acumular gerações', (t) => {
+  const { enrollment } = fixture(t); const now = Date.now(); const devices = []; const requests = []; const renewals = [];
+  for (let index = 0; index < 1000; index += 1) {
+    const id = `0249a001-0000-4000-8000-${String(index).padStart(12, '0')}`;
+    const currentHash = crypto.createHash('sha256').update(`current-${index}`).digest('hex');
+    devices.push({ agentId: id, certificateSha256: currentHash, revokedAt: index === 999 ? new Date(now).toISOString() : null });
+    for (let generation = 0; generation < 10; generation += 1) {
+      requests.push({ requestId: crypto.randomUUID(), result: { agentId: id, certificateSha256: generation === 9 ? currentHash : 'old' } });
+      renewals.push({ requestId: crypto.randomUUID(), input: { agentId: id, previousCertificateSha256: 'old' }, result: { certificateSha256: generation === 9 ? currentHash : 'old', preparedUntil: new Date(now - 1).toISOString() }, state: 'committed' });
+    }
+    renewals.push({ requestId: crypto.randomUUID(), input: { agentId: id, previousCertificateSha256: currentHash }, result: { preparedUntil: new Date(now + 60000).toISOString() }, state: 'prepared' });
+  }
+  const result = enrollment.compact({ schemaVersion: 2, devices, requests, renewals });
+  assert.equal(result.devices.length, 1000); assert.ok(result.devices[999].revokedAt);
+  assert.equal(result.requests.length, 1998); assert.equal(result.renewals.length, 1998);
+  assert.equal(result.renewals.filter((row) => row.state === 'prepared').length, 999);
+  assert.equal(result.renewals.filter((row) => row.state === 'committed').length, 999);
+});

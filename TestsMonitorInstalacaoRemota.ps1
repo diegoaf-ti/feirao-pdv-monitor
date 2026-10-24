@@ -19,7 +19,7 @@ function Write-InstallManifest {
 }
 function New-InstallCase {
   $path = Join-Path $temporary ([Guid]::NewGuid().ToString('N')); $package = Join-Path $path 'pacote'; $windows = Join-Path $package 'piloto-remoto/windows'; [void][IO.Directory]::CreateDirectory($windows);
-  foreach ($relative in (Get-PdvRemoteInstallFiles)) { [IO.File]::WriteAllText((Join-Path $package $relative), ('FIXTURE INATIVA ' + $relative)); }
+  foreach ($relative in (Get-PdvRemoteInstallFiles)) { [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName((Join-Path $package $relative))); [IO.File]::WriteAllText((Join-Path $package $relative), ('FIXTURE INATIVA ' + $relative)); }
   Write-InstallManifest $package;
   $common = Join-Path $path 'CommonData'; [void][IO.Directory]::CreateDirectory($common);
   $feirao = Join-Path $common 'Feirao'; $remote = Join-Path $feirao 'PdvMonitorRemoto';

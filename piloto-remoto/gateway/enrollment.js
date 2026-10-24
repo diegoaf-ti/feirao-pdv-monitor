@@ -12,6 +12,10 @@ const { RelayError } = require('./relay');
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const REPEATER = /^[1-9][0-9]{0,8}$/;
 const HASH = /^[a-f0-9]{64}$/;
+const MAX_JOURNAL_BYTES = 32 * 1024 * 1024;
+const RENEWAL_PREPARE_MS = 24 * 60 * 60 * 1000;
+const RENEWAL_REQUEST_MS = 5 * 60 * 1000;
+const canonicalDate = (value) => typeof value === 'string' && Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value;
 const copy = (value) => JSON.parse(JSON.stringify(value));
 const fingerprint = (cert) => cert.fingerprint256.replace(/:/g, '').toLowerCase();
 const exact = (value, fields) => {
@@ -120,14 +124,16 @@ class DeviceEnrollment {
     try {
       const descriptor = fs.openSync(`${this.journal}.lock`, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600); this.locked = true;
       try { fs.writeFileSync(descriptor, String(process.pid)); fs.fsyncSync(descriptor); } finally { fs.closeSync(descriptor); }
-      this.document = JSON.parse(privateFile(this.journal, 8388608)); this.validate();
+      this.document = JSON.parse(privateFile(this.journal, MAX_JOURNAL_BYTES)); this.validate();
+      // Migração sem reescrever no startup: a próxima mutação durável grava v2.
+      if (this.document.schemaVersion === 1) this.document = { ...this.document, schemaVersion: 2, renewals: [] };
       for (const binding of this.document.devices) { if (binding.revokedAt === null) { this.canInstall(binding, null, true); this.install(binding); } else this.remove(binding.agentId); }
     } catch (error) { if (this.locked) { fs.unlinkSync(`${this.journal}.lock`); this.locked = false; } throw error; }
   }
 
   validate() {
-    exact(this.document, ['schemaVersion', 'devices', 'requests']);
-    if (this.document.schemaVersion !== 1 || !Array.isArray(this.document.devices) || this.document.devices.length > 1024 || !Array.isArray(this.document.requests) || this.document.requests.length > 4096) throw new RelayError('EnrollmentStateInvalid', 503);
+    exact(this.document, this.document.schemaVersion === 1 ? ['schemaVersion', 'devices', 'requests'] : ['schemaVersion', 'devices', 'requests', 'renewals']);
+    if (![1, 2].includes(this.document.schemaVersion) || !Array.isArray(this.document.devices) || this.document.devices.length > 1024 || !Array.isArray(this.document.requests) || this.document.requests.length > 4096 || (this.document.schemaVersion === 2 && (!Array.isArray(this.document.renewals) || this.document.renewals.length > 4096))) throw new RelayError('EnrollmentStateInvalid', 503);
     const agents = new Set(); const repeaters = new Set(); const hashes = new Set(); const requests = new Set();
     for (const row of this.document.devices) {
       exact(row, ['agentId', 'repeaterId', 'certificatePem', 'certificateSha256', 'expiresAt', 'password', 'revokedAt']);
@@ -144,13 +150,50 @@ class DeviceEnrollment {
       if (certificate.ca || fingerprint(certificate) !== row.result.certificateSha256 || new Date(certificate.validTo).toISOString() !== row.result.expiresAt) throw new RelayError('EnrollmentStateInvalid', 503);
       requests.add(row.requestId);
     }
+    const pendingAgents = new Set();
+    for (const row of this.document.renewals || []) {
+      exact(row, ['requestId', 'requestHash', 'input', 'result', 'state']);
+      exact(row.input, ['requestId', 'agentId', 'repeaterId', 'csrPem', 'previousCertificateSha256', 'requestedAt']);
+      exact(row.result, ['requestId', 'agentId', 'repeaterId', 'previousCertificateSha256', 'certificatePem', 'certificateSha256', 'expiresAt', 'preparedUntil']);
+      const input = row.input; const result = row.result;
+      const requestHash = crypto.createHash('sha256').update(JSON.stringify(input)).digest('hex');
+      if (!UUID.test(row.requestId) || requests.has(row.requestId) || !HASH.test(row.requestHash) || row.requestHash !== requestHash || !['prepared', 'committed', 'aborted'].includes(row.state) || row.requestId !== input.requestId || row.requestId !== result.requestId || !agents.has(input.agentId) || !UUID.test(input.agentId) || !REPEATER.test(input.repeaterId) || !HASH.test(input.previousCertificateSha256) || typeof input.csrPem !== 'string' || Buffer.byteLength(input.csrPem) > 4096 || !canonicalDate(input.requestedAt) || !canonicalDate(result.preparedUntil) || !canonicalDate(result.expiresAt) || result.agentId !== input.agentId || result.repeaterId !== input.repeaterId || result.previousCertificateSha256 !== input.previousCertificateSha256 || !HASH.test(result.certificateSha256) || result.certificateSha256 === input.previousCertificateSha256 || Date.parse(result.preparedUntil) <= Date.parse(input.requestedAt) || Date.parse(result.preparedUntil) > Date.parse(input.requestedAt) + RENEWAL_PREPARE_MS + RENEWAL_REQUEST_MS) throw new RelayError('EnrollmentStateInvalid', 503);
+      const certificate = new crypto.X509Certificate(result.certificatePem);
+      if (certificate.ca || fingerprint(certificate) !== result.certificateSha256 || new Date(certificate.validTo).toISOString() !== result.expiresAt || certificate.subject !== `CN=pdv-${input.agentId}`) throw new RelayError('EnrollmentStateInvalid', 503);
+      if (row.state === 'prepared') {
+        if (pendingAgents.has(input.agentId)) throw new RelayError('EnrollmentStateInvalid', 503);
+        pendingAgents.add(input.agentId);
+      }
+      requests.add(row.requestId);
+    }
+  }
+
+  compact(document) {
+    const next = { ...document, schemaVersion: 2, renewals: document.renewals || [] };
+    const devices = new Map(next.devices.map((row) => [row.agentId, row]));
+    // Gerações antigas nunca são reinstaladas: o CAS atual ou o tombstone as recusa.
+    const kept = new Map();
+    next.requests = next.requests.slice().reverse().filter((row) => {
+      const current = devices.get(row.result.agentId);
+      const count = kept.get(row.result.agentId) || 0;
+      if (!current || current.revokedAt !== null || count >= 2) return false;
+      kept.set(row.result.agentId, count + 1); return true;
+    }).reverse();
+    next.renewals = next.renewals.filter((row) => {
+      const current = devices.get(row.input.agentId);
+      if (!current || current.revokedAt !== null) return false;
+      if (row.state === 'committed') return current.certificateSha256 === row.result.certificateSha256;
+      return Date.parse(row.result.preparedUntil) > this.now() && current.certificateSha256 === row.input.previousCertificateSha256;
+    });
+    return next;
   }
 
   save(next) {
     const target = `${this.journal}.${crypto.randomUUID()}.tmp`;
     let descriptor;
     try {
-      const content = JSON.stringify(next); if (Buffer.byteLength(content) > 8388608) throw new Error('Capacity');
+      next = this.compact(next);
+      const content = JSON.stringify(next); if (Buffer.byteLength(content) > MAX_JOURNAL_BYTES || next.renewals.length > 4096) throw new Error('Capacity');
       descriptor = fs.openSync(target, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
       fs.writeFileSync(descriptor, content); fs.fsyncSync(descriptor); fs.closeSync(descriptor); descriptor = undefined;
       fs.renameSync(target, this.journal);
@@ -178,19 +221,125 @@ class DeviceEnrollment {
       if (current.certificateSha256 !== previous.result.certificateSha256) throw new RelayError('EnrollmentSuperseded', 409);
       return copy(previous.result);
     }
+    if (this.document.renewals.some((row) => row.requestId === body.requestId)) throw new RelayError('EnrollmentConflict', 409);
     const current = this.document.devices.find((row) => row.agentId === body.agentId);
     if (current && current.revokedAt !== null) throw new RelayError('DeviceRevoked', 403);
     if ((current ? current.certificateSha256 : null) !== body.previousCertificateSha256 || (current && current.repeaterId !== body.repeaterId) || this.document.devices.some((row) => row.agentId !== body.agentId && row.repeaterId === body.repeaterId)) throw new RelayError('DeviceEnrollmentConflict', 409);
-    if ((!current && this.document.devices.length >= 1024) || this.document.requests.length >= 4096) throw new RelayError('EnrollmentCapacity', 503);
+    if (!current && this.document.devices.length >= 1024) throw new RelayError('EnrollmentCapacity', 503);
     this.canInstall({ agentId: body.agentId, repeaterId: body.repeaterId }, body.previousCertificateSha256, false);
     const issued = this.issuer.sign(body.csrPem, body.agentId);
     const binding = { agentId: body.agentId, repeaterId: body.repeaterId, ...issued, revokedAt: null, password: current?.password || Array.from({ length: 8 }, () => String.fromCharCode(crypto.randomInt(33, 127))).join('') };
     const result = { requestId: body.requestId, agentId: body.agentId, repeaterId: body.repeaterId, ...issued };
-    const next = { schemaVersion: 1, devices: [...this.document.devices.filter((row) => row.agentId !== body.agentId), binding], requests: [...this.document.requests, { requestId: body.requestId, requestHash, result }] };
+    const next = { ...this.document, devices: [...this.document.devices.filter((row) => row.agentId !== body.agentId), binding], requests: [...this.document.requests, { requestId: body.requestId, requestHash, result }] };
     this.save(next);
     try { this.install(binding); }
     catch { this.healthy = false; this.onFailure(); throw new RelayError('DeviceBindingUnavailable', 503); }
     return copy(result);
+  }
+
+  currentDevice(agentId, repeaterId) {
+    if (!this.healthy) throw new RelayError('EnrollmentUnavailable', 503);
+    const current = this.document.devices.find((row) => row.agentId === agentId);
+    if (!current) throw new RelayError('DeviceNotFound', 404);
+    if (current.revokedAt !== null) throw new RelayError('DeviceRevoked', 403);
+    if (current.repeaterId !== repeaterId) throw new RelayError('DeviceEnrollmentConflict', 409);
+    return current;
+  }
+
+  renewalResult(row) { return copy({ ...row.result, state: row.state }); }
+
+  prepareRenewal(body) {
+    if (!this.healthy) throw new RelayError('EnrollmentUnavailable', 503);
+    exact(body, ['requestId', 'agentId', 'repeaterId', 'csrPem', 'previousCertificateSha256', 'requestedAt']);
+    if (!UUID.test(body.requestId) || !UUID.test(body.agentId) || typeof body.repeaterId !== 'string' || !REPEATER.test(body.repeaterId) || typeof body.csrPem !== 'string' || Buffer.byteLength(body.csrPem) > 4096 || !HASH.test(body.previousCertificateSha256) || !canonicalDate(body.requestedAt)) throw new RelayError('InvalidRenewal');
+    const input = { requestId: body.requestId, agentId: body.agentId, repeaterId: body.repeaterId, csrPem: body.csrPem, previousCertificateSha256: body.previousCertificateSha256, requestedAt: body.requestedAt };
+    const requestHash = crypto.createHash('sha256').update(JSON.stringify(input)).digest('hex');
+    const current = this.currentDevice(body.agentId, body.repeaterId);
+    const previous = this.document.renewals.find((row) => row.requestId === body.requestId);
+    if (previous) {
+      if (previous.requestHash !== requestHash) throw new RelayError('RenewalConflict', 409);
+      if (previous.state === 'aborted') throw new RelayError('RenewalAborted', 409);
+      if (previous.state === 'committed') {
+        if (current.certificateSha256 !== previous.result.certificateSha256) throw new RelayError('RenewalSuperseded', 409);
+      } else {
+        if (current.certificateSha256 !== body.previousCertificateSha256) throw new RelayError('RenewalSuperseded', 409);
+        if (Date.parse(previous.result.preparedUntil) <= this.now()) throw new RelayError('RenewalExpired', 409);
+      }
+      return this.renewalResult(previous);
+    }
+    if (this.document.requests.some((row) => row.requestId === body.requestId)) throw new RelayError('RenewalConflict', 409);
+    const age = this.now() - Date.parse(body.requestedAt);
+    if (age < -30000 || age > RENEWAL_REQUEST_MS) throw new RelayError('RenewalRequestExpired', 409);
+    if (current.certificateSha256 !== body.previousCertificateSha256) throw new RelayError('DeviceEnrollmentConflict', 409);
+    if (Date.parse(current.expiresAt) <= this.now()) throw new RelayError('DeviceCertificateExpired', 403);
+    const next = this.compact(copy(this.document));
+    if (next.renewals.some((row) => row.input.agentId === body.agentId && row.state === 'prepared')) throw new RelayError('RenewalAlreadyPending', 409);
+    if (next.renewals.length >= 4096) throw new RelayError('EnrollmentCapacity', 503);
+    this.canInstall(current, body.previousCertificateSha256, false);
+    const issued = this.issuer.sign(body.csrPem, body.agentId);
+    if (issued.certificateSha256 === body.previousCertificateSha256 || Date.parse(issued.expiresAt) <= this.now()) throw new RelayError('InvalidIssuedCertificate', 503);
+    this.canInstall({ ...current, ...issued }, body.previousCertificateSha256, false);
+    const result = { requestId: body.requestId, agentId: body.agentId, repeaterId: body.repeaterId, previousCertificateSha256: body.previousCertificateSha256, ...issued, preparedUntil: new Date(this.now() + RENEWAL_PREPARE_MS).toISOString() };
+    const row = { requestId: body.requestId, requestHash, input, result, state: 'prepared' };
+    next.renewals.push(row); this.save(next);
+    // O vínculo antigo continua aceito até o commit; não há instalação nesta fase.
+    return this.renewalResult(row);
+  }
+
+  renewalOperation(requestId, body, allowUnknownCertificate = false) {
+    if (!this.healthy) throw new RelayError('EnrollmentUnavailable', 503);
+    exact(body, ['agentId', 'repeaterId', 'previousCertificateSha256', 'certificateSha256']);
+    if (!UUID.test(requestId) || !UUID.test(body.agentId) || typeof body.repeaterId !== 'string' || !REPEATER.test(body.repeaterId) || !HASH.test(body.previousCertificateSha256) || !(HASH.test(body.certificateSha256) || (allowUnknownCertificate && body.certificateSha256 === null))) throw new RelayError('InvalidRenewal');
+    const current = this.currentDevice(body.agentId, body.repeaterId);
+    const row = this.document.renewals.find((value) => value.requestId === requestId);
+    if (!row) throw new RelayError('RenewalNotFound', 404);
+    if (row.input.agentId !== body.agentId || row.input.repeaterId !== body.repeaterId || row.input.previousCertificateSha256 !== body.previousCertificateSha256 || (body.certificateSha256 !== null && row.result.certificateSha256 !== body.certificateSha256)) throw new RelayError('RenewalConflict', 409);
+    const expected = row.state === 'committed' ? row.result.certificateSha256 : row.input.previousCertificateSha256;
+    if (current.certificateSha256 !== expected) throw new RelayError('RenewalSuperseded', 409);
+    return { current, row };
+  }
+
+  renewalStatus(requestId, body) {
+    const { row } = this.renewalOperation(requestId, body, true);
+    if (row.state === 'prepared' && Date.parse(row.result.preparedUntil) <= this.now()) throw new RelayError('RenewalExpired', 409);
+    return this.renewalResult(row);
+  }
+
+  commitRenewal(requestId, body) {
+    const { current, row } = this.renewalOperation(requestId, body);
+    if (row.state === 'committed') return this.renewalResult(row);
+    if (row.state === 'aborted') throw new RelayError('RenewalAborted', 409);
+    if (Date.parse(row.result.preparedUntil) <= this.now()) throw new RelayError('RenewalExpired', 409);
+    if (Date.parse(current.expiresAt) <= this.now() || Date.parse(row.result.expiresAt) <= this.now()) throw new RelayError('DeviceCertificateExpired', 403);
+    const { certificatePem, certificateSha256, expiresAt } = row.result;
+    const binding = { ...current, certificatePem, certificateSha256, expiresAt };
+    this.canInstall(binding, body.previousCertificateSha256, false);
+    const next = copy(this.document);
+    next.devices = next.devices.map((value) => value.agentId === body.agentId ? binding : value);
+    const committed = next.renewals.find((value) => value.requestId === requestId); committed.state = 'committed';
+    this.save(next);
+    try { this.install(binding); }
+    catch { this.healthy = false; this.onFailure(); throw new RelayError('DeviceBindingUnavailable', 503); }
+    return this.renewalResult(committed);
+  }
+
+  abortRenewal(requestId, body) {
+    const { row } = this.renewalOperation(requestId, body, true);
+    if (row.state === 'committed') throw new RelayError('RenewalAlreadyCommitted', 409);
+    if (row.state !== 'aborted') {
+      const next = copy(this.document); next.renewals.find((value) => value.requestId === requestId).state = 'aborted'; this.save(next);
+    }
+    return { requestId, agentId: body.agentId, state: 'aborted' };
+  }
+
+  provisionProfile(body) {
+    if (!this.healthy) throw new RelayError('EnrollmentUnavailable', 503);
+    exact(body, ['agentId', 'repeaterId', 'certificateSha256']);
+    if (!UUID.test(body.agentId) || typeof body.repeaterId !== 'string' || !REPEATER.test(body.repeaterId) || !HASH.test(body.certificateSha256)) throw new RelayError('InvalidDeviceProfile');
+    const current = this.currentDevice(body.agentId, body.repeaterId);
+    if (current.certificateSha256 !== body.certificateSha256) throw new RelayError('DeviceEnrollmentConflict', 409);
+    if (Date.parse(current.expiresAt) <= this.now()) throw new RelayError('DeviceCertificateExpired', 403);
+    return { agentId: current.agentId, repeaterId: current.repeaterId, certificateSha256: current.certificateSha256, vncPassword: current.password, expiresAt: current.expiresAt };
   }
 
   revoke(agentId) {

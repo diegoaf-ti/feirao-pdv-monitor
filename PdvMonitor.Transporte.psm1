@@ -6,6 +6,7 @@ $script:PdvEventFields = @('EventId', 'Timestamp', 'SessionId', 'Sequence', 'Kin
 $script:PdvOutboxMaxBytes = 104857600
 $script:PdvOutboxMaxRecords = 20000
 $script:PdvBatchMaxBytes = 262144
+$script:PdvIdentitySwitchContext = $null
 
 function Get-PdvTransportValue {
   param($Object, [string]$Name, $Default = $null)
@@ -158,6 +159,7 @@ function Read-PdvHardwarePending {
 function Set-PdvMonitorHardwarePending {
   [CmdletBinding()]
   param([Parameter(Mandatory=$true)]$Session, [Parameter(Mandatory=$true)][Collections.IDictionary]$Hardware)
+  if(Test-PdvIdentitySwitchBlocked $Session){return (New-PdvTransportResult $false 'IdentitySwitchPending')}
   $central=Get-PdvCentralConfig $Session
   if (-not (Get-PdvTransportValue $central 'Enabled' $false)) { return (New-PdvTransportResult $false 'CentralDisabled') }
   try {
@@ -204,6 +206,7 @@ function Read-PdvSoftwarePending {
 function Set-PdvMonitorSoftwarePending {
   [CmdletBinding()]
   param([Parameter(Mandatory=$true)]$Session,[Parameter(Mandatory=$true)][Collections.IDictionary]$Software,[Parameter(Mandatory=$true)][string]$Fingerprint)
+  if(Test-PdvIdentitySwitchBlocked $Session){return (New-PdvTransportResult $false 'IdentitySwitchPending')}
   $central=Get-PdvCentralConfig $Session
   if(-not (Get-PdvTransportValue $central 'Enabled' $false)){return (New-PdvTransportResult $false 'CentralDisabled')}
   try{
@@ -237,6 +240,7 @@ function Set-PdvSoftwareUploadBackoff {
 
 function Invoke-PdvMonitorSoftwareUpload {
   [CmdletBinding()]param([Parameter(Mandatory=$true)]$Session)
+  if(Test-PdvIdentitySwitchBlocked $Session){return (New-PdvTransportResult $false 'IdentitySwitchPending')}
   $central=Get-PdvCentralConfig $Session
   if(-not (Get-PdvTransportValue $central 'Enabled' $false)){return (New-PdvTransportResult $false 'CentralDisabled')}
   $now=Get-PdvMonitorTransportNow;$next=Get-PdvTransportValue $Session 'NextSoftwareUploadAt' $null
@@ -329,7 +333,9 @@ function Write-PdvTransportAtomicBytes {
   $temporary = $Path + '.' + [Guid]::NewGuid().ToString('N') + '.tmp'
   $backup = $Path + '.' + [Guid]::NewGuid().ToString('N') + '.previous'
   try {
-    [IO.File]::WriteAllBytes($temporary, $Bytes)
+    $durableSwitch=$false
+    if($null -ne $script:PdvIdentitySwitchContext){$switchPaths=Get-PdvTransportPaths $script:PdvIdentitySwitchContext.Session;$durableSwitch=([string]::Equals($Path,$switchPaths.Config,[StringComparison]::OrdinalIgnoreCase) -or [string]::Equals($Path,$switchPaths.Credential,[StringComparison]::OrdinalIgnoreCase))}
+    if($durableSwitch){Write-PdvIdentitySwitchTempBytes $temporary $Bytes}else{[IO.File]::WriteAllBytes($temporary, $Bytes)}
     if ([IO.File]::Exists($Path)) { [IO.File]::Replace($temporary, $Path, $backup) }
     else { [IO.File]::Move($temporary, $Path) }
   } finally {
@@ -383,21 +389,239 @@ function Set-PdvInventoryStartupWindow {
   Set-PdvTransportValue $Session 'SoftwareInitialUploadAt' $now.AddSeconds((Get-PdvInventoryStartupDelay $central 'Software'))
 }
 
+# A troca de identidade preserva a fila anterior; arquivar nao e ACK nem remapeia IDs.
+function Write-PdvIdentitySwitchTempBytes {
+  param([string]$Path,[byte[]]$Bytes)
+  $stream=New-Object IO.FileStream($Path,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None,4096,[IO.FileOptions]::WriteThrough)
+  try{$stream.Write($Bytes,0,$Bytes.Length);$stream.Flush();if([Environment]::Version.Major -ge 4){$stream.Flush($true)}}finally{$stream.Dispose()}
+}
+function Sync-PdvIdentitySwitchCommittedFiles {
+  param($Paths)
+  foreach($path in @($Paths.Config,$Paths.Credential)){
+    [void](Assert-PdvIdentitySwitchPath $path)
+    $stream=New-Object IO.FileStream($path,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::Read,4096,[IO.FileOptions]::WriteThrough)
+    try{$stream.Flush();if([Environment]::Version.Major -ge 4){$stream.Flush($true)}}finally{$stream.Dispose()}
+  }
+}
+function Write-PdvIdentitySwitchDurableBytes {
+  param([string]$Path,[byte[]]$Bytes)
+  [void](Assert-PdvIdentitySwitchPath $Path)
+  if([IO.File]::Exists($Path) -or [IO.Directory]::Exists($Path)){throw 'IdentitySwitchStateAlreadyExists'}
+  $temporary=$Path+'.'+[Guid]::NewGuid().ToString('N')+'.switch-tmp';$stream=$null
+  try{
+    Write-PdvIdentitySwitchTempBytes $temporary $Bytes
+    [IO.File]::Move($temporary,$Path)
+  }finally{if($null -ne $stream){$stream.Dispose()};if([IO.File]::Exists($temporary)){[IO.File]::Delete($temporary)}}
+}
+function New-PdvIdentitySwitchSuccess {
+  param($Session,[string]$ArchivePath)
+  $result=New-PdvTransportResult $true 'ArquivoPreservado'
+  $result | Add-Member NoteProperty ArchivePath $ArchivePath
+  $result | Add-Member NoteProperty Message 'Central configurada. Fila e credencial protegida da identificação anterior preservadas em arquivo local, sem envio pela nova identificação.'
+  Set-PdvTransportValue $Session 'UploadStatusText' $result.Message
+  return $result
+}
+function Get-PdvIdentitySwitchHash {
+  param([byte[]]$Bytes)
+  $hash=[Security.Cryptography.SHA256]::Create()
+  try{return [BitConverter]::ToString($hash.ComputeHash($Bytes)).Replace('-','').ToLowerInvariant()}finally{$hash.Dispose()}
+}
+function Assert-PdvIdentitySwitchPath {
+  param([string]$Path)
+  $full=[IO.Path]::GetFullPath($Path);$probe=$full
+  while($probe){
+    if([IO.File]::Exists($probe) -or [IO.Directory]::Exists($probe)){
+      if(([IO.File]::GetAttributes($probe) -band [IO.FileAttributes]::ReparsePoint) -ne 0){throw 'IdentitySwitchLinkedPath'}
+    }
+    $parent=[IO.Path]::GetDirectoryName($probe);if($parent -ceq $probe){break};$probe=$parent
+  }
+  return $full
+}
+function Get-PdvIdentitySwitchFileHash {
+  param([string]$Path)
+  [void](Assert-PdvIdentitySwitchPath $Path)
+  if(-not [IO.File]::Exists($Path)){if([IO.Directory]::Exists($Path)){throw 'IdentitySwitchFileExpected'};return ''}
+  $stream=[IO.File]::Open($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+  $hash=[Security.Cryptography.SHA256]::Create()
+  try{return [BitConverter]::ToString($hash.ComputeHash($stream)).Replace('-','').ToLowerInvariant()}finally{$hash.Dispose();$stream.Dispose()}
+}
+function Get-PdvIdentitySwitchTreeHash {
+  param([string]$Path)
+  [void](Assert-PdvIdentitySwitchPath $Path)
+  if(-not [IO.Directory]::Exists($Path)){if([IO.File]::Exists($Path)){throw 'IdentitySwitchDirectoryExpected'};return ''}
+  $prefix=$Path.TrimEnd([IO.Path]::DirectorySeparatorChar)+[IO.Path]::DirectorySeparatorChar
+  $pending=@($Path);$lines=New-Object 'Collections.Generic.List[string]';$count=0;$bytes=0L
+  while($pending.Count -gt 0){
+    $next=@()
+    foreach($directory in $pending){
+      foreach($entry in [IO.Directory]::GetFileSystemEntries($directory)){
+        [void](Assert-PdvIdentitySwitchPath $entry);$count++;if($count -gt 40000){throw 'IdentitySwitchQueueTooLarge'}
+        $relative=$entry.Substring($prefix.Length).Replace([IO.Path]::DirectorySeparatorChar,'/')
+        if([IO.Directory]::Exists($entry)){$lines.Add(('D|'+(ConvertTo-PdvJsonString $relative)));$next+=,$entry}
+        else{$length=(New-Object IO.FileInfo($entry)).Length;$bytes+=$length;if($bytes -gt 104857600){throw 'IdentitySwitchQueueTooLarge'};$lines.Add(('F|'+(ConvertTo-PdvJsonString $relative)+'|'+$length+'|'+(Get-PdvIdentitySwitchFileHash $entry)))}
+      }
+    }
+    $pending=$next
+  }
+  $lines.Sort([StringComparer]::Ordinal)
+  return (Get-PdvIdentitySwitchHash ([Text.Encoding]::UTF8.GetBytes([string]::Join("`n",$lines.ToArray()))))
+}
+function Get-PdvIdentitySwitchLocations {
+  param($Session,[string]$ArchiveId='')
+  $paths=Get-PdvTransportPaths $Session
+  [void](Assert-PdvIdentitySwitchPath $paths.Directory)
+  if(-not [string]::Equals($paths.Outbox,[IO.Path]::GetFullPath((Join-Path $paths.Directory 'outbox')),[StringComparison]::OrdinalIgnoreCase)){throw 'IdentitySwitchOutboxPathInvalid'}
+  $parent=Join-Path $paths.Directory 'identidades-anteriores';[void](Assert-PdvIdentitySwitchPath $parent)
+  $archive='';if($ArchiveId){if($ArchiveId -cnotmatch '^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$'){throw 'IdentitySwitchArchiveInvalid'};$archive=Join-Path $parent $ArchiveId;[void](Assert-PdvIdentitySwitchPath $archive)}
+  return @{Paths=$paths;Parent=$parent;Archive=$archive;Journal=(Join-Path $paths.Directory 'identity-switch.xml')}
+}
+function Get-PdvIdentitySwitchItems {
+  param($Paths)
+  return @(@{Name='outbox';Source=$Paths.Outbox;Field='OutboxSha256';Directory=$true},@{Name='hardware-pendente.xml';Source=$Paths.Hardware;Field='HardwareSha256';Directory=$false},@{Name='software-pendente.xml';Source=$Paths.Software;Field='SoftwareSha256';Directory=$false},@{Name='hardware-confirmado.xml';Source=$Paths.HardwareAck;Field='HardwareAckSha256';Directory=$false},@{Name='software-confirmado.xml';Source=$Paths.SoftwareAck;Field='SoftwareAckSha256';Directory=$false})
+}
+function Move-PdvIdentitySwitchEntry {
+  param([string]$Source,[string]$Destination,[bool]$Directory)
+  [void](Assert-PdvIdentitySwitchPath $Source);[void](Assert-PdvIdentitySwitchPath $Destination)
+  if($Directory){[IO.Directory]::Move($Source,$Destination)}else{[IO.File]::Move($Source,$Destination)}
+}
+function Test-PdvIdentitySwitchInternal {
+  param($Session)
+  return ($null -ne $script:PdvIdentitySwitchContext -and [object]::ReferenceEquals($script:PdvIdentitySwitchContext.Session,$Session))
+}
+function Test-PdvIdentitySwitchBlocked {
+  param($Session)
+  if(Get-PdvTransportValue $Session 'IdentitySwitchBlocked' $false){return $true}
+  try{$paths=Get-PdvTransportPaths $Session;return ([IO.File]::Exists((Join-Path $paths.Directory 'identity-switch.xml')) -or [IO.Directory]::Exists((Join-Path $paths.Directory 'identity-switch.xml')))}catch{return $true}
+}
+function Read-PdvIdentitySwitchJournal {
+  param($Session)
+  $locations=Get-PdvIdentitySwitchLocations $Session
+  [void](Assert-PdvIdentitySwitchPath $locations.Journal)
+  $fields=@('ArchiveId','TargetEndpoint','TargetStoreId','TargetTerminal','TargetAgentId','TargetConfigSha256','TargetCredentialSha256','PreviousConfigSha256','PreviousCredentialSha256','OutboxSha256','HardwareSha256','SoftwareSha256','HardwareAckSha256','SoftwareAckSha256')
+  $journal=Read-PdvTransportXml $locations.Journal 'PdvMonitorIdentitySwitch' $fields
+  $locations=Get-PdvIdentitySwitchLocations $Session $journal.ArchiveId
+  if(-not (Test-PdvCentralIdentity $journal.TargetEndpoint $journal.TargetStoreId $journal.TargetTerminal $journal.TargetAgentId) -or -not [IO.Directory]::Exists($locations.Archive)){throw 'IdentitySwitchJournalInvalid'}
+  foreach($field in $fields){if($field.EndsWith('Sha256') -and $journal[$field] -cnotmatch '^[a-f0-9]{64}$' -and $journal[$field] -cne ''){throw 'IdentitySwitchJournalInvalid'}}
+  if(-not $journal.TargetConfigSha256 -or -not $journal.TargetCredentialSha256 -or -not $journal.OutboxSha256){throw 'IdentitySwitchJournalInvalid'}
+  $allowed=@('central.xml','central-credencial.bin','outbox','hardware-pendente.xml','software-pendente.xml','hardware-confirmado.xml','software-confirmado.xml','identity-switch.xml')
+  foreach($path in [IO.Directory]::GetFileSystemEntries($locations.Archive)){[void](Assert-PdvIdentitySwitchPath $path);if($allowed -cnotcontains [IO.Path]::GetFileName($path)){throw 'IdentitySwitchArchiveCollision'}}
+  foreach($pair in @(@{Name='central.xml';Field='PreviousConfigSha256'},@{Name='central-credencial.bin';Field='PreviousCredentialSha256'})){
+    if((Get-PdvIdentitySwitchFileHash (Join-Path $locations.Archive $pair.Name)) -cne $journal[$pair.Field]){throw 'IdentitySwitchSnapshotCollision'}
+  }
+  return @{Locations=$locations;Journal=$journal}
+}
+function Complete-PdvIdentitySwitchJournal {
+  param($Locations)
+  $destination=Join-Path $Locations.Archive 'identity-switch.xml'
+  [void](Assert-PdvIdentitySwitchPath $destination)
+  if([IO.File]::Exists($destination)){
+    if((Get-PdvIdentitySwitchFileHash $destination) -cne (Get-PdvIdentitySwitchFileHash $Locations.Journal)){throw 'IdentitySwitchJournalCollision'}
+    [IO.File]::Delete($Locations.Journal)
+  }else{Move-PdvIdentitySwitchEntry $Locations.Journal $destination $false}
+}
+function Recover-PdvIdentitySwitch {
+  param($Session)
+  $paths=Get-PdvTransportPaths $Session;$journalPath=Join-Path $paths.Directory 'identity-switch.xml'
+  if(-not [IO.File]::Exists($journalPath) -and -not [IO.Directory]::Exists($journalPath)){Set-PdvTransportValue $Session 'IdentitySwitchBlocked' $false;return @{Committed=$false;Recovered=$false;ArchivePath=''}}
+  Set-PdvTransportValue $Session 'IdentitySwitchBlocked' $true
+  $state=Read-PdvIdentitySwitchJournal $Session;$locations=$state.Locations;$journal=$state.Journal
+  $configHash=Get-PdvIdentitySwitchFileHash $paths.Config;$credentialHash=Get-PdvIdentitySwitchFileHash $paths.Credential
+  $committed=($configHash -ceq $journal.TargetConfigSha256 -and $credentialHash -ceq $journal.TargetCredentialSha256)
+  $plans=@()
+  foreach($item in @(Get-PdvIdentitySwitchItems $paths)){
+    $destination=Join-Path $locations.Archive $item.Name
+    if($item.Directory){$archived=Get-PdvIdentitySwitchTreeHash $destination;$current=Get-PdvIdentitySwitchTreeHash $item.Source}else{$archived=Get-PdvIdentitySwitchFileHash $destination;$current=Get-PdvIdentitySwitchFileHash $item.Source}
+    $expected=$journal[$item.Field]
+    if($committed){if($archived -cne $expected){throw 'IdentitySwitchArchiveCollision'};continue}
+    if($archived -and $archived -cne $expected){throw 'IdentitySwitchArchiveCollision'}
+    if(-not $expected){if($current -or $archived){throw 'IdentitySwitchRestoreCollision'};continue}
+    if($current -ceq $expected){continue}
+    if($archived -ceq $expected -and -not $current){$plans+=,@{Item=$item;Archived=$destination;RemoveEmpty=$false};continue}
+    if($archived -ceq $expected -and $item.Directory -and [IO.Directory]::Exists($item.Source) -and [IO.Directory]::GetFileSystemEntries($item.Source).Length -eq 0){$plans+=,@{Item=$item;Archived=$destination;RemoveEmpty=$true};continue}
+    throw 'IdentitySwitchRestoreCollision'
+  }
+  if(-not $committed){
+    if(($configHash -and $configHash -cne $journal.PreviousConfigSha256 -and $configHash -cne $journal.TargetConfigSha256) -or ($credentialHash -and $credentialHash -cne $journal.PreviousCredentialSha256 -and $credentialHash -cne $journal.TargetCredentialSha256)){throw 'IdentitySwitchConfigurationCollision'}
+    # Preflight completo antes de restaurar qualquer caminho. Colisao diferente
+    # bloqueia a central, preservando ambas as copias para o suporte.
+    foreach($plan in $plans){if($plan.RemoveEmpty){[IO.Directory]::Delete($plan.Item.Source,$false)};Move-PdvIdentitySwitchEntry $plan.Archived $plan.Item.Source $plan.Item.Directory}
+    foreach($pair in @(@{Source=$paths.Config;Name='central.xml';Hash=$journal.PreviousConfigSha256},@{Source=$paths.Credential;Name='central-credencial.bin';Hash=$journal.PreviousCredentialSha256})){
+      if($pair.Hash){if((Get-PdvIdentitySwitchFileHash $pair.Source) -cne $pair.Hash){Write-PdvTransportAtomicBytes $pair.Source ([IO.File]::ReadAllBytes((Join-Path $locations.Archive $pair.Name)))}}
+      elseif([IO.File]::Exists($pair.Source)){[IO.File]::Delete($pair.Source)}
+    }
+  }
+  if($committed){Sync-PdvIdentitySwitchCommittedFiles $paths}
+  Complete-PdvIdentitySwitchJournal $locations
+  Set-PdvTransportValue $Session 'IdentitySwitchBlocked' $false
+  return @{Committed=$committed;Recovered=$true;ArchivePath=$locations.Archive}
+}
+function Test-PdvCentralIdentityNeedsArchive {
+  param($Session,$NewCentral,$Paths)
+  $previous=Get-PdvCentralConfig $Session
+  if([string](Get-PdvTransportValue $previous 'AgentId' '')){foreach($field in @('AgentId','StoreId','Terminal')){if([string](Get-PdvTransportValue $previous $field '') -cne [string]$NewCentral[$field]){return $true}}}
+  foreach($file in @(Get-PdvOutboxFiles $Paths.Outbox)){$record=Read-PdvTransportXml $file.FullName 'PdvMonitorOutbox' (@('AgentId','StoreId','Terminal')+$script:PdvEventFields);foreach($field in @('AgentId','StoreId','Terminal')){if($record[$field] -cne $NewCentral[$field]){return $true}}}
+  foreach($path in @($Paths.Hardware,$Paths.Software)){if([IO.File]::Exists($path)){if($path -ceq $Paths.Hardware){$record=Read-PdvHardwarePending $path}else{$record=Read-PdvSoftwarePending $path};foreach($field in @('AgentId','StoreId','Terminal')){if($record[$field] -cne $NewCentral[$field]){return $true}}}}
+  return $false
+}
+function Invoke-PdvCentralIdentitySwitch {
+  param($Session,$NewCentral,[string]$Token)
+  $paths=Get-PdvTransportPaths $Session
+  $protected=Protect-PdvMonitorToken $Token $NewCentral
+  $configBytes=New-PdvTransportXmlBytes 'PdvMonitorCentral' @{Enabled='true';Endpoint=$NewCentral.Endpoint;StoreId=$NewCentral.StoreId;Terminal=$NewCentral.Terminal;AgentId=$NewCentral.AgentId}
+  $locations=Get-PdvIdentitySwitchLocations $Session ([Guid]::NewGuid().ToString('D'))
+  $journal=@{ArchiveId=[IO.Path]::GetFileName($locations.Archive);TargetEndpoint=$NewCentral.Endpoint;TargetStoreId=$NewCentral.StoreId;TargetTerminal=$NewCentral.Terminal;TargetAgentId=$NewCentral.AgentId;TargetConfigSha256=(Get-PdvIdentitySwitchHash $configBytes);TargetCredentialSha256=(Get-PdvIdentitySwitchHash $protected);PreviousConfigSha256=(Get-PdvIdentitySwitchFileHash $paths.Config);PreviousCredentialSha256=(Get-PdvIdentitySwitchFileHash $paths.Credential)}
+  foreach($item in @(Get-PdvIdentitySwitchItems $paths)){if($item.Directory){$journal[$item.Field]=Get-PdvIdentitySwitchTreeHash $item.Source}else{$journal[$item.Field]=Get-PdvIdentitySwitchFileHash $item.Source}}
+  [void][IO.Directory]::CreateDirectory($locations.Parent)
+  if([IO.Directory]::Exists($locations.Archive) -or [IO.File]::Exists($locations.Archive)){throw 'IdentitySwitchArchiveCollision'}
+  [void][IO.Directory]::CreateDirectory($locations.Archive)
+  foreach($pair in @(@{Source=$paths.Config;Name='central.xml';Hash=$journal.PreviousConfigSha256},@{Source=$paths.Credential;Name='central-credencial.bin';Hash=$journal.PreviousCredentialSha256})){
+    if($pair.Hash){Write-PdvIdentitySwitchDurableBytes (Join-Path $locations.Archive $pair.Name) ([IO.File]::ReadAllBytes($pair.Source));if((Get-PdvIdentitySwitchFileHash (Join-Path $locations.Archive $pair.Name)) -cne $pair.Hash){throw 'IdentitySwitchSnapshotCollision'}}
+  }
+  Write-PdvIdentitySwitchDurableBytes $locations.Journal (New-PdvTransportXmlBytes 'PdvMonitorIdentitySwitch' $journal)
+  Set-PdvTransportValue $Session 'IdentitySwitchBlocked' $true
+  try{
+    foreach($item in @(Get-PdvIdentitySwitchItems $paths)){if($journal[$item.Field]){Move-PdvIdentitySwitchEntry $item.Source (Join-Path $locations.Archive $item.Name) $item.Directory}}
+    [void][IO.Directory]::CreateDirectory($paths.Outbox)
+    $script:PdvIdentitySwitchContext=@{Session=$Session;Protected=$protected}
+    try{$result=Set-PdvMonitorCentralConfig -Session $Session -Endpoint $NewCentral.Endpoint -StoreId $NewCentral.StoreId -Terminal $NewCentral.Terminal -AgentId $NewCentral.AgentId -Token $Token}finally{$script:PdvIdentitySwitchContext=$null}
+    if(-not $result.Success){throw 'IdentitySwitchConfigurationFailed'}
+    $recovered=Recover-PdvIdentitySwitch $Session
+    if(-not $recovered.Committed){throw 'IdentitySwitchCommitUnconfirmed'}
+    return (New-PdvIdentitySwitchSuccess $Session $locations.Archive)
+  }catch{
+    $script:PdvIdentitySwitchContext=$null
+    try{
+      $recovered=Recover-PdvIdentitySwitch $Session
+      $completed=Join-Path $locations.Archive 'identity-switch.xml'
+      if($recovered.Committed -or ((Get-PdvIdentitySwitchFileHash $paths.Config) -ceq $journal.TargetConfigSha256 -and (Get-PdvIdentitySwitchFileHash $paths.Credential) -ceq $journal.TargetCredentialSha256 -and (Get-PdvIdentitySwitchFileHash $completed) -ceq (Get-PdvIdentitySwitchHash (New-PdvTransportXmlBytes 'PdvMonitorIdentitySwitch' $journal)))){return (New-PdvIdentitySwitchSuccess $Session $locations.Archive)}
+      Read-PdvCentralSessionConfig $Session $paths;return (New-PdvTransportResult $false 'IdentityArchiveRolledBack')
+    }
+    catch{Set-PdvTransportValue $Session 'IdentitySwitchBlocked' $true;Set-PdvTransportValue (Get-PdvCentralConfig $Session) 'Enabled' $false;return (New-PdvTransportResult $false 'IdentitySwitchRecoveryRequired')}
+  }finally{$Token=$null;$protected=$null}
+}
+
+function Read-PdvCentralSessionConfig {
+  param($Session,$Paths)
+  [void](Get-PdvCentralConfig $Session)
+  if([IO.File]::Exists($Paths.Config)){
+    $values=Read-PdvTransportXml $Paths.Config 'PdvMonitorCentral' @('Enabled','Endpoint','StoreId','Terminal','AgentId')
+    if(-not (Test-PdvCentralIdentity $values.Endpoint $values.StoreId $values.Terminal $values.AgentId) -or @('true','false') -notcontains $values.Enabled){throw 'InvalidCentralConfig'}
+    $values.Enabled=($values.Enabled -eq 'true');Set-PdvTransportValue (Get-PdvTransportValue $Session 'Config') 'Central' $values
+  }
+}
+
 function Initialize-PdvMonitorCentral {
   [CmdletBinding()]
   param([Parameter(Mandatory=$true)]$Session)
   try {
     $paths = Get-PdvTransportPaths $Session
     [void][IO.Directory]::CreateDirectory($paths.Directory)
+    $identityRecovery=Recover-PdvIdentitySwitch $Session
     [void][IO.Directory]::CreateDirectory($paths.Outbox)
-    [void](Get-PdvCentralConfig $Session)
-    if ([IO.File]::Exists($paths.Config)) {
-      $values = Read-PdvTransportXml $paths.Config 'PdvMonitorCentral' @('Enabled', 'Endpoint', 'StoreId', 'Terminal', 'AgentId')
-      if (-not (Test-PdvCentralIdentity $values.Endpoint $values.StoreId $values.Terminal $values.AgentId) -or @('true', 'false') -notcontains $values.Enabled) { throw 'InvalidCentralConfig' }
-      $values.Enabled = ($values.Enabled -eq 'true')
-      Set-PdvTransportValue (Get-PdvTransportValue $Session 'Config') 'Central' $values
-    }
-    Remove-PdvMonitorRoutineOutbox $Session $paths (Get-PdvCentralConfig $Session)
+    Read-PdvCentralSessionConfig $Session $paths
+    # A recuperacao restaura os bytes originais antes de retomar a coleta.
+    # Nao drenar rotina durante a propria recuperacao de uma troca interrompida.
+    if(-not $identityRecovery.Recovered){Remove-PdvMonitorRoutineOutbox $Session $paths (Get-PdvCentralConfig $Session)}
     Set-PdvInventoryStartupWindow $Session
     Set-PdvTransportValue $Session 'NextUploadAt' ([DateTimeOffset]::MinValue)
     Set-PdvTransportValue $Session 'UploadFailureCount' 0
@@ -412,7 +636,7 @@ function Initialize-PdvMonitorCentral {
 
 function Set-PdvMonitorCentralConfig {
   [CmdletBinding()]
-  param([Parameter(Mandatory=$true)]$Session, [string]$Endpoint, [string]$StoreId, [string]$Terminal, [string]$AgentId, [string]$Token)
+  param([Parameter(Mandatory=$true)]$Session, [string]$Endpoint, [string]$StoreId, [string]$Terminal, [string]$AgentId, [string]$Token, [switch]$ArchivePreviousIdentity)
   if (-not (Test-PdvCentralIdentity $Endpoint $StoreId $Terminal $AgentId) -or $Token -notmatch '^[a-fA-F0-9]{64}$') {
     Set-PdvTransportValue $Session 'UploadStatusText' 'Configuração central inválida: conferir HTTPS, loja, terminal, agente e credencial.'
     return (New-PdvTransportResult $false 'InvalidConfiguration')
@@ -421,7 +645,9 @@ function Set-PdvMonitorCentralConfig {
     $paths = Get-PdvTransportPaths $Session
     [void][IO.Directory]::CreateDirectory($paths.Directory)
     [void][IO.Directory]::CreateDirectory($paths.Outbox)
+    if(-not (Test-PdvIdentitySwitchInternal $Session)){[void](Recover-PdvIdentitySwitch $Session)}
     $newCentral = @{Enabled=$true; Endpoint=$Endpoint; StoreId=$StoreId; Terminal=$Terminal; AgentId=$AgentId.ToLowerInvariant()}
+    if($ArchivePreviousIdentity -and (Test-PdvCentralIdentityNeedsArchive $Session $newCentral $paths)){return (Invoke-PdvCentralIdentitySwitch $Session $newCentral $Token)}
     foreach ($file in @(Get-PdvOutboxFiles $paths.Outbox)) {
       $old = Read-PdvTransportXml $file.FullName 'PdvMonitorOutbox' (@('AgentId', 'StoreId', 'Terminal') + $script:PdvEventFields)
       if ($old.AgentId -ne $newCentral.AgentId -or $old.StoreId -cne $StoreId -or $old.Terminal -cne $Terminal) {
@@ -440,7 +666,7 @@ function Set-PdvMonitorCentralConfig {
       $pendingSoftware=Read-PdvSoftwarePending $paths.Software
       if($pendingSoftware.AgentId -ne $newCentral.AgentId -or $pendingSoftware.StoreId -cne $StoreId -or $pendingSoftware.Terminal -cne $Terminal){return (New-PdvTransportResult $false 'PendingIdentityChange')}
     }
-    $protected = Protect-PdvMonitorToken $Token $newCentral
+    if(Test-PdvIdentitySwitchInternal $Session){$protected=$script:PdvIdentitySwitchContext.Protected}else{$protected = Protect-PdvMonitorToken $Token $newCentral}
     $configValues = @{Enabled='true'; Endpoint=$Endpoint; StoreId=$StoreId; Terminal=$Terminal; AgentId=$newCentral.AgentId}
     $configBytes = New-PdvTransportXmlBytes 'PdvMonitorCentral' $configValues
     $previousCredential = $null
@@ -462,6 +688,9 @@ function Set-PdvMonitorCentralConfig {
     Set-PdvTransportValue $Session 'LastSoftwareAt' $null
     Set-PdvTransportValue $Session 'NextUploadAt' ([DateTimeOffset]::MinValue)
     Set-PdvTransportValue $Session 'UploadFailureCount' 0
+    Set-PdvTransportValue $Session 'NextSoftwareUploadAt' ([DateTimeOffset]::MinValue)
+    Set-PdvTransportValue $Session 'SoftwareUploadFailures' 0
+    Set-PdvTransportValue $Session 'HardwareCompatibilityRetryAt' ([DateTimeOffset]::MinValue)
     Set-PdvTransportValue $Session 'UploadStatusText' 'Central configurada. Credencial protegida para este usuário do Windows; aguardando envio.'
     return (New-PdvTransportResult $true 'Configured')
   } catch {
@@ -473,6 +702,7 @@ function Set-PdvMonitorCentralConfig {
 function Add-PdvMonitorOutboxRecord {
   [CmdletBinding()]
   param([Parameter(Mandatory=$true)]$Session, [Parameter(Mandatory=$true)]$Record)
+  if(Test-PdvIdentitySwitchBlocked $Session){return (New-PdvTransportResult $false 'IdentitySwitchPending')}
   $central = Get-PdvCentralConfig $Session
   $enabled = Get-PdvTransportValue $central 'Enabled'
   if ($enabled -isnot [bool] -or -not $enabled) { return (New-PdvTransportResult $false 'CentralDisabled') }
@@ -564,6 +794,7 @@ function Set-PdvUploadBackoff {
 function Invoke-PdvMonitorUpload {
   [CmdletBinding()]
   param([Parameter(Mandatory=$true)]$Session)
+  if(Test-PdvIdentitySwitchBlocked $Session){return (New-PdvTransportResult $false 'IdentitySwitchPending')}
   $central = Get-PdvCentralConfig $Session
   $enabled = Get-PdvTransportValue $central 'Enabled'
   if ($enabled -isnot [bool] -or -not $enabled) { return (New-PdvTransportResult $false 'CentralDisabled') }

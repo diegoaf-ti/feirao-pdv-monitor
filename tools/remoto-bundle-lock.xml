@@ -1,0 +1,24 @@
+<?xml version='1.0' encoding='utf-8'?>
+<PdvRemoteBundle schemaVersion="1" id="ultravnc-1.8.3.0-stunnel-5.82-x64">
+  <Profiles>
+    <Profile id="win7-sp1-x64" />
+    <Profile id="win10plus-x64" />
+  </Profiles>
+  <Files>
+    <File path="bin/ultravnc/winvnc.exe" sha256="9ebd1ec90ba1274d4a183f5bf6588374700052da907fa764a2ae7072e8ae19fe" sizeBytes="3848272" authPolicy="authenticode" machine="34404" publisherThumbprint="FC73648251A581B15067983FBFA67D1008D1EB59" />
+    <File path="bin/ultravnc/ddengine64.dll" sha256="b131ea39ca40544e6805246057213faa9ed86e49b5b1cac0029bc9532386cb75" sizeBytes="336328" authPolicy="authenticode" machine="34404" publisherThumbprint="ADC749D2F75F158C8218857FF187F81B97B3872A" />
+    <File path="bin/ultravnc/vnchooks.dll" sha256="8eb6f0f2d25f3d9fa075c311c6ad6f4d18cd4309d497f0d2a0e60b84f1fb19eb" sizeBytes="488552" authPolicy="authenticode" machine="34404" publisherThumbprint="C09BFAB9E1A10CAC52FE664084C4DF77452A44AE" />
+    <File path="bin/stunnel/stunnel.exe" sha256="69a62693907976d0e25a6570c1522fd10584a2c7e4e8c93cff39b974b44e5b78" sizeBytes="317504" authPolicy="authenticode" machine="34404" publisherThumbprint="52080A81F4A29130C44554D0264CC1E2786DEE85" />
+    <File path="bin/stunnel/libcrypto-3-x64.dll" sha256="8d450f6eb97ed866712b1bfb57c80f30c5970edfc80d354d2de34ea3380ece4e" sizeBytes="7436096" authPolicy="authenticode" machine="34404" publisherThumbprint="52080A81F4A29130C44554D0264CC1E2786DEE85" />
+    <File path="bin/stunnel/libssl-3-x64.dll" sha256="bdb8ed2acb90fdab1cac146ee89685b009e8d58a591fe8bc9800782a85d3f635" sizeBytes="1329568" authPolicy="authenticode" machine="34404" publisherThumbprint="52080A81F4A29130C44554D0264CC1E2786DEE85" />
+    <File path="bin/stunnel/libssp-0.dll" sha256="43ac5e338e3e05d2da19c48eef21f65b3e1833be0bc9c5735465f2935b371754" sizeBytes="131426" authPolicy="covered-by-signed-container" machine="34404" sourceArtifact="sources/stunnel-5.82-win64-installer.exe" />
+    <File path="sources/stunnel-5.82-win64-installer.exe" sha256="722c1ad626919af2b0034666b4d19cc4795e925c32f60e8f3c59af4fb3ad2dfc" sizeBytes="4011024" authPolicy="authenticode" machine="332" publisherThumbprint="52080A81F4A29130C44554D0264CC1E2786DEE85" />
+    <File path="licenses/GCC-GPL-3.txt" sha256="8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903" sizeBytes="35147" authPolicy="sha256" />
+    <File path="licenses/GCC-RUNTIME-EXCEPTION.txt" sha256="9d6b43ce4d8de0c878bf16b54d8e7a10d9bd42b75178153e3af6a815bdc90f74" sizeBytes="3324" authPolicy="sha256" />
+    <File path="licenses/ORIGENS.md" sha256="1c34e6b1d39507bad2780b5615eda3936b84bbb16cf12aa9425854820fad0844" sizeBytes="1764" authPolicy="sha256" />
+    <File path="licenses/OpenSSL-LICENSE.txt" sha256="7d5450cb2d142651b8afa315b5f238efc805dad827d91ba367d8516bc9d49e7a" sizeBytes="10175" authPolicy="sha256" />
+    <File path="licenses/UltraVNC-LICENSE.txt" sha256="3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986" sizeBytes="35149" authPolicy="sha256" />
+    <File path="licenses/stunnel-COPYING.md" sha256="716f18b10eac3f1875ea2205418dd1b0084bd210bd17d615df6b180cfc4d65b6" sizeBytes="1768" authPolicy="sha256" />
+    <File path="licenses/stunnel-GPL-2.md" sha256="62f171d4d8b6726df61f18a6bbc0a70f79c4bc2134d837d35c81fc6289a2d84d" sizeBytes="17941" authPolicy="sha256" />
+  </Files>
+</PdvRemoteBundle>

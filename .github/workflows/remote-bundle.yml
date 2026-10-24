@@ -1,0 +1,45 @@
+name: Bundle remoto oficial para piloto
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/pdv-remoto-instalacao-renovacao
+
+permissions:
+  contents: read
+
+jobs:
+  official-x64:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validar manifesto e testes isolados do empacotador
+        run: python -m unittest discover -s tools -p 'test_*.py' -v
+      - name: Conferir validação do instalador com arquivos sintéticos
+        shell: powershell
+        run: |
+          & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ./tools/TestsBundleRemoto.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'Falha nos testes isolados do bundle' }
+      - name: Conferir assinaturas reais e extrair somente dependências pinadas
+        run: python tools/preparar-bundle-remoto.py --output "${{ runner.temp }}/pdv-remote-bundle"
+      - name: Gerar instalador universal com remoto x64 e sem identidade privada
+        shell: pwsh
+        run: |
+          $version = (Get-Content -LiteralPath monitor-version.txt -Raw).Trim()
+          python tools/criar-pacote-instalacao.py --source . --output "${{ runner.temp }}/pdv-package-remote" --version $version --remote-bundle "${{ runner.temp }}/pdv-remote-bundle"
+          if ($LASTEXITCODE -ne 0) { throw 'Empacotamento remoto recusado' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: monitor-windows-com-remoto-x64-piloto
+          path: ${{ runner.temp }}/pdv-package-remote/*
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dependencias-remotas-x64-conferidas
+          path: ${{ runner.temp }}/pdv-remote-bundle/*
+          if-no-files-found: error
