@@ -55,7 +55,7 @@ function Get-PdvTransportPaths {
   $outbox = [IO.Path]::GetFullPath($outbox)
   $directoryPrefix = $directory.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
   if (-not $outbox.StartsWith($directoryPrefix, [StringComparison]::OrdinalIgnoreCase)) { throw 'OutboxMustBeInsideDataDirectory' }
-  return (New-Object PSObject -Property @{Directory=$directory; Outbox=$outbox; Config=(Join-Path $directory 'central.xml'); Credential=(Join-Path $directory 'central-credencial.bin'); Hardware=(Join-Path $directory 'hardware-pendente.xml'); Software=(Join-Path $directory 'software-pendente.xml')})
+  return (New-Object PSObject -Property @{Directory=$directory; Outbox=$outbox; Config=(Join-Path $directory 'central.xml'); Credential=(Join-Path $directory 'central-credencial.bin'); Hardware=(Join-Path $directory 'hardware-pendente.xml'); Software=(Join-Path $directory 'software-pendente.xml'); HardwareAck=(Join-Path $directory 'hardware-confirmado.xml'); SoftwareAck=(Join-Path $directory 'software-confirmado.xml')})
 }
 
 function Get-PdvOutboxFiles {
@@ -95,6 +95,59 @@ function New-PdvEnvelopeJson {
   return '{"schemaVersion":'+$version+',"agentId":' + (ConvertTo-PdvJsonString ([string](Get-PdvTransportValue $Central 'AgentId'))) + ',"storeId":' + (ConvertTo-PdvJsonString ([string](Get-PdvTransportValue $Central 'StoreId'))) + ',"terminal":' + (ConvertTo-PdvJsonString ([string](Get-PdvTransportValue $Central 'Terminal'))) + ',"batchId":' + (ConvertTo-PdvJsonString $BatchId) + ',"events":[' + [string]::Join(',', $EventJson) + ']'+$hardwarePart+'}'
 }
 
+# Somente incidentes e auditoria de ações saem da máquina. O CSV local guarda
+# também a rotina; tipos futuros precisam ser classificados antes de enviar.
+function Test-PdvMonitorCentralEvent {
+  param($Record)
+  $kind=[string](Get-PdvTransportValue $Record 'Kind' '')
+  if (@('DeviceDisconnected','DeviceMissing','ComPortChanged','ComPortConflict','HardwareFault','DeviceRestored','HardwareChanged','SecurityThreatDetected','SecurityThreatStatusChanged','RecoveryAttempt','RecoveryResult','RecoveryFailed','NerusRecoveryAttempt','NerusRecoveryConfigured','NerusRecoveryFailed','NerusRecoveryUncertain','NerusServiceRestarted','LogGap','UpdateFailed','UpdateRollback','UpdateRolledBack','RemoteSupportStarted','RemoteSupportEnded','RemoteSupportFailed','RemoteSupportBlocked','RemoteSupportInterrupted','RemoteSupportConsentRequested','RemoteSupportConsentDecision','RemoteSupportConsentDenied','RemoteSupportCloseRequired','RemoteSupportClosed') -contains $kind) { return $true }
+  # Estado inválido de recuperação, serviço vinculado indisponível e lacunas
+  # merecem atenção; indisponibilidade transitória de uma consulta fica local.
+  $reason=[string](Get-PdvTransportValue $Record 'Reason' '')
+  return ($kind -eq 'CollectionWarning' -and (@('NerusServiceState','NerusServiceNotObserved') -contains $reason))
+}
+
+function Test-PdvMonitorLocalRoutine {
+  param($Record)
+  if (Test-PdvMonitorCentralEvent $Record) { return $false }
+  return (@('Heartbeat','Started','Stopped','MonitorStopped','SessionStarted','SessionStopped','WindowsEvent','WindowsCritical','WindowsError','WindowsEventCoverage','PrinterSnapshot','PortReservations','Snapshot','DeviceSnapshot','MachineInventory','SoftwareInventory','SoftwareInventoryChanged','ServiceDiagnostic','UploadWarning','UploadResumed','RecoveryDecision','NerusRecoveryBlocked','RemoteSupportDiagnostic','CollectionWarning','CollectionRestored','ProfileChanged','CentralConfigured','MaintenanceArmed','MaintenanceDisarmed','UpdateStaged','UpdateApplied') -contains [string](Get-PdvTransportValue $Record 'Kind' ''))
+}
+
+function Remove-PdvMonitorRoutineOutbox {
+  param($Session,$Paths,$Central)
+  if (-not (Test-PdvCentralIdentity ([string]$Central.Endpoint) ([string]$Central.StoreId) ([string]$Central.Terminal) ([string]$Central.AgentId))) { return }
+  foreach($file in @(Get-PdvOutboxFiles $Paths.Outbox)) {
+    try {
+      $record=Read-PdvTransportXml $file.FullName 'PdvMonitorOutbox' (@('AgentId','StoreId','Terminal') + $script:PdvEventFields)
+      $matches=$true
+      foreach($field in @('AgentId','StoreId','Terminal')) { if($record[$field] -cne [string](Get-PdvTransportValue $Central $field '')) { $matches=$false } }
+      # Só rotina conhecida é descartada da fila anterior. Registros inválidos,
+      # tipos desconhecidos e incidentes permanecem para análise, sem expiração.
+      if($matches -and (Test-PdvOutboxRecord $record) -and (Test-PdvMonitorLocalRoutine $record)) { [IO.File]::Delete($file.FullName) }
+    } catch { }
+  }
+}
+
+function Test-PdvInventoryAcknowledged {
+  param($Central,[string]$Path,[string]$Fingerprint)
+  if (-not [IO.File]::Exists($Path)) { return $false }
+  try {
+    $ack=Read-PdvTransportXml $Path 'PdvMonitorInventoryAcknowledged' @('AgentId','StoreId','Terminal','Endpoint','Fingerprint')
+    foreach($field in @('AgentId','StoreId','Terminal','Endpoint')) { if($ack[$field] -cne [string](Get-PdvTransportValue $Central $field '')) { return $false } }
+    return ($ack.Fingerprint -ceq $Fingerprint)
+  } catch { return $false }
+}
+
+function Save-PdvInventoryAcknowledged {
+  param($Central,[string]$Path,[string]$Fingerprint)
+  if ($Fingerprint -notmatch '^[a-f0-9]{64}$') { throw 'InventoryAcknowledgmentInvalid' }
+  $values=@{Fingerprint=$Fingerprint}
+  foreach($field in @('AgentId','StoreId','Terminal','Endpoint')) { $values[$field]=[string](Get-PdvTransportValue $Central $field '') }
+  # Só executar depois do ACK integral. Persistir antes de apagar a pendência:
+  # uma queda entre as duas etapas conserva a prova de confirmação em disco.
+  Write-PdvTransportAtomicBytes $Path (New-PdvTransportXmlBytes 'PdvMonitorInventoryAcknowledged' $values)
+}
+
 function Read-PdvHardwarePending {
   param([string]$Path)
   $values=Read-PdvTransportXml $Path 'PdvMonitorHardware' @('AgentId','StoreId','Terminal','Fingerprint','HardwareJson')
@@ -116,7 +169,9 @@ function Set-PdvMonitorHardwarePending {
     if ([IO.File]::Exists($paths.Hardware)) {
       $previous=Read-PdvHardwarePending $paths.Hardware
       foreach ($field in @('AgentId','StoreId','Terminal')) { if ($previous[$field] -cne $values[$field]) { throw 'HardwareIdentityMismatch' } }
+      if ($previous.Fingerprint -ceq $values.Fingerprint) { return (New-PdvTransportResult $true 'HardwareAlreadyQueued' $true) }
     }
+    if (-not [IO.File]::Exists($paths.Hardware) -and (Test-PdvInventoryAcknowledged $central $paths.HardwareAck $values.Fingerprint)) { return (New-PdvTransportResult $true 'HardwareAlreadyAcknowledged' $true) }
     # Inventário representa o estado mais recente. A substituição do único item
     # pendente é atômica e não altera a fila histórica de eventos.
     Write-PdvTransportAtomicBytes $paths.Hardware (New-PdvTransportXmlBytes 'PdvMonitorHardware' $values)
@@ -165,6 +220,7 @@ function Set-PdvMonitorSoftwarePending {
       # O mesmo estado pendente conserva identidade e bytes para reenvio.
       if($old.Fingerprint -ceq $Fingerprint){return (New-PdvTransportResult $true 'SoftwareAlreadyQueued' $true)}
     }
+    if (-not [IO.File]::Exists($paths.Software) -and (Test-PdvInventoryAcknowledged $central $paths.SoftwareAck $Fingerprint)) { return (New-PdvTransportResult $true 'SoftwareAlreadyAcknowledged' $true) }
     Write-PdvTransportAtomicBytes $paths.Software (New-PdvTransportXmlBytes 'PdvMonitorSoftware' $values)
     return (New-PdvTransportResult $true 'SoftwareQueued' $true)
   }catch{return (New-PdvTransportResult $false 'SoftwareQueueFailed')}
@@ -190,6 +246,8 @@ function Invoke-PdvMonitorSoftwareUpload {
     if(-not (Test-PdvCentralIdentity ([string]$central.Endpoint) ([string]$central.StoreId) ([string]$central.Terminal) ([string]$central.AgentId))){throw 'InvalidConfiguration'}
     $paths=Get-PdvTransportPaths $Session
     if(-not [IO.File]::Exists($paths.Software)){return (New-PdvTransportResult $true 'SoftwareOutboxEmpty')}
+    $initialAt=Get-PdvTransportValue $Session 'SoftwareInitialUploadAt' $null
+    if(-not [IO.File]::Exists($paths.SoftwareAck) -and $initialAt -is [DateTimeOffset] -and $initialAt -gt $now){return (New-PdvTransportResult $true 'SoftwareBaselineDeferred')}
     $pending=Read-PdvSoftwarePending $paths.Software
     foreach($field in @('AgentId','StoreId','Terminal')){if($pending[$field] -cne [string]$central.$field){Set-PdvSoftwareUploadBackoff $Session $now $true;return (New-PdvTransportResult $false 'SoftwareIdentityMismatch')}}
     try{$token=Unprotect-PdvMonitorToken ([IO.File]::ReadAllBytes($paths.Credential)) $central;if($token -notmatch '^[a-fA-F0-9]{64}$'){throw 'InvalidCredential'}}
@@ -201,7 +259,7 @@ function Invoke-PdvMonitorSoftwareUpload {
     if($status -ne 204){Set-PdvSoftwareUploadBackoff $Session $now (@(401,403,404,413,415,426,501,503) -contains $status);return (New-PdvTransportResult $false ('SoftwareHttp'+$status))}
     if([IO.File]::Exists($paths.Software)){
       $current=Read-PdvSoftwarePending $paths.Software
-      if($current.PayloadHash -ceq $pending.PayloadHash -and $current.SoftwareJson -ceq $pending.SoftwareJson -and $current.SnapshotId -ceq $pending.SnapshotId){[IO.File]::Delete($paths.Software)}
+      if($current.PayloadHash -ceq $pending.PayloadHash -and $current.SoftwareJson -ceq $pending.SoftwareJson -and $current.SnapshotId -ceq $pending.SnapshotId){Save-PdvInventoryAcknowledged $central $paths.SoftwareAck $pending.Fingerprint;[IO.File]::Delete($paths.Software)}
     }
     Set-PdvTransportValue $Session 'SoftwareUploadFailures' 0
     Set-PdvTransportValue $Session 'NextSoftwareUploadAt' $now.AddSeconds(5)
@@ -310,6 +368,21 @@ function Get-PdvCentralConfig {
   return $central
 }
 
+function Get-PdvInventoryStartupDelay {
+  param($Central,[string]$Kind)
+  $id=[string](Get-PdvTransportValue $Central 'AgentId' '')
+  if (-not (Test-PdvTransportGuid $id)) { return 0 }
+  $offset=0; if($Kind -eq 'Software'){$offset=23}
+  return (([Convert]::ToInt32($id.Substring(0,4),16)+$offset) % 61)
+}
+
+function Set-PdvInventoryStartupWindow {
+  param($Session)
+  $central=Get-PdvCentralConfig $Session; $now=Get-PdvMonitorTransportNow
+  Set-PdvTransportValue $Session 'HardwareInitialUploadAt' $now.AddSeconds((Get-PdvInventoryStartupDelay $central 'Hardware'))
+  Set-PdvTransportValue $Session 'SoftwareInitialUploadAt' $now.AddSeconds((Get-PdvInventoryStartupDelay $central 'Software'))
+}
+
 function Initialize-PdvMonitorCentral {
   [CmdletBinding()]
   param([Parameter(Mandatory=$true)]$Session)
@@ -324,6 +397,8 @@ function Initialize-PdvMonitorCentral {
       $values.Enabled = ($values.Enabled -eq 'true')
       Set-PdvTransportValue (Get-PdvTransportValue $Session 'Config') 'Central' $values
     }
+    Remove-PdvMonitorRoutineOutbox $Session $paths (Get-PdvCentralConfig $Session)
+    Set-PdvInventoryStartupWindow $Session
     Set-PdvTransportValue $Session 'NextUploadAt' ([DateTimeOffset]::MinValue)
     Set-PdvTransportValue $Session 'UploadFailureCount' 0
     Set-PdvTransportValue $Session 'UploadStatusText' 'Central pronta; nenhum envio confirmado nesta sessão.'
@@ -378,6 +453,13 @@ function Set-PdvMonitorCentralConfig {
       throw
     }
     Set-PdvTransportValue (Get-PdvTransportValue $Session 'Config') 'Central' $newCentral
+    Set-PdvInventoryStartupWindow $Session
+    # O checkpoint patrimonial pertence ao destino/agente. Revalidar em disco
+    # mesmo quando esta funcao e chamada sem o wrapper do runtime.
+    Set-PdvTransportValue $Session 'HardwareQueueChecked' $false
+    Set-PdvTransportValue $Session 'SoftwareQueueChecked' $false
+    Set-PdvTransportValue $Session 'LastHardwareAt' $null
+    Set-PdvTransportValue $Session 'LastSoftwareAt' $null
     Set-PdvTransportValue $Session 'NextUploadAt' ([DateTimeOffset]::MinValue)
     Set-PdvTransportValue $Session 'UploadFailureCount' 0
     Set-PdvTransportValue $Session 'UploadStatusText' 'Central configurada. Credencial protegida para este usuário do Windows; aguardando envio.'
@@ -394,6 +476,7 @@ function Add-PdvMonitorOutboxRecord {
   $central = Get-PdvCentralConfig $Session
   $enabled = Get-PdvTransportValue $central 'Enabled'
   if ($enabled -isnot [bool] -or -not $enabled) { return (New-PdvTransportResult $false 'CentralDisabled') }
+  if (-not (Test-PdvMonitorCentralEvent $Record)) { return (New-PdvTransportResult $true 'LocalOnly') }
   try {
     if (-not (Test-PdvCentralIdentity ([string](Get-PdvTransportValue $central 'Endpoint')) ([string](Get-PdvTransportValue $central 'StoreId')) ([string](Get-PdvTransportValue $central 'Terminal')) ([string](Get-PdvTransportValue $central 'AgentId'))) -or -not (Test-PdvOutboxRecord $Record)) { throw 'InvalidRecord' }
     $paths = Get-PdvTransportPaths $Session
@@ -494,7 +577,9 @@ function Invoke-PdvMonitorUpload {
     $files = @(Get-PdvOutboxFiles $paths.Outbox | Sort-Object LastWriteTimeUtc, Name)
     $hardwarePending=$null; $hardwareJson=''; $hardwareFingerprint=''
     $hardwareRetryAt=Get-PdvTransportValue $Session 'HardwareCompatibilityRetryAt'
-    if ([IO.File]::Exists($paths.Hardware) -and -not ($hardwareRetryAt -is [DateTimeOffset] -and $hardwareRetryAt -gt $now)) {
+    $initialAt=Get-PdvTransportValue $Session 'HardwareInitialUploadAt' $null
+    $baselineDeferred=(-not [IO.File]::Exists($paths.HardwareAck) -and $initialAt -is [DateTimeOffset] -and $initialAt -gt $now)
+    if ([IO.File]::Exists($paths.Hardware) -and -not $baselineDeferred -and -not ($hardwareRetryAt -is [DateTimeOffset] -and $hardwareRetryAt -gt $now)) {
       $hardwarePending=Read-PdvHardwarePending $paths.Hardware
       if ($hardwarePending.AgentId -ne [string](Get-PdvTransportValue $central 'AgentId') -or $hardwarePending.StoreId -cne [string](Get-PdvTransportValue $central 'StoreId') -or $hardwarePending.Terminal -cne [string](Get-PdvTransportValue $central 'Terminal')) {
         Set-PdvUploadBackoff $Session $now $true
@@ -528,6 +613,9 @@ function Invoke-PdvMonitorUpload {
         return (New-PdvTransportResult $false 'OutboxIdentityMismatch')
       }
       if (-not (Test-PdvOutboxRecord $record)) { throw 'InvalidQueuedRecord' }
+      # Drena somente rotina de versões anteriores, já registrada no CSV local.
+      # Incidentes nunca expiram por idade nem são removidos por rotação.
+      if (-not (Test-PdvMonitorCentralEvent $record)) { if(Test-PdvMonitorLocalRoutine $record){[IO.File]::Delete($file.FullName)}; continue }
       $candidateJson = ConvertTo-PdvEventJson $record
       $candidates = @($jsonEvents.ToArray()) + @($candidateJson)
       $candidateBody = [Text.Encoding]::UTF8.GetBytes((New-PdvEnvelopeJson $central $candidates $batchId $hardwareJson))
@@ -539,6 +627,7 @@ function Invoke-PdvMonitorUpload {
       $selected.Add($file.FullName)
       $body = $candidateBody
     }
+    if ($selected.Count -eq 0 -and -not $hardwareJson) { return (New-PdvTransportResult $true 'OutboxEmpty') }
     $authorization = 'Bearer ' + [string](Get-PdvTransportValue $central 'AgentId') + '.' + $token
     $statusCode = Invoke-PdvMonitorHttpPost ([string](Get-PdvTransportValue $central 'Endpoint')) $authorization $body
     if($statusCode -eq 400 -and $hardwarePending){
@@ -565,7 +654,7 @@ function Invoke-PdvMonitorUpload {
       # mais recente caso tenha sido gravado enquanto a chamada estava em voo.
       try {
         $currentHardware=Read-PdvHardwarePending $paths.Hardware
-        if ($currentHardware.Fingerprint -ceq $hardwareFingerprint -and $currentHardware.HardwareJson -ceq $hardwareJson) { [IO.File]::Delete($paths.Hardware) }
+        if ($currentHardware.Fingerprint -ceq $hardwareFingerprint -and $currentHardware.HardwareJson -ceq $hardwareJson) { Save-PdvInventoryAcknowledged $central $paths.HardwareAck $hardwareFingerprint; [IO.File]::Delete($paths.Hardware) }
       } catch { $deleteFailed=$true }
     }
     foreach ($path in $selected) { try { [IO.File]::Delete($path) } catch { $deleteFailed = $true } }
@@ -583,4 +672,4 @@ function Invoke-PdvMonitorUpload {
   } finally { $token = $null; $authorization = $null }
 }
 
-Export-ModuleMember -Function Initialize-PdvMonitorCentral, Set-PdvMonitorCentralConfig, Add-PdvMonitorOutboxRecord, Invoke-PdvMonitorUpload, Set-PdvMonitorHardwarePending, Set-PdvMonitorSoftwarePending, Invoke-PdvMonitorSoftwareUpload
+Export-ModuleMember -Function Test-PdvMonitorCentralEvent, Initialize-PdvMonitorCentral, Set-PdvMonitorCentralConfig, Add-PdvMonitorOutboxRecord, Invoke-PdvMonitorUpload, Set-PdvMonitorHardwarePending, Set-PdvMonitorSoftwarePending, Invoke-PdvMonitorSoftwareUpload

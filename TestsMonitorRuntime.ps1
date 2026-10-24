@@ -306,6 +306,13 @@ try {
   Assert-Runtime (-not [IO.File]::Exists((Join-Path $destination 'central-credencial.bin')) -and -not [IO.Directory]::Exists((Join-Path $destination 'outbox')) -and $exported.Count -gt 0) 'Exportação inclui só lista permitida de logs/configurações, sem credencial nem fila'
   foreach ($path in $exported) { Assert-Runtime ([IO.File]::ReadAllText($path) -notmatch 'FAKE-SECRET-MUST-NOT-EXPORT|FAKE-OUTBOX-MUST-NOT-EXPORT') 'Nenhum arquivo exportado contém credencial ou payload da fila' }
 
+  # Trinta dias se aplica apenas aos CSVs: pendência e identidade não expiram.
+  $checkpoint=Join-Path $session.DataDirectory 'hardware-confirmado.xml'; [IO.File]::WriteAllText($checkpoint,'checkpoint-preservado');
+  [IO.File]::SetLastWriteTimeUtc($checkpoint,[DateTime]::UtcNow.AddDays(-60));
+  $pending=Join-Path $session.DataDirectory 'outbox/pending.xml';[IO.File]::SetLastWriteTimeUtc($pending,[DateTime]::UtcNow.AddDays(-60));
+  & $module {param($Session);Remove-PdvMonitorOldLogs $Session;} $session;
+  Assert-Runtime ([IO.File]::Exists($checkpoint) -and [IO.File]::Exists($pending) -and [IO.File]::Exists((Join-Path $session.DataDirectory 'central-credencial.bin'))) 'Rotação de trinta dias não remove checkpoint, fila crítica ou credencial, mesmo com sessenta dias';
+
   # O contrato é aplicado à cópia do log, sem mudar a evidência usada na política.
   $session=New-TestSession
   $device=New-Object PSObject -Property @{InstanceId=('USB\' + ('X' * 1100)); Name=('á' * 300); Port='COM4'; Present=$true; PresenceKnown=$false; Status=('Erro de driver ' + ('ç' * 140)); ProblemCode='CM_PROB_NONE'}
@@ -408,7 +415,7 @@ try {
   Assert-Runtime ((@(Get-TestRecords | Where-Object {$_.Kind -in @('WindowsError','WindowsCritical','WindowsEvent','WindowsEventCoverage')}).Count -eq 0)) 'Eventos genéricos e cobertura Windows não são consultados ou publicados';
   & $module {$script:TestNow=$script:TestNow.AddMinutes(10)};Invoke-PdvMonitorTick $session;
   Assert-Runtime ((@(Get-TestRecords | Where-Object {$_.Kind -in @('WindowsError','WindowsCritical','WindowsEvent','WindowsEventCoverage')}).Count -eq 0) -and $session.LoggingHealthy) 'Mesmo após dez minutos o monitor segue saudável sem consultar eventos genéricos';
-  # Coleta patrimonial a cada seis horas, envio somente inicial/mudança/24h.
+  # Coleta patrimonial a cada seis horas, envio somente inicial e mudança, sem renovação periódica.
   $session=New-TestSession;
   $hardware=@{schemaVersion=1;collectedAt='2026-10-19T12:00:00-03:00';machineId='uuid-teste';hostname='CX4901';manufacturer='Marca';model='Caixa';serialNumber='SN1';os=@{caption='Windows';version='10';build='19045';architecture='64-bit';lastBootAt=''};cpu=@{name='CPU';cores='4';logicalProcessors='8'};memory=@{totalBytes='8589934592';modules=@()};disks=@();systemVolume=@{name='C:';totalBytes='1000';freeBytes='500'};networkAdapters=@();warnings=@()};
   & $module {param($Hardware);$script:TestHardwareResult=New-Object PSObject -Property @{Success=$true;Hardware=$Hardware;CoverageHealthy=$true}} $hardware;
@@ -417,9 +424,9 @@ try {
   & $module {$script:TestNow=$script:TestNow.AddHours(6);$script:TestHardwareResult.Hardware.systemVolume.freeBytes='1'};Invoke-PdvMonitorTick $session;
   Assert-Runtime ((Get-TestMetric 'TestHardwareCalls') -eq 2 -and (Get-TestMetric 'TestHardwareQueued') -eq 1 -and (@(Get-TestRecords | Where-Object Kind -eq 'HardwareChanged').Count -eq 0)) 'Variação de espaço livre não renova inventário nem gera mudança de hardware';
   & $module {$script:TestNow=$script:TestNow.AddHours(18)};Invoke-PdvMonitorTick $session;
-  Assert-Runtime ((Get-TestMetric 'TestHardwareQueued') -eq 2 -and (@(Get-TestRecords | Where-Object Kind -eq 'HardwareChanged').Count -eq 0)) 'Renovação de 24h envia somente documento de inventário';
+  Assert-Runtime ((Get-TestMetric 'TestHardwareQueued') -eq 1 -and (@(Get-TestRecords | Where-Object Kind -eq 'HardwareChanged').Count -eq 0)) 'Passagem de 24h sem alteração não envia inventário';
   & $module {$script:TestNow=$script:TestNow.AddHours(6);$script:TestHardwareResult.Hardware.memory.totalBytes='17179869184'};Invoke-PdvMonitorTick $session;
-  Assert-Runtime ((Get-TestMetric 'TestHardwareQueued') -eq 3 -and (@(Get-TestRecords | Where-Object Kind -eq 'HardwareChanged').Count -eq 1)) 'Alteração de RAM envia inventário e um resumo de mudança';
+  Assert-Runtime ((Get-TestMetric 'TestHardwareQueued') -eq 2 -and (@(Get-TestRecords | Where-Object Kind -eq 'HardwareChanged').Count -eq 1)) 'Alteração de RAM envia inventário e um resumo de mudança';
   $before=[IO.File]::ReadAllText((Join-Path $session.DataDirectory 'inventario-hardware.json'));
   & $module {$script:TestNow=$script:TestNow.AddHours(6);$script:TestHardwareResult.CoverageHealthy=$false;$script:TestHardwareResult.Hardware.model=''};Invoke-PdvMonitorTick $session;
   Assert-Runtime ([IO.File]::ReadAllText((Join-Path $session.DataDirectory 'inventario-hardware.json')) -ceq $before) 'Falha parcial não sobrescreve inventário válido nem apaga hardware conhecido';

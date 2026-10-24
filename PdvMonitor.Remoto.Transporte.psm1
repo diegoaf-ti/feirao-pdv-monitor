@@ -145,6 +145,21 @@ function Invoke-PdvMonitorRemoteExchange {
 
 function Get-PdvRemoteControllerNow { return [DateTimeOffset]::UtcNow; }
 
+function Get-PdvRemoteIdleJitterSeconds {
+  param([string]$AgentId,[int]$Maximum=60);
+  if($Maximum -le 0){return 0;}
+  $hash=[Security.Cryptography.SHA256]::Create();
+  try{$bytes=$hash.ComputeHash([Text.Encoding]::UTF8.GetBytes('remote-idle|'+$AgentId.ToLowerInvariant()));return [int]([BitConverter]::ToUInt32($bytes,0) % ([long]$Maximum+1));}
+  finally{$hash.Clear();}
+}
+
+function Get-PdvRemoteIdleRetrySeconds {
+  param($Controller,[int]$FailureCount);
+  $base=60;for($index=1;$index -lt [Math]::Min(4,$FailureCount);$index++){$base=[Math]::Min(285,$base*2);}
+  # Backoff apenas ocioso. Uma sessao recebida mantem consultas a cada 3 s.
+  return [Math]::Min(300,$base+(Get-PdvRemoteIdleJitterSeconds ([string]$Controller.Broker.AgentId) 15));
+}
+
 function Get-PdvRemoteControllerField {
   param($Object,[string]$Name,$Default=$null);
   if($null -eq $Object){return ,$Default;}
@@ -254,7 +269,7 @@ function Get-PdvRemotePreparationReason {
 
 function New-PdvMonitorRemoteController {
   param($Session,[string]$ProgramDirectory);
-  $controller=@{Enabled=$false;Reason='RemoteExtensionNotInstalled';Broker=$null;Windows=$null;WindowsModule=$null;NextPollAt=[DateTimeOffset]::MinValue;Lease=$null;LeaseVerifiedAt=$null;CentralExpiresAt='';PromptBusy=$false;Paused=$false;Busy=$false;Stopping=$false;};
+  $controller=@{Enabled=$false;Reason='RemoteExtensionNotInstalled';Broker=$null;Windows=$null;WindowsModule=$null;NextPollAt=[DateTimeOffset]::MinValue;Lease=$null;LeaseVerifiedAt=$null;CentralExpiresAt='';PromptBusy=$false;Paused=$false;Busy=$false;Stopping=$false;IdleFailures=0;};
   try{
     $path=Get-PdvRemoteAdministrativeModulePath;
     if(-not [IO.File]::Exists($path)){return $controller;}
@@ -276,6 +291,7 @@ function New-PdvMonitorRemoteController {
     $controller.Broker=New-PdvMonitorRemoteContext -DataDirectory $Session.DataDirectory -AgentId ([string]$central.AgentId) -Enabled $true;
     $controller.Reason='RemotePilotConfigured';
     $controller.Busy=Test-PdvRemoteControllerBusy $controller;
+    if(-not $controller.Busy -and @('idle','closed','denied') -ccontains $controller.Broker.Stage){$controller.NextPollAt=(Get-PdvRemoteControllerNow).AddSeconds((Get-PdvRemoteIdleJitterSeconds ([string]$central.AgentId)));}
     return $controller;
   }catch{$controller.Reason=Get-PdvRemotePreparationReason $_.Exception;$controller.Enabled=$false;return $controller;}
 }
@@ -395,8 +411,9 @@ function Complete-PdvMonitorRemoteWork {
   try{
     if($Result -isnot [Collections.IDictionary] -or -not [bool]$Result.Success){throw 'RemoteExchangeFailed';}
     if($Work.Operation -ceq 'Request'){
-      $Controller.NextPollAt=(Get-PdvRemoteControllerNow).AddSeconds(15);
-      if($Result.Status -eq 200){[void](Receive-PdvMonitorRemoteRequest $Controller.Broker $Result.Value);}
+      # Pedido expira em 120 s: idle 60 s deixa tempo para o operador, sem ampliar TTL.
+      $Controller.NextPollAt=(Get-PdvRemoteControllerNow).AddSeconds(60);
+      if($Result.Status -eq 200){[void](Receive-PdvMonitorRemoteRequest $Controller.Broker $Result.Value);$Controller.NextPollAt=(Get-PdvRemoteControllerNow).AddSeconds(3);}
     }elseif($Work.Operation -ceq 'Consent'){
       [void](Complete-PdvMonitorRemoteConsent $Controller.Broker $Result.Value);if($Result.Value.Status -ceq 'approved'){$Controller.CentralExpiresAt=[string]$Result.Value.ExpiresAt;};$Controller.NextPollAt=[DateTimeOffset]::MinValue;
     }elseif($Work.Operation -ceq 'Closed'){
@@ -432,9 +449,14 @@ function Complete-PdvMonitorRemoteWork {
       }
       $Controller.Lease=$lease;$Controller.LeaseVerifiedAt=Get-PdvRemoteControllerNow;
     }else{throw 'RemoteOperationInvalid';}
+    $Controller.IdleFailures=0;
     $Controller.Reason=[string]$Controller.Broker.LastReason;
   }catch{
     $Controller.Reason='RemoteExchangeBlocked';$Controller.NextPollAt=(Get-PdvRemoteControllerNow).AddSeconds(15);
+    if($Work.Operation -ceq 'Request' -and @('idle','closed','denied') -ccontains $Controller.Broker.Stage){
+      $Controller.IdleFailures=[Math]::Min(4,1+[int](Get-PdvRemoteControllerField $Controller 'IdleFailures' 0));
+      $Controller.NextPollAt=(Get-PdvRemoteControllerNow).AddSeconds((Get-PdvRemoteIdleRetrySeconds $Controller $Controller.IdleFailures));
+    }
     if(@('idle','closed','denied','interrupted','close_required') -cnotcontains $Controller.Broker.Stage){Request-PdvRemoteControllerClose $Controller 'TransportFailed';}
   }finally{
     # Evitar nonce retido no objeto compartilhado com o runspace terminado.

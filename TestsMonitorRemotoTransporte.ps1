@@ -59,6 +59,27 @@ function Start-RemoteHttpAuthorized($Session,$Controller) {
   Add-RemoteHttpReply (New-RemoteHttpSessionXml);[void](Invoke-RemoteHttpWork $Controller $Session);
 }
 try{
+  Test-RemoteHttp 'idle consulta a cada 60 s e pedido recebido volta ao ciclo ativo de 3 s' {
+    $session=New-RemoteHttpCase;$controller=New-RemoteHttpController $session;Add-RemoteHttpReply '' 204;[void](Invoke-RemoteHttpWork $controller $session);
+    $now=& $module {Get-PdvRemoteControllerNow;};Assert-RemoteHttp (($controller.NextPollAt-$now).TotalSeconds -eq 60) 'Idle nao aguardou 60 s.';
+    & $module {$script:ControllerNow=$script:ControllerNow.AddSeconds(59);};Assert-RemoteHttp ($null -eq (Get-PdvMonitorRemoteWork $controller)) 'Idle consultou antes de 60 s.';
+    & $module {$script:ControllerNow=$script:ControllerNow.AddSeconds(1);};$work=Get-PdvMonitorRemoteWork $controller;Assert-RemoteHttp ($work.Operation -ceq 'Request') 'Consulta nao foi liberada aos 60 s.';
+    Add-RemoteHttpReply (New-RemoteHttpRequestXml);$reply=Invoke-PdvMonitorRemoteExchange $session $work.Operation $work.Payload;Complete-PdvMonitorRemoteWork $controller $work $reply;
+    $now=& $module {Get-PdvRemoteControllerNow;};Assert-RemoteHttp ($controller.Broker.Stage -ceq 'requested' -and ($controller.NextPollAt-$now).TotalSeconds -eq 3) 'Pedido recebido manteve idle ou foi recusado antes do TTL 120 s.';
+    Assert-RemoteHttp (($controller.Broker.Active.Request.ExpiresAt-$controller.Broker.Active.Request.RequestedAt).TotalSeconds -eq 120) 'Intervalo ampliou TTL de consentimento.';
+    $controller.Enabled=$false;$controller.NextPollAt=[DateTimeOffset]::MinValue;Assert-RemoteHttp ($null -eq (Get-PdvMonitorRemoteWork $controller)) 'Remoto desativado consultou.';
+  }
+  Test-RemoteHttp 'falha idle aplica backoff limitado e resposta valida restaura 60 s' {
+    $session=New-RemoteHttpCase;$controller=New-RemoteHttpController $session;$delays=@();
+    for($i=0;$i -lt 6;$i++){
+      Add-RemoteHttpReply '' 503;[void](Invoke-RemoteHttpWork $controller $session);$now=& $module {Get-PdvRemoteControllerNow;};$delay=($controller.NextPollAt-$now).TotalSeconds;$delays+=,$delay;
+      Assert-RemoteHttp ($delay -ge 60 -and $delay -le 300 -and $controller.Broker.Stage -ceq 'idle') 'Falha idle violou limite ou abriu sessao.';
+    }
+    Assert-RemoteHttp ($delays[1] -gt $delays[0] -and $delays[2] -gt $delays[1] -and $delays[5] -eq $delays[4]) 'Backoff nao cresce ou nao estabiliza.';
+    Add-RemoteHttpReply '' 204;[void](Invoke-RemoteHttpWork $controller $session);$now=& $module {Get-PdvRemoteControllerNow;};Assert-RemoteHttp ($controller.IdleFailures -eq 0 -and ($controller.NextPollAt-$now).TotalSeconds -eq 60) 'Resposta valida nao reiniciou backoff.';
+    $offsets=@();for($i=0;$i -lt 20;$i++){$id='00000000-0000-4000-8000-'+$i.ToString('000000000000');$pair=@(& $module {param($agentId);Get-PdvRemoteIdleJitterSeconds $agentId;Get-PdvRemoteIdleJitterSeconds $agentId;} $id);Assert-RemoteHttp ($pair[0] -eq $pair[1] -and $pair[0] -ge 0 -and $pair[0] -le 60) 'Dispersao inicial instavel/fora de 60 s.';$offsets+=,$pair[0];}
+    Assert-RemoteHttp (@($offsets | Select-Object -Unique).Count -gt 1) 'Dispersao nao distribui instalacoes.';
+  }
   Test-RemoteHttp 'HTTPS autenticado reutiliza identidade e token; XML produz tipos fechados' {
     $session=New-RemoteHttpCase;Add-RemoteHttpReply (New-RemoteHttpRequestXml);$result=Invoke-PdvMonitorRemoteExchange $session 'Request';
     Assert-RemoteHttp ($result.Success -and $result.Value.SessionMaxSeconds -is [int] -and $result.Value.SessionMaxSeconds -eq 900) 'Contrato request nao tipado.';

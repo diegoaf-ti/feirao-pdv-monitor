@@ -59,14 +59,15 @@ function Assert-Automation([bool]$Condition,[string]$Message) { if (-not $Condit
   function script:Invoke-PdvMonitorRestart { throw 'Reinício real proibido no teste'; }
 };
 & $nerus {
-  $script:TestNow=[DateTimeOffset]::Parse('2026-10-19T12:00:00-03:00'); $script:PolicyEnabled=$true; $script:PolicyFailure=$false; $script:PolicyRequests=0;
+  $script:TestNow=[DateTimeOffset]::Parse('2026-10-19T12:00:00-03:00'); $script:PolicyEnabled=$true; $script:PolicyFailure=$false; $script:PolicyRequests=0; $script:PolicyWindowOpen=$false;
   function script:Get-PdvNerusNow { return $script:TestNow; }
   function script:Invoke-PdvNerusHttp {
     param($Session,$Path,$Method='GET',$Body='');
     if ($Path -cne '/agent/policy') { throw 'Escrita/API inesperada no teste'; }
     $script:PolicyRequests++; if ($script:PolicyFailure) { throw 'NerusTransportUnavailable'; }
     $enabled='false'; if ($script:PolicyEnabled) { $enabled='true'; }
-    return ('<PdvMonitorPolicy schemaVersion="1"><Enabled>false</Enabled><AutoUpdateEnabled>'+$enabled+'</AutoUpdateEnabled><WindowOpen>false</WindowOpen><Revision></Revision><InstanceId></InstanceId><HardwareId></HardwareId><ServerTime>'+$script:TestNow.ToString('o')+'</ServerTime><BlockingProcessNames></BlockingProcessNames><PortMappings></PortMappings></PdvMonitorPolicy>');
+    $window='false';if($script:PolicyWindowOpen){$window='true';}
+    return ('<PdvMonitorPolicy schemaVersion="1"><Enabled>false</Enabled><AutoUpdateEnabled>'+$enabled+'</AutoUpdateEnabled><WindowOpen>'+$window+'</WindowOpen><Revision></Revision><InstanceId></InstanceId><HardwareId></HardwareId><ServerTime>'+$script:TestNow.ToString('o')+'</ServerTime><BlockingProcessNames></BlockingProcessNames><PortMappings></PortMappings></PdvMonitorPolicy>');
   }
   function script:Get-PdvNerusProcesses { throw 'Processos reais proibidos'; }
   function script:Get-PdvNerusJobs { throw 'Spooler real proibido'; }
@@ -75,12 +76,17 @@ function Assert-Automation([bool]$Condition,[string]$Message) { if (-not $Condit
 function Set-TestTime([DateTimeOffset]$Now) { & $runtime { param($n); $script:TestNow=$n; } $Now; & $nerus { param($n); $script:TestNow=$n; } $Now; }
 function Reset-TestMetrics {
   & $runtime { $script:Records.Clear();$script:UpdateChecks.Clear();$script:HealthCalls.Clear();$script:QueueFailure=$false;$script:LogFailureKind='';$script:UpdateSucceeds=$true;$script:StageUpdate=$false;$script:InventoryComplete=$true; };
-  & $nerus { $script:PolicyEnabled=$true;$script:PolicyFailure=$false;$script:PolicyRequests=0; };
+  & $nerus { $script:PolicyEnabled=$true;$script:PolicyFailure=$false;$script:PolicyRequests=0;$script:PolicyWindowOpen=$false; };
   Set-TestTime ([DateTimeOffset]::Parse('2026-10-19T12:00:00-03:00'));
 }
-function New-AutomationSession([string]$Name) {
+function New-AutomationSession([string]$Name,[bool]$PolicyDue=$true) {
   $data=Join-Path $testRoot $Name;
-  return (Start-PdvMonitorSession -DataDirectory $data -ProgramDirectory (Join-Path $data 'programa'));
+  $session=Start-PdvMonitorSession -DataDirectory $data -ProgramDirectory (Join-Path $data 'programa');
+  # Criar o estado real agenda a dispersao sem consultar a API. Os cenarios
+  # seguintes avancam apenas o relogio simulado ate a consulta estar devida.
+  $session.NerusAutomation=& $nerus {param($s);New-PdvNerusState $s;} $session;
+  if($PolicyDue){Set-TestTime $session.NerusAutomation.NextPolicyAt;}
+  return $session;
 }
 function Get-AutomationRecords([string]$Kind) {
   # Preserva explicitamente o array na saída da função: em 5.1/StrictMode um
@@ -106,9 +112,16 @@ try {
   & $runtime { [void]$script:Records.Add((New-Object PSObject -Property @{Kind='ArrayContract';})); };
   $many=Get-AutomationRecords 'ArrayContract';
   Assert-Automation ($many -is [object[]] -and $many.Count -eq 2) 'Helper mantém array para múltiplos registros';
-  Reset-TestMetrics; $s=New-AutomationSession 'policy-six-hours';
+  Reset-TestMetrics; $s=New-AutomationSession 'policy-six-hours' $false;
   Assert-Automation (-not $s.AutoUpdateEnabled) 'Início não presume opt-in local';
+  $initial=& $nerus {Get-PdvNerusNow;};$due=$s.NerusAutomation.NextPolicyAt;
+  Assert-Automation ($due -gt $initial -and $due -le $initial.AddSeconds(60)) 'Fixture usa dispersao inicial real dentro de sessenta segundos';
   Invoke-PdvMonitorTick $s;
+  Assert-Automation ((& $nerus {$script:PolicyRequests;}) -eq 0 -and -not $s.AutoUpdateEnabled) 'Inicio aguarda agenda sem fazer GET ou habilitar atualizacao';
+  Set-TestTime $due.AddTicks(-1);Invoke-PdvMonitorTick $s;
+  Assert-Automation ((& $nerus {$script:PolicyRequests;}) -eq 0) 'Um instante antes da agenda ainda nao consulta politica';
+  Set-TestTime $due;Invoke-PdvMonitorTick $s;
+  Assert-Automation ((& $nerus {$script:PolicyRequests;}) -eq 1) 'Primeiro GET ocorre quando a agenda de dispersao vence';
   Assert-Automation ($s.AutoUpdateEnabled -and (& $runtime {$script:UpdateChecks.Count;}) -eq 1) 'Política real parseada habilita consulta de atualização';
   $first=& $runtime {return $script:UpdateChecks[0];};
   Assert-Automation ($first.Enabled -and $first.Version -ceq $s.MonitorVersion -and $first.Program -ceq $s.ProgramDirectory) 'Runtime passa versão e caminho reais ao atualizador';
@@ -119,6 +132,19 @@ try {
   Assert-Automation ((& $runtime {$script:UpdateChecks.Count;}) -eq 2) 'Nova consulta ocorre na janela de seis horas';
   & $nerus { $script:PolicyEnabled=$false; }; Set-TestTime $first.At.AddHours(12); Invoke-PdvMonitorTick $s;
   Assert-Automation (-not $s.AutoUpdateEnabled -and (& $runtime {$script:UpdateChecks.Count;}) -eq 2) 'Revogar opt-in central impede consulta seguinte';
+
+  # Mudancas administrativas passam a valer na proxima consulta agendada.
+  # Enabled continua false: a fixture nao habilita recuperacao ou escrita ERP.
+  Reset-TestMetrics;$s=New-AutomationSession 'policy-window';Invoke-PdvMonitorTick $s;
+  Assert-Automation (-not $s.NerusAutomation.Policy.WindowOpen -and $s.AutoUpdateEnabled) 'Politica inicial distingue janela fechada de permissao de atualizacao';
+  & $nerus {$script:PolicyWindowOpen=$true;};$due=$s.NerusAutomation.NextPolicyAt;
+  Set-TestTime $due.AddTicks(-1);Invoke-PdvMonitorTick $s;
+  Assert-Automation (-not $s.NerusAutomation.Policy.WindowOpen -and (& $nerus {$script:PolicyRequests;}) -eq 1) 'Abrir janela na central nao cria polling antes da agenda';
+  Set-TestTime $due;Invoke-PdvMonitorTick $s;
+  Assert-Automation ($s.NerusAutomation.Policy.WindowOpen -and (& $nerus {$script:PolicyRequests;}) -eq 2) 'Consulta agendada observa abertura da nova janela';
+  & $nerus {$script:PolicyWindowOpen=$false;$script:PolicyEnabled=$false;};$due=$s.NerusAutomation.NextPolicyAt;
+  Set-TestTime $due;Invoke-PdvMonitorTick $s;
+  Assert-Automation (-not $s.NerusAutomation.Policy.WindowOpen -and -not $s.AutoUpdateEnabled -and (& $nerus {$script:PolicyRequests;}) -eq 3) 'Nova consulta observa janela fechada e revogacao do opt-in';
 
   Reset-TestMetrics; $s=New-AutomationSession 'policy-failure'; & $nerus {$script:PolicyFailure=$true;}; Invoke-PdvMonitorTick $s;
   Assert-Automation (-not $s.AutoUpdateEnabled -and (& $runtime {$script:UpdateChecks.Count;}) -eq 0) 'Falha na política não habilita atualização';

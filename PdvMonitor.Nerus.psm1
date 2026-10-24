@@ -17,6 +17,31 @@ function Get-PdvNerusValue {
   return ,$Default;
 }
 function Get-PdvNerusNow { return [DateTimeOffset]::Now; }
+function Get-PdvNerusPolicyJitterSeconds {
+  # Dispersao estavel por instalacao; reiniciar varias lojas nao sincroniza consultas.
+  param($Session,[int]$Maximum=60);
+  if ($Maximum -le 0) { return 0; }
+  $hash=[Security.Cryptography.SHA256]::Create();
+  try {
+    $bytes=$hash.ComputeHash([Text.Encoding]::UTF8.GetBytes('nerus-policy|'+([string]$Session.Config.Central.AgentId).ToLowerInvariant()));
+    return [int]([BitConverter]::ToUInt32($bytes,0) % ([long]$Maximum+1));
+  } finally { $hash.Clear(); }
+}
+function Update-PdvNerusPolicyCache {
+  param($Session,$State,[DateTimeOffset]$Now);
+  $previousRevision=''; if ($null -ne $State.Policy) { $previousRevision=$State.Policy.Revision; }
+  try {
+    $fresh=ConvertFrom-PdvNerusPolicy (Invoke-PdvNerusHttp $Session '/agent/policy');
+    $State.Policy=$fresh;$State.PolicyFetchedAt=$Now;
+    $State.NextPolicyAt=$Now.AddSeconds(900+(Get-PdvNerusPolicyJitterSeconds $Session));
+    $Session.AutoUpdateEnabled=[bool]$fresh.AutoUpdateEnabled;
+    if ($previousRevision -cne $fresh.Revision) { $State.Samples=@(); }
+  } catch {
+    $State.Policy=$null;$State.PolicyFetchedAt=[DateTimeOffset]::MinValue;$State.Samples=@();$Session.AutoUpdateEnabled=$false;
+    $State.NextPolicyAt=$Now.AddSeconds(300+(Get-PdvNerusPolicyJitterSeconds $Session));
+    throw;
+  }
+}
 function Get-PdvNerusProcesses { return @(Get-Process -ErrorAction Stop); }
 function Get-PdvNerusJobs { return @(Get-WmiObject -Class Win32_PrintJob -ErrorAction Stop); }
 function Get-PdvNerusFreshSnapshot { return (Get-PdvMonitorSnapshot); }
@@ -51,7 +76,7 @@ function Save-PdvNerusLedger {
 }
 function New-PdvNerusState {
   param($Session);
-  $state=@{Policy=$null;NextPolicyAt=[DateTimeOffset]::MinValue;Samples=@();NextAttemptAt=[DateTimeOffset]::MinValue;Pending=$null;RetryAt=[DateTimeOffset]::MinValue;Healthy=$true;LastReason='';Events=(New-Object Collections.Queue)};
+  $state=@{Policy=$null;PolicyFetchedAt=[DateTimeOffset]::MinValue;NextPolicyAt=(Get-PdvNerusNow).AddSeconds((Get-PdvNerusPolicyJitterSeconds $Session));Samples=@();NextAttemptAt=[DateTimeOffset]::MinValue;Pending=$null;RetryAt=[DateTimeOffset]::MinValue;Healthy=$true;LastReason='';Events=(New-Object Collections.Queue)};
   $path=Join-Path $Session.DataDirectory 'nerus-automacao.xml';
   if ([IO.File]::Exists($path)) {
     try {
@@ -296,13 +321,8 @@ function Invoke-PdvMonitorNerusAutomation {
   }
   $state=$Session.NerusAutomation; $now=Get-PdvNerusNow;
   try {
-    if ($now -ge $state.NextPolicyAt) {
-      $state.NextPolicyAt=$now.AddSeconds(60);
-      $previousRevision=''; if ($null -ne $state.Policy) { $previousRevision=$state.Policy.Revision; }
-      try { $state.Policy=ConvertFrom-PdvNerusPolicy (Invoke-PdvNerusHttp $Session '/agent/policy'); }
-      catch { $state.Policy=$null; $state.Samples=@(); $Session.AutoUpdateEnabled=$false; $state.NextPolicyAt=$now.AddMinutes(5); throw; }
-      $Session.AutoUpdateEnabled=[bool]$state.Policy.AutoUpdateEnabled;
-      if ($previousRevision -cne $state.Policy.Revision) { $state.Samples=@(); }
+    if ($now -ge $state.NextPolicyAt -or ($null -ne $state.Policy -and $now -lt $state.PolicyFetchedAt)) {
+      Update-PdvNerusPolicyCache $Session $state $now;
     }
     if (-not $state.Healthy) { throw 'NerusLocalStateInvalid'; }
     if ($null -ne $state.Pending) {
@@ -327,6 +347,16 @@ function Invoke-PdvMonitorNerusAutomation {
     if ($null -eq $evidence) {
       Add-PdvNerusNotice $state 'CashierNotConfirmedIdle' 'NerusRecoveryBlocked' 'Correção aguardando equipamento vinculado, identidade da máquina e ausência confirmada de processos PDV/TEF e impressão.';
       return;
+    }
+    # O cache reduz consultas ociosas, mas nunca prolonga autorizacao de escrita.
+    # Revalidar politica e janela antes de criar operacao com cache maior que 30 s.
+    if (($now-$state.PolicyFetchedAt).TotalSeconds -gt 30) {
+      Update-PdvNerusPolicyCache $Session $state $now;
+      if ($null -eq $state.Policy -or -not $state.Policy.Enabled -or -not $state.Policy.WindowOpen -or $state.Samples.Count -ne 3) { return; }
+      $diagnosis=Get-PdvNerusSampleDiagnosis $Session $Snapshot $state.Policy $ObservedAt;
+      if (-not $diagnosis.Eligible) { $state.Samples=@();return; }
+      $evidence=Get-PdvNerusEvidence $Session $state;
+      if ($null -eq $evidence) { return; }
     }
     $requestId=[guid]::NewGuid().ToString();
     $body=ConvertTo-PdvHardwareJson @{requestId=$requestId;policyRevision=$state.Policy.Revision;evidence=$evidence};
@@ -619,7 +649,7 @@ function Get-PdvNerusRestartPolicy {
   if (-not $p.Enabled -or -not $p.WindowOpen) { throw 'NerusRestartWindowClosed'; }
   if (-not $Session.HardwareMachineId -or [string]$Session.HardwareMachineId -cne $p.HardwareId) { throw 'NerusRestartMachineMismatch'; }
   if ((Get-PdvNerusNow) -lt $Session.NerusAutomation.NextAttemptAt) { throw 'NerusRestartRateLimited'; }
-  $Session.NerusAutomation.Policy=$p;$Session.NerusAutomation.NextPolicyAt=(Get-PdvNerusNow).AddSeconds(60);
+  $Session.NerusAutomation.Policy=$p;$Session.NerusAutomation.PolicyFetchedAt=Get-PdvNerusNow;$Session.NerusAutomation.NextPolicyAt=(Get-PdvNerusNow).AddSeconds(900+(Get-PdvNerusPolicyJitterSeconds $Session));
   return $p;
 }
 function Get-PdvNerusConfigurationForRestart {
