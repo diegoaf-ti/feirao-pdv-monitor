@@ -24,13 +24,30 @@ function Assert-PdvBundleAttributes {
   if ($Node.Attributes.Count -ne $Allowed.Count) { throw 'RemoteBundleAttributes'; }
   foreach ($attribute in $Node.Attributes) { if ($Allowed -cnotcontains $attribute.Name) { throw 'RemoteBundleAttributes'; } }
 }
+function Write-PdvBundleSignatureDiagnostic {
+  param([string]$Artifact, $Signature, [string]$InvocationFailure = '');
+  $status='InvocationFailed';$thumbprint='';$message=$InvocationFailure;
+  if($null -ne $Signature){$status=[string]$Signature.Status;$message=[string]$Signature.StatusMessage;if($null -ne $Signature.SignerCertificate){$thumbprint=([string]$Signature.SignerCertificate.Thumbprint).ToUpperInvariant();}}
+  # Somente metadados publicos da assinatura. Uma linha limitada evita comandos
+  # de workflow/caracteres de terminal injetados no diagnostico do runner.
+  $artifactText=[regex]::Replace($Artifact,'[^A-Za-z0-9_.-]','_');if($artifactText.Length -gt 120){$artifactText=$artifactText.Substring(0,120);}
+  $message=[regex]::Replace($message,'[\x00-\x1f\x7f-\x9f]',' ').Replace('::',': :');if($message.Length -gt 2048){$message=$message.Substring(0,2048);}
+  Write-Host ('PDV_BUNDLE_SIGNATURE Artifact='+$artifactText+' Status='+$status+' Thumbprint='+$thumbprint+' StatusMessage='+$message);
+}
+function Assert-PdvBundleAuthenticode {
+  param([string]$Path,[string]$ExpectedThumbprint,[string]$FailureCode);
+  $signature=$null;
+  try{$signature=Get-AuthenticodeSignature -LiteralPath $Path -ErrorAction Stop;}
+  catch{Write-PdvBundleSignatureDiagnostic ([IO.Path]::GetFileName($Path)) $null ([string]$_.Exception.Message);throw $FailureCode;}
+  $thumbprint='';if($null -ne $signature.SignerCertificate){$thumbprint=([string]$signature.SignerCertificate.Thumbprint).ToUpperInvariant();}
+  if($signature.Status -ne [Management.Automation.SignatureStatus]::Valid -or $null -eq $signature.SignerCertificate -or $thumbprint -cne $ExpectedThumbprint){Write-PdvBundleSignatureDiagnostic ([IO.Path]::GetFileName($Path)) $signature;throw $FailureCode;}
+}
 function Assert-PdvRemoteSourceArtifact {
   param([string]$Path);
   if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { throw 'RemoteBundleAuthenticodeRequiresWindows'; }
   $full = Assert-PdvBundleRegularPath $Path;
   if (-not [IO.File]::Exists($full) -or ([IO.FileInfo]$full).Length -ne 4011024 -or (Get-PdvBundleSha256 ([IO.File]::ReadAllBytes($full))) -cne '722c1ad626919af2b0034666b4d19cc4795e925c32f60e8f3c59af4fb3ad2dfc') { throw 'RemoteBundleSourceArtifact'; }
-  $signature = Get-AuthenticodeSignature -LiteralPath $full -ErrorAction Stop;
-  if ($signature.Status -ne [Management.Automation.SignatureStatus]::Valid -or $null -eq $signature.SignerCertificate -or $signature.SignerCertificate.Thumbprint.ToUpperInvariant() -cne '52080A81F4A29130C44554D0264CC1E2786DEE85') { throw 'RemoteBundleSourceSignature'; }
+  Assert-PdvBundleAuthenticode $full '52080A81F4A29130C44554D0264CC1E2786DEE85' 'RemoteBundleSourceSignature';
 }
 function Assert-PdvRemoteBundle {
   param([string]$BundleDirectory, [string]$TrustedManifestPath, [string]$ProfileId, [switch]$AllowRuntimeConfiguration);
@@ -96,8 +113,7 @@ function Assert-PdvRemoteBundle {
       $offset = [BitConverter]::ToUInt32($bytes, 60);
       if ($offset -gt ($bytes.Length - 26) -or [BitConverter]::ToUInt32($bytes, $offset) -ne 17744 -or [BitConverter]::ToUInt16($bytes, ($offset + 4)) -ne [int]$machine) { throw 'RemoteBundlePeMachine'; }
       if ($policy -ceq 'authenticode') {
-        $signature = Get-AuthenticodeSignature -LiteralPath $path -ErrorAction Stop;
-        if ($signature.Status -ne [Management.Automation.SignatureStatus]::Valid -or $null -eq $signature.SignerCertificate -or $signature.SignerCertificate.Thumbprint.ToUpperInvariant() -cne $node.GetAttribute('publisherThumbprint')) { throw ('RemoteBundleSignature:' + $name); }
+        Assert-PdvBundleAuthenticode $path $node.GetAttribute('publisherThumbprint') ('RemoteBundleSignature:' + $name);
       }
     }
     $names[$name] = $node; $entries += ,@{ RelativePath = $name; Path = $path; Sha256 = $node.GetAttribute('sha256'); SizeBytes = $size; AuthPolicy = $policy; PublisherThumbprint = $node.GetAttribute('publisherThumbprint') };

@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -20,6 +21,50 @@ from remote_bundle import parse_manifest, regular, validated_content
 HERE = Path(__file__).resolve().parent
 STUNNEL_MEMBERS = ('bin/stunnel.exe', 'bin/libcrypto-3-x64.dll', 'bin/libssl-3-x64.dll', 'bin/libssp-0.dll')
 ULTRA_MEMBERS = ('x64/winvnc.exe', 'x64/ddengine64.dll', 'x64/vnchooks.dll')
+
+
+def command_diagnostic(error, phase, private_paths=()):
+    """Mostra a falha dos verificadores, sem comando, ambiente ou traceback.
+
+    Entradas desses subprocessos são somente distribuições públicas pinadas.
+    Limitar/normalizar stdout e stderr impede controles de terminal/workflow e
+    remove caminhos locais antes de incluir a resposta no log público do CI.
+    """
+    chunks = []
+    for label, value in [('stdout', error.stdout), ('stderr', error.stderr)]:
+        if not value:
+            continue
+        text = value.decode('utf-8', errors='replace') if isinstance(value, bytes) else str(value)
+        text = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', text)
+        for target in sorted((str(p) for p in private_paths if p), key=len, reverse=True):
+            text = text.replace(target, '[local]')
+        lines = []
+        for line in text.splitlines():
+            line = re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', line).replace('::', ': :').strip()
+            if line:
+                lines.append(line[:2048])
+        sanitized = '\n'.join(lines)
+        if len(sanitized) > 6144:
+            sanitized = sanitized[:3072] + '\n[saída limitada]\n' + sanitized[-3072:]
+        if sanitized:
+            chunks.append(label + ':\n' + sanitized)
+    reason = ('prazo excedido' if isinstance(error, subprocess.TimeoutExpired)
+              else 'código de saída ' + str(error.returncode))
+    return phase + ' falhou (' + reason + ').' + ('\n' + '\n'.join(chunks) if chunks else ' O verificador não retornou diagnóstico.')
+
+
+def run_checked(command, phase, timeout, private_paths=()):
+    try:
+        return subprocess.run(command, check=True, capture_output=True, timeout=timeout)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        raise ValueError(command_diagnostic(error, phase, private_paths)) from None
+
+
+def validate_checked(directory, phase, private_paths=()):
+    try:
+        return validated_content(directory, HERE / 'remoto-bundle-lock.xml', HERE / 'ValidarBundleRemoto.ps1')
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        raise ValueError(command_diagnostic(error, phase, private_paths)) from None
 
 
 def download(artifact, folder):
@@ -49,9 +94,10 @@ def prepare(output, sevenzip):
         work = Path(work)
         sources = {a['name']: download(a, work) for a in audit['artifacts']}
         container = sources['stunnel-5.82-win64-installer.exe']
-        subprocess.run(['powershell.exe', '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', str(HERE / 'ValidarBundleRemoto.ps1'), '-SourceArtifactPath', str(container)], check=True, capture_output=True, timeout=120)
+        private_paths = (work, HERE, output)
+        run_checked(['powershell.exe', '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', str(HERE / 'ValidarBundleRemoto.ps1'), '-SourceArtifactPath', str(container)], 'Assinatura do instalador oficial stunnel', 120, private_paths)
         extracted = work / 'stunnel'
-        subprocess.run([sevenzip, 'x', '-y', '-o' + str(extracted), str(container), *STUNNEL_MEMBERS], check=True, capture_output=True, timeout=60)
+        run_checked([sevenzip, 'x', '-y', '-o' + str(extracted), str(container), *STUNNEL_MEMBERS], 'Extração da distribuição oficial stunnel', 60, private_paths)
         staged = work / 'bundle'
         staged.mkdir()
         with zipfile.ZipFile(sources['UltraVNC_1830.zip']) as archive:
@@ -78,12 +124,12 @@ def prepare(output, sevenzip):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(regular(HERE / 'remote-licenses' / Path(name).name, HERE / 'remote-licenses', 1024 * 1024))
         (staged / 'remoto-bundle.xml').write_bytes(manifest)
-        validated_content(staged, HERE / 'remoto-bundle-lock.xml', HERE / 'ValidarBundleRemoto.ps1')
+        validate_checked(staged, 'Assinaturas do bundle preparado', private_paths)
         output.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(staged, output)
         # Conferir a cópia que será efetivamente usada pelo empacotador.
         try:
-            validated_content(output, HERE / 'remoto-bundle-lock.xml', HERE / 'ValidarBundleRemoto.ps1')
+            validate_checked(output, 'Assinaturas da cópia final do bundle', private_paths)
         except BaseException:
             shutil.rmtree(output)
             raise
@@ -95,4 +141,7 @@ if __name__ == '__main__':
     parser.add_argument('--output', required=True, type=Path)
     parser.add_argument('--sevenzip', default=shutil.which('7z') or r'C:\Program Files\7-Zip\7z.exe')
     args = parser.parse_args()
-    print(prepare(args.output, args.sevenzip))
+    try:
+        print(prepare(args.output, args.sevenzip))
+    except ValueError as error:
+        parser.exit(1, str(error) + '\n')
