@@ -35,3 +35,9 @@ No Conecta, validade ou certificado instalado não significam sessão aberta. Re
 Aplicar `database/ddl/create_pdv_monitor_remote_identity.sql` na base correta antes de atualizar a API. Publicar o gateway e a API compatíveis, preservando emissor, journals, chaves e configuração existentes. Nenhuma porta pública adicional é necessária: renovação passa pelo HTTPS443 e o controle API/gateway continua mTLS interno. O acesso remoto de dispositivo continua na porta5443 já autorizada no HML.
 
 O feed de atualização automática da frota permanece inalterado. A primeira instalação com remoto é manual e acompanhada. Nenhuma máquina ou política é ativada só por gerar/publicar o pacote.
+
+## Troca da identificação central com fila pendente
+
+Se o cadastro informar `PendingIdentityChange`, confirme primeiro a loja, o caixa e a instalação corretos. A troca continua bloqueada por padrão. Ao confirmar expressamente o arquivamento, o monitor move a fila anterior e seus inventários/checkpoints para `identidades-anteriores/<GUID>/`, preservando os bytes, EventIds, configuração e credencial DPAPI do usuário. Esses registros não são enviados como se pertencessem ao novo agente, não recebem confirmação fictícia e não entram na rotação de logs de trinta dias. O retorno `ArquivoPreservado` informa o caminho local para consulta pela manutenção; a exportação comum de diagnóstico não inclui essa credencial.
+
+A troca grava snapshots e um journal durável antes de mover arquivos. Se houver interrupção, a inicialização finaliza a troca somente quando configuração e credencial novas correspondem à intenção gravada; caso contrário, restaura o estado anterior. Colisão com conteúdo diferente mantém os arquivos e bloqueia o envio para análise do suporte. Não apague `identity-switch.xml` ou a pasta de histórico para contornar esse bloqueio. O inventário da identidade nova recebe sua própria confirmação.
