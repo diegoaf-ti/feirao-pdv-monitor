@@ -47,7 +47,7 @@ try{
   $queued=& $module {$script:Queued};$s=Start-PdvMonitorSession -DataDirectory $s.DataDirectory;
   Assert-InventoryRuntime ($s.SoftwareFingerprint -ceq ('e'*64) -and $s.SoftwareThreatSignatures.ContainsKey('123') -and $null -ne $s.SoftwareLastQueuedAt) 'Reabertura restaura resumo e assinaturas sem reler hardware ou proteção';
   Invoke-InventorySoftware $s;
-  Assert-InventoryRuntime ((& $module {$script:Queued}) -eq $queued -and (Count-InventoryRecords 'SecurityThreatStatusChanged') -eq 1) 'Reabertura não duplica inventário ou alerta do mesmo estado';
+  Assert-InventoryRuntime ((& $module {$script:Queued}) -eq ($queued+1) -and (Count-InventoryRecords 'SecurityThreatStatusChanged') -eq 1) 'Reabertura consulta checkpoint do transporte uma vez e não duplica alerta do mesmo estado';
   $s.Config.Central.Enabled=$true;& $module {$script:QueueOk=$false};Set-InventorySoftware $software ('f'*64);Invoke-InventorySoftware $s;Invoke-InventorySoftware $s;
   $warnings=& $module {@($script:Records|Where-Object{$_.Reason -ceq 'SoftwareQueueFailed'}).Count};
   Assert-InventoryRuntime ($warnings -eq 1 -and $null -eq $s.SoftwareLastQueuedAt -and [IO.File]::Exists($full)) 'Falha da fila preserva inventário e alerta uma vez, com nova tentativa';

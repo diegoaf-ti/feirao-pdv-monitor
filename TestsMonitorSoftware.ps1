@@ -73,6 +73,8 @@ try {
     Reset-Software;& $module {$script:SoftwareEntries+=@(@{SubKeyName='other';DisplayName='Outro';DisplayVersion='2';Publisher='Empresa';InstallDate=''});$script:SoftwareDefender.Threats=@(@{ThreatID=1;ThreatName='Teste';SeverityID=1;IsActive=$false});};$a=Get-SoftwareDocument;
     & $module {$script:SoftwareNow=$script:SoftwareNow.AddHours(1);[Array]::Reverse($script:SoftwareEntries);};$b=Get-SoftwareDocument;
     Assert-Software ($a.Software.snapshotId -cne $b.Software.snapshotId -and $a.Fingerprint -ceq $b.Fingerprint) 'Hash muda com ruido';
+    $b.Software.security.threats[0].lastSeenAt='2026-10-23T12:00:00Z';
+    Assert-Software ((Get-PdvSoftwareFingerprint $b.Software) -ceq $b.Fingerprint) 'Horario de ultima observacao sozinho nao deve reenviar inventario';
     & $module {$script:SoftwareDefender.Threats[0].IsActive=$true;};$c=Get-SoftwareDocument;Assert-Software ($b.Fingerprint -cne $c.Fingerprint) 'Hash perdeu status ativo';
   };
   Test-Software 'limite 500 apps explicito e documento UTF8 inteiro ate128KiB' {

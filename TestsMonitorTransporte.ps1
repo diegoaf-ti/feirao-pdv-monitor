@@ -10,6 +10,8 @@ $testRoot = Join-Path ([IO.Path]::GetTempPath()) ('pdv-transporte-testes-' + [Gu
 [void][IO.Directory]::CreateDirectory($testRoot)
 
 & $module {
+  $script:TestRealStartupDelay=(Get-Command Get-PdvInventoryStartupDelay).ScriptBlock
+  function script:Get-PdvInventoryStartupDelay {param($Central,[string]$Kind);return 0}
   $script:TestToken = 'a' * 64
   $script:TestNow = [DateTimeOffset]::Parse('2026-10-15T12:00:00-03:00')
   $script:TestStatus = 204
@@ -68,7 +70,7 @@ function New-TestRecord {
   $record.SessionId = $Session.Id
   $record.Timestamp = '2026-10-15T12:00:00-03:00'
   $record.Sequence = [string]$Sequence
-  $record.Kind = 'Snapshot'
+  $record.Kind = 'HardwareFault'
   $record.Role = 'Pinpad'
   $record.InstanceId = 'USB\PINPAD\001'
   $record.DeviceName = 'Pinpad "teste" \ ação'
@@ -257,10 +259,10 @@ try {
   & $module {
     param($Session,$Hardware)
     $script:TestReplaceSession=$Session; $script:TestReplaceHardware=$Hardware;
-    $script:TestAfterPost={ $script:TestReplaceHardware.collectedAt='2026-10-20T12:00:00-03:00'; [void](Set-PdvMonitorHardwarePending $script:TestReplaceSession $script:TestReplaceHardware) };
+    $script:TestAfterPost={ $script:TestReplaceHardware.collectedAt='2026-10-20T12:00:00-03:00'; $script:TestReplaceHardware.memory.totalBytes='17179869184'; [void](Set-PdvMonitorHardwarePending $script:TestReplaceSession $script:TestReplaceHardware) };
   } $session $hardware;
   $result=Invoke-PdvMonitorUpload $session;
-  Assert-Transport ($result.Success -and [IO.File]::Exists((Join-Path $session.DataDirectory 'hardware-pendente.xml'))) 'ACK antigo não remove snapshot renovado durante a chamada, mesmo com o mesmo hash estático';
+  Assert-Transport ($result.Success -and [IO.File]::Exists((Join-Path $session.DataDirectory 'hardware-pendente.xml'))) 'ACK antigo não remove mudança real de RAM criada durante a chamada';
   Reset-TestBackoff $session; $result=Invoke-PdvMonitorUpload $session;
   Assert-Transport ($result.Success -and -not [IO.File]::Exists((Join-Path $session.DataDirectory 'hardware-pendente.xml'))) 'ACK do conteúdo exato conclui a nova pendência';
   $session=New-TestSession;$hardware=New-TestHardware;$hardware.schemaVersion=2;
@@ -278,6 +280,93 @@ try {
   Assert-Transport ($result.Success -and $result.Sent -eq 1 -and [IO.File]::Exists($hardwarePath)) 'Eventos novos continuam durante a espera de integração';
   & $module {$script:TestHardwareUnsupported=$false;$script:TestNow=$script:TestNow.AddMinutes(16)};Reset-TestBackoff $session;$result=Invoke-PdvMonitorUpload $session;
   Assert-Transport ($result.Success -and -not [IO.File]::Exists($hardwarePath)) 'API atualizada confirma hardware na próxima tentativa elegível';
+
+  # Rotina nunca vira telemetria; incidentes e fechamento de incidente continuam.
+  $session=New-TestSession
+  foreach($kind in @('Heartbeat','Started','Stopped','MonitorStopped','WindowsEvent','WindowsCritical','WindowsError','WindowsEventCoverage','PrinterSnapshot','PortReservations','SessionStarted','SessionStopped','Snapshot','MachineInventory','SoftwareInventory','SoftwareInventoryChanged','ServiceDiagnostic','UploadWarning','UploadResumed','RecoveryDecision','NerusRecoveryBlocked')) {
+    $record=New-TestRecord $session; $record.Kind=$kind
+    $result=Add-PdvMonitorOutboxRecord $session $record
+    Assert-Transport ($result.Success -and -not $result.Queued -and $result.Reason -eq 'LocalOnly') ('Rotina fica local: '+$kind)
+  }
+  Assert-Transport ((Get-TestQueueCount $session) -eq 0) 'Rotina não cria XML de envio'
+  $result=Invoke-PdvMonitorUpload $session
+  Assert-Transport ($result.Reason -eq 'OutboxEmpty' -and (& $module {$script:TestPosts.Count}) -eq 0) 'Ausência de alterações não abre conexãoHTTP'
+  foreach($kind in @('DeviceDisconnected','ComPortChanged','ComPortConflict','HardwareFault','DeviceRestored','HardwareChanged','SecurityThreatDetected','SecurityThreatStatusChanged','RecoveryAttempt','RecoveryResult','RecoveryFailed','NerusRecoveryUncertain','NerusServiceRestarted','UpdateRollback')) {
+    $record=New-TestRecord $session; $record.Kind=$kind
+    Assert-Transport (Add-PdvMonitorOutboxRecord $session $record).Queued ('Incidente permanece durável: '+$kind)
+  }
+  $result=Invoke-PdvMonitorUpload $session
+  Assert-Transport ($result.Success -and $result.Sent -eq 14) 'Incidentes são enviados sem aguardar contato periódico'
+
+  # Migração da fila anterior só drena rotina; falha crítica não expira.
+  $session=New-TestSession; $routine=New-TestRecord $session; $routine.Kind='Heartbeat'
+  & $module {param($Session,$Record)
+    $values=@{AgentId=$Session.Config.Central.AgentId;StoreId='49';Terminal='CX4901'}
+    foreach($field in $script:PdvEventFields){$values[$field]=$Record[$field]}
+    Write-PdvTransportAtomicBytes (Join-Path $Session.OutboxPath ($Record.EventId+'.xml')) (New-PdvTransportXmlBytes 'PdvMonitorOutbox' $values)
+  } $session $routine
+  $critical=New-TestRecord $session; $critical.Timestamp='2026-08-01T12:00:00-03:00'
+  [void](Add-PdvMonitorOutboxRecord $session $critical)
+  $result=Invoke-PdvMonitorUpload $session; $posts=& $module {return ,$script:TestPosts.ToArray()}
+  $sent=ConvertFrom-TestJson $posts[0].Json
+  Assert-Transport ($result.Success -and $result.Sent -eq 1 -and $sent.events[0].EventId -ceq $critical.EventId -and (Get-TestQueueCount $session) -eq 0) 'Fila antiga deixa de enviar heartbeat e conserva incidente mesmo com mais de trinta dias'
+
+  # Upgrade local libera quota tomada por rotina antes de surgir novo incidente.
+  $session=New-TestSession
+  & $module {param($Session)
+    foreach($kind in @('Heartbeat','MonitorStopped','WindowsError','WindowsCritical','WindowsEvent','WindowsEventCoverage','PrinterSnapshot','PortReservations','DeviceSnapshot','TipoFuturoDesconhecido')) {
+      $values=@{AgentId=$Session.Config.Central.AgentId;StoreId='49';Terminal='CX4901'}
+      foreach($field in $script:PdvEventFields){$values[$field]=''}
+      $values.EventId=[guid]::NewGuid().ToString();$values.Timestamp='2026-08-01T12:00:00-03:00';$values.SessionId=$Session.Id;$values.Sequence='1';$values.Kind=$kind
+      Write-PdvTransportAtomicBytes (Join-Path $Session.OutboxPath ($values.EventId+'.xml')) (New-PdvTransportXmlBytes 'PdvMonitorOutbox' $values)
+    }
+  } $session
+  $critical=New-TestRecord $session;[void](Add-PdvMonitorOutboxRecord $session $critical)
+  $reopened=New-Object PSObject -Property @{DataDirectory=$session.DataDirectory;Id=[guid]::NewGuid().ToString();Config=@{}}
+  [void](Initialize-PdvMonitorCentral $reopened)
+  Assert-Transport ((Get-TestQueueCount $reopened) -eq 2 -and [IO.File]::Exists((Join-Path $session.OutboxPath ($critical.EventId+'.xml')))) 'Inicialização remove somente rotina conhecida e preserva incidente e tipo desconhecido'
+
+  # ACK persistido: reabrir o programa não renova o inventário sem mudança.
+  $session=New-TestSession; $hardware=New-TestHardware
+  [void](Set-PdvMonitorHardwarePending $session $hardware); [void](Invoke-PdvMonitorUpload $session)
+  $ack=Join-Path $session.DataDirectory 'hardware-confirmado.xml'
+  Assert-Transport ([IO.File]::Exists($ack)) 'Hardware confirmado ganha checkpoint separado da coleta local'
+  $reopened=New-Object PSObject -Property @{DataDirectory=$session.DataDirectory;Id=[guid]::NewGuid().ToString();Config=@{}}
+  [void](Initialize-PdvMonitorCentral $reopened); $hardware.collectedAt='2026-11-20T12:00:00-03:00'
+  $result=Set-PdvMonitorHardwarePending $reopened $hardware
+  Assert-Transport ($result.Reason -eq 'HardwareAlreadyAcknowledged' -and -not [IO.File]::Exists((Join-Path $session.DataDirectory 'hardware-pendente.xml'))) 'Checkpoint após reinício evita reenvio até depois de trinta dias'
+  $oldAck=[IO.File]::ReadAllText($ack); $hardware.memory.totalBytes='17179869184'
+  [void](Set-PdvMonitorHardwarePending $reopened $hardware); $pendingPath=Join-Path $session.DataDirectory 'hardware-pendente.xml'; $pending=[IO.File]::ReadAllText($pendingPath)
+  & $module {$script:TestTimeout=$true}; $result=Invoke-PdvMonitorUpload $reopened
+  Assert-Transport (-not $result.Success -and [IO.File]::ReadAllText($ack) -ceq $oldAck -and [IO.File]::ReadAllText($pendingPath) -ceq $pending) 'Timeout não avança checkpoint e conserva bytes pendentes'
+  $reopened=New-Object PSObject -Property @{DataDirectory=$session.DataDirectory;Id=[guid]::NewGuid().ToString();Config=@{}}
+  [void](Initialize-PdvMonitorCentral $reopened); & $module {$script:TestTimeout=$false}; $result=Invoke-PdvMonitorUpload $reopened
+  Assert-Transport ($result.Success -and -not [IO.File]::Exists($pendingPath) -and [IO.File]::ReadAllText($ack) -cne $oldAck) 'Reinício antes do ACK retoma pendência e só então atualiza checkpoint'
+  $reopened|Add-Member NoteProperty HardwareQueueChecked $true -Force;$reopened|Add-Member NoteProperty SoftwareQueueChecked $true -Force
+  $switched=Set-PdvMonitorCentralConfig $reopened 'https://outro.example/api/pdv-monitor/ingest' '49' 'CX4901' $reopened.Config.Central.AgentId ('a'*64)
+  Assert-Transport (-not $reopened.HardwareQueueChecked -and -not $reopened.SoftwareQueueChecked) 'Trocar configuração invalida verificação de fila do runtime sem apagar checkpoint'
+  $result=Set-PdvMonitorHardwarePending $reopened $hardware
+  Assert-Transport ($switched.Success -and $result.Reason -eq 'HardwareQueued' -and [IO.File]::Exists($pendingPath)) 'Checkpoint de outra origem não suprime primeira entrega para nova central'
+
+
+  # Jitter existe só para o primeiro documento patrimonial, nunca incidente.
+  $session=New-TestSession; $hardware=New-TestHardware
+  $now=& $module {Get-PdvMonitorTransportNow}
+  $session.HardwareInitialUploadAt=$now.AddSeconds(60)
+  [void](Set-PdvMonitorHardwarePending $session $hardware)
+  [void](Add-PdvMonitorOutboxRecord $session (New-TestRecord $session))
+  $result=Invoke-PdvMonitorUpload $session; $posts=& $module {return ,$script:TestPosts.ToArray()}
+  $first=ConvertFrom-TestJson $posts[0].Json
+  Assert-Transport ($result.Success -and $result.Sent -eq 1 -and $posts.Count -eq 1 -and -not $first.PSObject.Properties['hardware'] -and [IO.File]::Exists((Join-Path $session.DataDirectory 'hardware-pendente.xml'))) 'Incidente é enviado imediatamente enquanto baseline aguarda jitter'
+  & $module {$script:TestNow=$script:TestNow.AddSeconds(61)}; Reset-TestBackoff $session; $result=Invoke-PdvMonitorUpload $session
+  Assert-Transport ($result.Success -and $result.Sent -eq 0 -and -not [IO.File]::Exists((Join-Path $session.DataDirectory 'hardware-pendente.xml'))) 'Baseline segue após no máximo sessenta segundos sem evento artificial'
+  $jitter=& $module {
+    $values=@{}
+    for($i=0;$i -lt 61;$i++){$central=@{AgentId=('{0:x4}0000-0000-4000-8000-000000000001' -f $i)};$delay=& $script:TestRealStartupDelay $central 'Hardware';$values[$delay]=$true}
+    $central=@{AgentId='00000000-0000-4000-8000-000000000001'}
+    return @{Count=$values.Count;Hardware=(& $script:TestRealStartupDelay $central 'Hardware');Software=(& $script:TestRealStartupDelay $central 'Software')}
+  }
+  Assert-Transport ($jitter.Count -eq 61 -and $jitter.Hardware -eq 0 -and $jitter.Software -eq 23) 'Jitter estável por instalação cobre zero a sessenta segundos e separa documentos'
 
   # Configuração persiste sem segredo e reabre com mesma identificação.
   $session = New-TestSession

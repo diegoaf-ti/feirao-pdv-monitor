@@ -298,7 +298,9 @@ function ConvertTo-PdvSoftwareThreats {
 }
 function Get-PdvSoftwareFingerprint {
   param([Collections.IDictionary]$Software);
-  $security=@{provider=$Software.security.provider;status=$Software.security.status;threats=(Get-PdvHardwareCanonicalArray @($Software.security.threats))};
+  # Horários de observação não são instalação/remoção nem mudança de ameaça.
+  $threats=@();foreach($threat in @($Software.security.threats)){$copy=@{};foreach($key in $threat.Keys){if($key -ne 'lastSeenAt'){$copy[$key]=$threat[$key];}};$threats+=@($copy);}
+  $security=@{provider=$Software.security.provider;status=$Software.security.status;threats=(Get-PdvHardwareCanonicalArray $threats)};
   $static=@{schemaVersion=$Software.schemaVersion;complete=$Software.complete;coverage=$Software.coverage;apps=(Get-PdvHardwareCanonicalArray @($Software.apps));security=$security};
   return (Get-PdvSoftwareHash (ConvertTo-PdvHardwareJson $static));
 }

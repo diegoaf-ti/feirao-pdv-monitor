@@ -60,6 +60,8 @@ function New-TestReply([string]$Status='configured_pending_restart',[string]$Tic
 
 & $module {
   $script:RealSaveNerusState=(Get-Command Save-PdvNerusState).ScriptBlock;
+  $script:RealPolicyJitter=(Get-Command Get-PdvNerusPolicyJitterSeconds).ScriptBlock;
+  function script:Get-PdvNerusPolicyJitterSeconds {param($Session,[int]$Maximum=60);return $script:TestPolicyJitter;}
   function script:Get-PdvNerusNow { return $script:TestNow; }
   function script:Get-PdvNerusProcesses {
     if ($script:TestProcessFailure) { throw 'Consulta simulada indisponivel'; }
@@ -115,6 +117,7 @@ function Reset-NerusMocks {
     $script:TestCalls=New-Object 'Collections.Generic.List[object]';
     $script:TestPrepareResponses=New-Object Collections.Queue; $script:TestCommitResponses=New-Object Collections.Queue;
     $script:TestProcesses=@();$script:TestJobCount=0;$script:TestProcessFailure=$false;$script:TestJobsFailure=$false;$script:TestSaveFailure=$false;
+    $script:TestPolicyJitter=0;
     $script:TestSaveFailurePhase='';$script:TestPolicyFailure='';$script:TestOpenProcessAfterPrepare=$false;$script:TestQueueJobAfterPrepare=$false;$script:TestWaits=0;$script:TestFreshCalls=0;
   } $policy $snapshot $prepared $configured;
 }
@@ -137,6 +140,49 @@ function Get-NerusCalls([string]$Path='') {
 function Get-NerusEvents($Session) { return @($Session.NerusAutomation.Events.ToArray()); }
 
 try {
+  Test-NerusCase 'cache ocioso consulta politica a cada 15 min e dispersa inicio por instalacao' {
+    Reset-NerusMocks;$s=New-TestNerusSession;$sn=New-TestSnapshot;$s.MaintenanceArmed=$true;
+    & $module {$script:TestPolicyJitter=60;};
+    Invoke-NerusTicks $s $sn 1;
+    Assert-Nerus (@(Get-NerusCalls '/agent/policy').Count -eq 0) 'Inicio ignorou dispersao.';
+    & $module {param($session,$snapshot);$script:TestNow=$session.NerusAutomation.NextPolicyAt;Invoke-PdvMonitorNerusAutomation $session $snapshot $script:TestNow;} $s $sn;
+    Assert-Nerus (@(Get-NerusCalls '/agent/policy').Count -eq 1) 'Primeira consulta nao foi executada.';
+    Assert-Nerus (($s.NerusAutomation.NextPolicyAt-$s.NerusAutomation.PolicyFetchedAt).TotalSeconds -eq 960) 'Cache nao usa15 min mais dispersao.';
+    & $module {param($session,$snapshot);$script:TestNow=$session.NerusAutomation.NextPolicyAt.AddSeconds(-1);Invoke-PdvMonitorNerusAutomation $session $snapshot $script:TestNow;} $s $sn;
+    Assert-Nerus (@(Get-NerusCalls '/agent/policy').Count -eq 1) 'Cache ocioso consultou antes do prazo.';
+    & $module {param($session,$snapshot);$script:TestNow=$session.NerusAutomation.NextPolicyAt;Invoke-PdvMonitorNerusAutomation $session $snapshot $script:TestNow;} $s $sn;
+    Assert-Nerus (@(Get-NerusCalls '/agent/policy').Count -eq 2) 'Consulta periodica nao ocorreu no prazo.';
+    $offsets=@();for($i=0;$i -lt 20;$i++){$sample=New-TestNerusSession;$sample.Config.Central.AgentId=('00000000-0000-4000-8000-'+$i.ToString('000000000000'));$pair=@(& $module {param($session);& $script:RealPolicyJitter $session;& $script:RealPolicyJitter $session;} $sample);Assert-Nerus ($pair[0] -eq $pair[1] -and $pair[0] -ge 0 -and $pair[0] -le 60) 'Dispersao nao foi estavel/limitada.';$offsets+=,$pair[0];}
+    Assert-Nerus (@($offsets | Select-Object -Unique).Count -gt 1) 'Instalacoes sincronizadas.';
+  };
+  Test-NerusCase 'falha de politica bloqueia cache e aguarda 5 min antes do retry' {
+    Reset-NerusMocks;$s=New-TestNerusSession;$sn=New-TestSnapshot;$s.MaintenanceArmed=$true;
+    & $module {$script:TestPolicy=$script:TestPolicy.Replace('<AutoUpdateEnabled>false</AutoUpdateEnabled>','<AutoUpdateEnabled>true</AutoUpdateEnabled>');};
+    Invoke-NerusTicks $s $sn 1;Assert-Nerus $s.AutoUpdateEnabled 'Fixture nao habilitou atualizacao.';
+    & $module {param($session,$snapshot);$script:TestPolicyFailure='NerusHttp503';$script:TestNow=$session.NerusAutomation.NextPolicyAt;Invoke-PdvMonitorNerusAutomation $session $snapshot $script:TestNow;} $s $sn;
+    Assert-Nerus ($null -eq $s.NerusAutomation.Policy -and -not $s.AutoUpdateEnabled -and $s.NerusAutomation.Samples.Count -eq 0) 'Falha reteve autorizacao anterior.';
+    $delay=& $module {param($session);($session.NerusAutomation.NextPolicyAt-$script:TestNow).TotalSeconds;} $s;
+    Assert-Nerus ($delay -eq 300) 'Retry nao aguardou 5 min.';
+    & $module {param($session,$snapshot);$script:TestNow=$session.NerusAutomation.NextPolicyAt.AddSeconds(-1);Invoke-PdvMonitorNerusAutomation $session $snapshot $script:TestNow;} $s $sn;
+    Assert-Nerus (@(Get-NerusCalls '/agent/policy').Count -eq 2) 'Falha criou loop de consultas.';
+    & $module {param($session,$snapshot);$script:TestPolicyFailure='';$script:TestNow=$session.NerusAutomation.NextPolicyAt;Invoke-PdvMonitorNerusAutomation $session $snapshot $script:TestNow;} $s $sn;
+    Assert-Nerus (@(Get-NerusCalls '/agent/policy').Count -eq 3 -and $null -ne $s.NerusAutomation.Policy) 'Retry nao recuperou politica.';
+  };
+  Test-NerusCase 'cache de 15 min nunca amplia janela ou autorizacao da correcao' {
+    foreach($variant in @('disabled','closed','revision','failed')){
+      Reset-NerusMocks;$s=New-TestNerusSession;$sn=New-TestSnapshot;Invoke-NerusTicks $s $sn 1;
+      & $module {$script:TestNow=$script:TestNow.AddSeconds(40);};
+      switch($variant){
+        'disabled'{& $module {$script:TestPolicy=$script:TestPolicy.Replace('<Enabled>true</Enabled>','<Enabled>false</Enabled>');};}
+        'closed'{& $module {$script:TestPolicy=$script:TestPolicy.Replace('<WindowOpen>true</WindowOpen>','<WindowOpen>false</WindowOpen>');};}
+        'revision'{& $module {$script:TestPolicy=$script:TestPolicy.Replace('b2222222-2222-4222-8222-222222222222','b3333333-3333-4333-8333-333333333333');};}
+        'failed'{& $module {$script:TestPolicyFailure='NerusHttp503';};}
+      }
+      Invoke-NerusTicks $s $sn 2;
+      Assert-Nerus (@(Get-NerusCalls '/agent/policy').Count -eq 2 -and @(Get-NerusCalls '/agent/nerus/prepare').Count -eq 0) ('Cache antigo autorizou tentativa: '+$variant);
+      if($variant -ceq 'revision'){Assert-Nerus ($s.NerusAutomation.Samples.Count -eq 0) 'Politica nova reutilizou amostras.';}
+    }
+  };
   Test-NerusCase 'politica valida preserva correspondencias explicitas' {
     Reset-NerusMocks;
     $p=& $module { param($text); ConvertFrom-PdvNerusPolicy $text; } (New-TestPolicyXml);

@@ -7,6 +7,7 @@ $temp=Join-Path ([IO.Path]::GetTempPath()) ('software-transport-'+[guid]::NewGui
 [void][IO.Directory]::CreateDirectory($temp);$script:checks=0;
 function Assert-SoftwareTransport($Value,$Message){if(-not $Value){throw $Message;};$script:checks++;}
 & $module {
+  function script:Get-PdvInventoryStartupDelay {param($Central,[string]$Kind);return 0}
   $script:Now=[DateTimeOffset]::Parse('2026-10-21T18:00:00Z');$script:Code=204;$script:Timeout=$false;$script:AfterPost=$null;$script:Posts=New-Object Collections.ArrayList;
   function script:Get-PdvMonitorTransportNow{return $script:Now;}
   function script:Protect-PdvMonitorToken{param($Token,$Central);return ,[byte[]]@(1,2,3);}
@@ -33,16 +34,29 @@ try{
   $s=New-SoftwareSession;$doc=New-SoftwareDocument;
   $r=Set-PdvMonitorSoftwarePending $s $doc ('b'*64);Assert-SoftwareTransport $r.Queued 'Documento persiste antes do envio';
   $path=Join-Path $s.DataDirectory 'software-pendente.xml';$before=[IO.File]::ReadAllText($path);
+  Assert-SoftwareTransport (-not [IO.File]::Exists((Join-Path $s.DataDirectory 'software-confirmado.xml'))) 'Enfileirar snapshot não o marca confirmado';
   $again=New-SoftwareDocument;$r=Set-PdvMonitorSoftwarePending $s $again ('b'*64);
   Assert-SoftwareTransport ($r.Reason -eq 'SoftwareAlreadyQueued' -and [IO.File]::ReadAllText($path) -ceq $before) 'Mesmo estado conserva bytes e snapshotId';
   & $module {$script:Timeout=$true;};$r=Invoke-PdvMonitorSoftwareUpload $s;
-  Assert-SoftwareTransport (-not $r.Success -and [IO.File]::ReadAllText($path) -ceq $before) 'Timeout conserva pendência';
+  Assert-SoftwareTransport (-not $r.Success -and [IO.File]::ReadAllText($path) -ceq $before -and -not [IO.File]::Exists((Join-Path $s.DataDirectory 'software-confirmado.xml'))) 'Timeout conserva pendência sem criar checkpoint';
   & $module {$script:Timeout=$false;};Reset-SoftwareBackoff $s;$r=Invoke-PdvMonitorSoftwareUpload $s;
   Assert-SoftwareTransport ($r.Success -and $r.Reason -eq 'SoftwareAcknowledged' -and -not [IO.File]::Exists($path)) 'Somente204 remove envio confirmado';
   $posts=& $module {return ,$script:Posts.ToArray();};
   Assert-SoftwareTransport ($posts[0].Endpoint -ceq 'https://central.example/api/pdv-monitor/agent/software') 'Endpoint derivado mantém mesma origemHTTPS';
   Assert-SoftwareTransport ($posts[0].Body -ceq $posts[1].Body) 'Reenvio usa mesmo documento';
   Assert-SoftwareTransport (-not $posts[0].Body.Contains(('a'*64))) 'Credencial não integra corpo';
+  $ack=Join-Path $s.DataDirectory 'software-confirmado.xml';
+  Assert-SoftwareTransport ([IO.File]::Exists($ack)) 'Checkpoint software é persistido somente após confirmação integral';
+  $reopened=[pscustomobject]@{DataDirectory=$s.DataDirectory;Config=@{}};[void](Initialize-PdvMonitorCentral $reopened);
+  $again=New-SoftwareDocument;$again.collectedAt='2026-11-21T18:00:00Z';$r=Set-PdvMonitorSoftwarePending $reopened $again ('b'*64);
+  Assert-SoftwareTransport ($r.Reason -eq 'SoftwareAlreadyAcknowledged' -and -not [IO.File]::Exists($path)) 'Novo snapshotId/horário e reinício não reenviam software sem alteração';
+  $oldAck=[IO.File]::ReadAllText($ack);$again.apps[0].version='2';[void](Set-PdvMonitorSoftwarePending $reopened $again ('c'*64));
+  & $module {$script:Timeout=$true;};$r=Invoke-PdvMonitorSoftwareUpload $reopened;
+  Assert-SoftwareTransport (-not $r.Success -and [IO.File]::Exists($path) -and [IO.File]::ReadAllText($ack) -ceq $oldAck) 'Timeout de alteração mantém checkpoint anterior e documento para recuperação';
+  $lastBytes=[IO.File]::ReadAllText($path);$reopened=[pscustomobject]@{DataDirectory=$s.DataDirectory;Config=@{}};[void](Initialize-PdvMonitorCentral $reopened);
+  Assert-SoftwareTransport ([IO.File]::ReadAllText($path) -ceq $lastBytes) 'Reiniciar antes do ACK não muda snapshotId/bytes';
+  & $module {$script:Timeout=$false;};$r=Invoke-PdvMonitorSoftwareUpload $reopened;
+  Assert-SoftwareTransport ($r.Success -and -not [IO.File]::Exists($path) -and [IO.File]::ReadAllText($ack) -cne $oldAck) 'Alteração é confirmada após reinício antes de avançar checkpoint';
   $s=New-SoftwareSession;$doc=New-SoftwareDocument;[void](Set-PdvMonitorSoftwarePending $s $doc ('b'*64));
   $path=Join-Path $s.DataDirectory 'software-pendente.xml';
   & $module {$script:Code=404;};$r=Invoke-PdvMonitorSoftwareUpload $s;
@@ -72,5 +86,11 @@ try{
   Assert-SoftwareTransport ($r.Success -and -not [IO.File]::Exists($path)) 'Documento com muitos caracteres escapáveis é lido e confirmado sem travar fila';
   $posts=& $module {return ,$script:Posts.ToArray();};$last=ConvertFrom-Json $posts[$posts.Count-1].Body;
   Assert-SoftwareTransport ($last.apps[0].name -ceq ('&'*256) -and @($last.apps).Count -eq 100) 'XML protegido conserva conteúdo original e JSON completo para API';
+  $s=New-SoftwareSession;$doc=New-SoftwareDocument;[void](Set-PdvMonitorSoftwarePending $s $doc ('b'*64));
+  $now=& $module {Get-PdvMonitorTransportNow};$s.SoftwareInitialUploadAt=$now.AddSeconds(60);$count=& $module {$script:Posts.Count};
+  $r=Invoke-PdvMonitorSoftwareUpload $s;
+  Assert-SoftwareTransport ($r.Success -and $r.Reason -eq 'SoftwareBaselineDeferred' -and (& $module {$script:Posts.Count}) -eq $count) 'Baseline software aguarda janela breve semHTTP';
+  & $module {$script:Now=$script:Now.AddSeconds(61)};$r=Invoke-PdvMonitorSoftwareUpload $s;
+  Assert-SoftwareTransport ($r.Success -and $r.Reason -eq 'SoftwareAcknowledged') 'Baseline software confirma depois do jitter';
   Write-Output ('PASS: '+$script:checks+' verificações de transporte de software, somente mocks e pastas temporárias.');
 }finally{[IO.Directory]::Delete($temp,$true);}
