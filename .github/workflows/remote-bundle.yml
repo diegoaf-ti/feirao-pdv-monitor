@@ -23,7 +23,7 @@ jobs:
       - name: Conferir validação do instalador com arquivos sintéticos
         shell: powershell
         run: |
-          & ./tools/TestsBundleRemoto.ps1
+          & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ./tools/TestsBundleRemoto.ps1
           if ($LASTEXITCODE -ne 0) { throw 'Falha nos testes isolados do bundle' }
       - name: Conferir assinaturas reais e extrair somente dependências pinadas
         run: python tools/preparar-bundle-remoto.py --output "${{ runner.temp }}/pdv-remote-bundle"
