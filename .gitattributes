@@ -3,3 +3,7 @@
 *.cmd text eol=crlf
 *.vbs text eol=crlf
 *.md text eol=lf
+# Estes arquivos integram uma aprovacao por hash dos bytes originais.
+# O checkout Windows nao pode converter suas quebras de linha.
+tools/remote-licenses/** -text
+tools/remoto-bundle-lock.xml -text

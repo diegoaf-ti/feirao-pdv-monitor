@@ -1,8 +1,11 @@
 import copy
 import hashlib
 import importlib.util
+import json
 from pathlib import Path
+import shutil
 import struct
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -31,6 +34,33 @@ class RemoteBundleTest(unittest.TestCase):
                 data = (HERE / 'remote-licenses' / Path(node.get('path')).name).read_bytes()
                 self.assertEqual(node.get('sha256'), hashlib.sha256(data).hexdigest())
                 self.assertEqual(int(node.get('sizeBytes')), len(data))
+
+    def test_windows_git_checkout_preserves_approved_manifest_and_original_licence_bytes(self):
+        # Reproduz core.autocrlf do runner Windows sem rede e sem alterar o repo real.
+        with tempfile.TemporaryDirectory(prefix='pdv-bundle-git-eol-') as work:
+            work = Path(work)
+            source, checkout = work / 'source', work / 'checkout'
+            (source / 'tools').mkdir(parents=True)
+            shutil.copyfile(HERE.parent / '.gitattributes', source / '.gitattributes')
+            shutil.copyfile(HERE / 'remoto-bundle-lock.xml', source / 'tools/remoto-bundle-lock.xml')
+            shutil.copytree(HERE / 'remote-licenses', source / 'tools/remote-licenses')
+            commands = [
+                ['git', '-c', 'init.defaultBranch=main', 'init', '-q', str(source)],
+                ['git', '-C', str(source), 'add', '-f', '.gitattributes', 'tools'],
+                ['git', '-C', str(source), '-c', 'user.name=PDV isolated fixture', '-c', 'user.email=pdv-fixture@example.invalid', 'commit', '--no-gpg-sign', '-q', '-m', 'Fixture de bytes aprovados'],
+                ['git', '-c', 'core.autocrlf=true', 'clone', '--no-hardlinks', '-q', str(source), str(checkout)],
+            ]
+            for command in commands:
+                subprocess.run(command, check=True, capture_output=True, timeout=30)
+            raw = (checkout / 'tools/remoto-bundle-lock.xml').read_bytes()
+            audit = json.loads((HERE / 'remote-dependency-audit.json').read_bytes())
+            self.assertEqual(hashlib.sha256(raw).hexdigest(), audit['manifestSha256'])
+            self.assertEqual(raw, self.raw)
+            for node in bundle.parse_manifest(raw).find('Files'):
+                if node.get('path').startswith('licenses/'):
+                    data = (checkout / 'tools/remote-licenses' / Path(node.get('path')).name).read_bytes()
+                    self.assertEqual(hashlib.sha256(data).hexdigest(), node.get('sha256'))
+                    self.assertEqual(len(data), int(node.get('sizeBytes')))
 
     def test_unknown_unsigned_dll_or_container_forgery_is_rejected(self):
         for attribute, value in [('path', 'bin/stunnel/other.dll'), ('sha256', '0' * 64), ('sourceArtifact', 'sources/unknown.exe')]:
