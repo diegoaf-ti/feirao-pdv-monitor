@@ -4,7 +4,7 @@ $root=Split-Path -Parent $MyInvocation.MyCommand.Path;Add-Type -Path (Join-Path 
 Import-Module (Join-Path $root 'PdvMonitor.Remoto.Identidade.psm1') -Force;$module=Get-Module PdvMonitor.Remoto.Identidade;
 $count=0;function Assert-Test($Value,$Message){$script:count++;if(-not $Value){throw $Message;}}
 function Assert-Throws([scriptblock]$Body,$Code){$script:count++;try{&$Body|Out-Null;}catch{if($_.Exception.Message.Contains($Code)){return};throw};throw "Missing $Code"}
-$temporary=Join-Path /private/tmp ('pdv-identity-'+[Guid]::NewGuid().ToString('N'));[void][IO.Directory]::CreateDirectory($temporary);
+$testBase=[IO.Path]::GetTempPath();if([IO.Directory]::Exists('/private/tmp')){$testBase='/private/tmp';};$temporary=Join-Path $testBase ('pdv-identity-'+[Guid]::NewGuid().ToString('N'));[void][IO.Directory]::CreateDirectory($temporary);
 $key=[Security.Cryptography.RSA]::Create(2048);$other=[Security.Cryptography.RSA]::Create(2048);
 try{
  $agent='11111111-1111-4111-8111-111111111111';$request='22222222-2222-4222-8222-222222222222';
@@ -18,11 +18,14 @@ try{
  $now=[DateTimeOffset]::UtcNow;Assert-Test (Test-PdvIdentityRenewalDue $now.AddDays(30).ToString('o') $now) '30day boundary';Assert-Test (-not(Test-PdvIdentityRenewalDue $now.AddDays(31).ToString('o') $now)) '31day premature';Assert-Throws {Test-PdvIdentityRenewalDue $now.ToString('o') $now} 'RemoteIdentityExpired';
  $identity=@{AgentId=$agent;CertificateSha256=('a'*64);PublicKeySha256=$public.PublicKeySha256;PrivateKeyFile=$private;MonitorUserSid='S-1-5-21-1-2-3-1001'};
  & $module {
+  $script:ValidationRsa=$args[0];
   function script:Assert-PdvIdentityPath {param($Path,$Sid);return $Path;}
   function script:Invoke-PdvIdentityHttp {
    param($Trust,$Operation,$Body);
    $script:HttpCalls++;$script:LastBody=$Body;
    if($Operation -ceq 'challenge'){
+    $hashBefore='';if($Body.Contains('csrSha256')){$hashBefore=$Body.csrSha256;};$proofBefore=@('PDV-REMOTE-IDENTITY-CHALLENGE','1',$Body.purpose,$Body.agentId,$Body.requestId,$Body.certificateSha256,$hashBefore,$Body.clientNonce,$Body.requestedAt)-join "`n";
+    if($Body.clientNonce -cnotmatch '^[A-Za-z0-9_-]{43}$' -or -not $script:ValidationRsa.VerifyData([Text.Encoding]::UTF8.GetBytes($proofBefore),[Convert]::FromBase64String($Body.signatureBase64),[Security.Cryptography.HashAlgorithmName]::SHA256,[Security.Cryptography.RSASignaturePadding]::Pkcs1)){throw 'ChallengeWithoutPossessionProof';}
     $expiry=[DateTimeOffset]::UtcNow.AddMinutes(3).ToString('yyyy-MM-ddTHH:mm:ss.fffZ');$id='33333333-3333-4333-8333-333333333333';$nonce='a'*43;$hash='';if($Body.Contains('csrSha256')){$hash=$Body.csrSha256;}
     $canonical=@('PDV-REMOTE-IDENTITY','1',$Body.purpose,$Body.agentId,$Body.requestId,$id,$nonce,$Body.certificateSha256,$hash,$expiry)-join "`n";
     if($script:Tamper){$canonical+='BAD';}
@@ -30,10 +33,14 @@ try{
    }
    return ,([Text.Encoding]::UTF8.GetBytes('<OK/>'));
   };$script:HttpCalls=0;$script:Tamper=$false;
- }
+ } $key;
  $result=& $module {param($I,$R);Invoke-PdvIdentityProof @{} $I 'profile' $R;} $identity $request;
  Assert-Test ([Text.Encoding]::UTF8.GetString($result) -ceq '<OK/>') 'Proof response bytes';
  Assert-Test ((&$module {$script:HttpCalls}) -eq 2) 'Challenge and proof calls';
+ $renewedBytes=& $module {param($I,$R,$Csr);Invoke-PdvIdentityProof @{} $I 'renew' $R $Csr;} $identity $request $public.CsrPem;
+ $renewBody=&$module {$script:LastBody};Assert-Test (-not $renewBody.csrPem.Contains("`r") -and $renewBody.csrPem.EndsWith("`n") -and $renewBody.csrPem -ceq ($public.CsrPem.Replace("`r`n","`n").Trim()+"`n")) 'CSR must match API canonical LF contract';
+ & $module {$script:HttpCalls=0;};[void](& $module {param($I,$R);Invoke-PdvIdentityProof @{} $I 'profile' $R;} $identity $request);
+
  $sent=&$module {$script:LastBody};Assert-Test ($sent.signatureBase64.Length -eq 344 -and $sent.Count -eq 6) 'Proof contract not closed';
  & $module {$script:Tamper=$true;$script:HttpCalls=0;};Assert-Throws {&$module {param($I,$R);Invoke-PdvIdentityProof @{} $I 'profile' $R;} $identity $request} 'RemoteIdentityChallengeMismatch';Assert-Test ((&$module {$script:HttpCalls}) -eq 1) 'Signed tampered challenge';
  $json=&$module {ConvertTo-PdvIdentityJson @{schemaVersion=1;csrPem="a`nb";agentId='x'};};$parsed=[Text.Encoding]::UTF8.GetString($json)|ConvertFrom-Json;Assert-Test ($parsed.schemaVersion -eq 1 -and $parsed.csrPem -ceq "a`nb") 'JSON PS2 encoding';
@@ -48,7 +55,7 @@ try{
   function script:Read-PdvMonitorRemoteEnrollmentTrust {param($Path);return @{};}
   function script:Read-PdvIdentityFile {param($Path,$Root,$Fields,$Sid);if([IO.Path]::GetFileName($Path) -ceq 'identity-maintenance.xml'){return $script:Config.Clone();};return (Read-PdvIdentityXml ([IO.File]::ReadAllBytes($Path)) $Root $Fields);}
   function script:Write-PdvIdentityAtomic {param($Path,$Bytes,$Sid);if([IO.Path]::GetFileName($Path) -ceq 'identity-maintenance.xml'){$script:Config=Read-PdvIdentityXml $Bytes 'PdvRemoteIdentityMaintenance' @('AgentId','MonitorUserSid','IdentityDirectory');};[IO.File]::WriteAllBytes($Path,$Bytes);}
-  function script:Read-PdvIdentityCertificate {param($Directory,$Sid,$Trust);$isOld=$Directory.EndsWith('/old');if($isOld -and $script:OldExpired){throw 'OldMustNotBeRead';};$expiry=$script:Now.AddDays(90);if($isOld -and $script:Due){$expiry=$script:Now.AddDays(20);};return @{AgentId=$script:Agent;ExpiresAt=$expiry.ToString('o');CertificateSha256=$(if($isOld){'a'*64}else{'b'*64});PublicKeySha256=('c'*64);PrivateKeyFile='synthetic';MonitorUserSid=$Sid};}
+  function script:Read-PdvIdentityCertificate {param($Directory,$Sid,$Trust);$isOld=([IO.Path]::GetFileName($Directory) -ceq 'old');if($isOld -and $script:OldExpired){throw 'OldMustNotBeRead';};$expiry=$script:Now.AddDays(90);if($isOld -and $script:Due){$expiry=$script:Now.AddDays(20);};return @{AgentId=$script:Agent;ExpiresAt=$expiry.ToString('o');CertificateSha256=$(if($isOld){'a'*64}else{'b'*64});PublicKeySha256=('c'*64);PrivateKeyFile='synthetic';MonitorUserSid=$Sid};}
   function script:Assert-PdvIdentityNoRemoteProcesses {if($script:Busy){throw 'SessionBusy';}}
   function script:New-PdvMonitorRemoteEnrollmentRequest {param($Path,$Agent,$Request,$Sid);$script:Calls+=('request:'+ $Request);return @{CsrPem='PUBLIC-SYNTHETIC';RequestId=$Request;AgentId=$Agent};}
   function script:Complete-PdvMonitorRemoteEnrollment {param($Request,$Trust,$Bytes);$script:Calls+='install-prepared';return @{};}

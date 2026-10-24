@@ -53,8 +53,13 @@ function Invoke-PdvIdentityHttp {
 function Invoke-PdvIdentityProof {
   param($Trust,$Identity,[string]$Purpose,[string]$RequestId,[string]$CsrPem='');
   if(@('renew','confirm','profile','abort') -cnotcontains $Purpose -or $RequestId -cnotmatch '^[a-f0-9-]{36}$'){throw 'RemoteIdentityInvalidOperation';}
-  $hash='';if($Purpose -ceq 'renew'){$hash=[Conecta.PdvRemoteEnrollment.CryptoV1]::Sha256([Text.Encoding]::UTF8.GetBytes($CsrPem));}
+  $hash='';if($Purpose -ceq 'renew'){$CsrPem=$CsrPem.Replace("`r`n","`n").Trim()+"`n";$hash=[Conecta.PdvRemoteEnrollment.CryptoV1]::Sha256([Text.Encoding]::UTF8.GetBytes($CsrPem));}
   $body=@{schemaVersion=1;agentId=$Identity.AgentId;purpose=$Purpose;requestId=$RequestId;certificateSha256=$Identity.CertificateSha256};if($hash){$body.csrSha256=$hash;}
+  [void](Assert-PdvIdentityPath $Identity.PrivateKeyFile $Identity.MonitorUserSid);
+  $random=New-Object Security.Cryptography.RNGCryptoServiceProvider;$nonceBytes=New-Object byte[] 32;try{$random.GetBytes($nonceBytes);$clientNonce=[Convert]::ToBase64String($nonceBytes).TrimEnd('=').Replace('+','-').Replace('/','_');}finally{$random.Dispose();[Array]::Clear($nonceBytes,0,$nonceBytes.Length);}
+  $requestedAt=(Get-PdvIdentityNow).UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ss.fffZ');
+  $challengeProof=@('PDV-REMOTE-IDENTITY-CHALLENGE','1',$Purpose,$Identity.AgentId,$RequestId,$Identity.CertificateSha256,$hash,$clientNonce,$requestedAt) -join "`n";
+  $body.clientNonce=$clientNonce;$body.requestedAt=$requestedAt;$body.signatureBase64=[Conecta.PdvRemoteEnrollment.CryptoV1]::SignIdentityPayload($Identity.PrivateKeyFile,$challengeProof,$Identity.PublicKeySha256);
   $challenge=Read-PdvIdentityXml (Invoke-PdvIdentityHttp $Trust 'challenge' $body) 'PdvRemoteIdentityChallenge' @('ChallengeId','Nonce','ExpiresAt','SigningPayload','Purpose','AgentId','RequestId','CertificateSha256','CsrSha256');
   if($challenge.ChallengeId -cnotmatch '^[a-f0-9-]{36}$' -or $challenge.Nonce -cnotmatch '^[A-Za-z0-9_-]{43}$' -or $challenge.ExpiresAt -cnotmatch '^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$' -or $challenge.Purpose -cne $Purpose -or $challenge.AgentId -cne $Identity.AgentId -or $challenge.RequestId -cne $RequestId -or $challenge.CertificateSha256 -cne $Identity.CertificateSha256 -or $challenge.CsrSha256 -cne $hash){throw 'RemoteIdentityChallengeMismatch';}
   $expiry=[DateTimeOffset]::Parse($challenge.ExpiresAt,[Globalization.CultureInfo]::InvariantCulture);$now=Get-PdvIdentityNow;if($expiry -le $now -or $expiry -gt $now.AddMinutes(5)){throw 'RemoteIdentityChallengeExpired';}
